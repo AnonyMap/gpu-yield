@@ -49,7 +49,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -83,6 +83,7 @@ DEFAULTS = {
     "restart_after_suspend": True,
     "extra_processes": [],
     "ignore_appids": [],
+    "detect_wine": True,
     "ollama_unit": MANAGED_OLLAMA_UNIT,
     "update_repo": "",
     "update_branch": "main",
@@ -134,6 +135,11 @@ extra_processes = []
 
 # Steam AppIds that should NOT stop the AI. Empty means every game stops it.
 ignore_appids = []
+
+# Also treat any running Wine/Proton program as a game. Catches Windows games
+# started outside Steam (Heroic, Lutris), including Heroic's "Add to Steam"
+# shortcuts, which can hand off to an already-open Heroic and exit early.
+detect_wine = true
 
 # systemd user unit that runs Ollama. Leave as-is unless you manage Ollama yourself.
 ollama_unit = "gpu-yield-ollama.service"
@@ -249,10 +255,18 @@ def scan_games(cfg):
 
     Steam starts each game as `reaper SteamLaunch AppId=<id> -- <game command>` and the
     reaper lives as long as the game does, so it is a reliable "a game is running" flag.
+
+    Windows games launched outside Steam (Heroic, Lutris, or a Heroic shortcut that hands
+    off to an already-running Heroic and exits) have no reaper, but Wine/Proton keeps a
+    `wineserver` process alive for as long as the game runs. It only counts when no Steam
+    game is present, because Steam's Proton games run one too and `ignore_appids` must
+    still be able to exempt them.
     """
     found = {}
     extra = set(cfg["extra_processes"])
     ignore = set(cfg["ignore_appids"])
+    steam_present = False
+    wine_pids = []
     try:
         entries = os.scandir("/proc")
     except OSError:
@@ -270,12 +284,18 @@ def scan_games(cfg):
         argv = raw.rstrip(b"\0").split(b"\0")
         name = os.path.basename(argv[0]).decode(errors="replace")
         if name == "reaper" and b"SteamLaunch" in argv:
+            steam_present = True
             appid = next((a[6:].decode(errors="replace") for a in argv if a.startswith(b"AppId=")), "?")
             if appid == "0" or appid in ignore:
                 continue
             found[int(entry.name)] = f"Steam AppId {appid}"
         elif name in extra:
             found[int(entry.name)] = name
+        elif name == "wineserver" and cfg["detect_wine"]:
+            wine_pids.append(int(entry.name))
+    if wine_pids and not steam_present:
+        for pid in wine_pids:
+            found[pid] = "Wine/Proton game (outside Steam)"
     return found
 
 

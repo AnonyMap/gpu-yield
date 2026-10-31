@@ -9,7 +9,7 @@ Keeps a local LLM loaded on the living-room PC while it sits in Steam's Gaming M
 | Game closes | After a 45 s cooldown (so launchers and quick game switches don't cause reload churn), Ollama starts and the model is reloaded |
 | PC wakes from sleep | Ollama is restarted, since GPU compute can be unreliable after resume |
 
-Games are detected through Steam's `reaper` helper. Steam launches every game in your library through it, non-Steam shortcuts included, and it lives exactly as long as the game. No per-game launch options are needed.
+Games are detected through Steam's `reaper` helper. Steam launches every game in your library through it, non-Steam shortcuts included, and it lives exactly as long as the game. Windows games started outside Steam, such as from Heroic, are caught by Wine's `wineserver` process. No per-game launch options are needed.
 
 ## Install
 
@@ -115,7 +115,7 @@ Edit `~/.config/gpu-yield/config.toml`, then run `systemctl --user restart gpu-y
 
 ## Limits
 
-- Only games launched through Steam are detected. In Gaming Mode that's everything you'd normally play. For anything else, add its process name to `extra_processes`.
+- Games launched through Steam are detected by Steam's `reaper`. Windows games launched any other way (Heroic, Lutris) are detected by Wine's `wineserver` process; this also covers Heroic's "Add to Steam" shortcuts, which can hand the game to an already-open Heroic and exit early. Native Linux games launched outside Steam aren't detected; add their process name to `extra_processes`. Set `detect_wine = false` if you run Windows utilities through Wine that shouldn't stop the AI.
 - The stand-in only exists while Ollama is stopped. There's a gap of under a second during each handoff where connections are refused.
 - Ollama has no authentication. Setup only opens the port to your subnet; don't forward it on your router.
 - Tested against a simulated Steam `reaper` process and a fake Ollama server, not yet on a real Bazzite install. Run `gpu-yield doctor` after setup, then launch a game and check `gpu-yield status`.
