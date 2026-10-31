@@ -2,207 +2,322 @@
 
 [![tests](https://github.com/AnonyMap/gpu-yield/actions/workflows/tests.yml/badge.svg)](https://github.com/AnonyMap/gpu-yield/actions/workflows/tests.yml)
 
-Keeps a local LLM loaded on the living-room PC while it sits in Steam's Gaming Mode, and gets it out of the GPU's way the moment a game starts.
+Turn a Linux gaming PC into a home AI server that gets out of the way when you play. While the PC sits idle in Steam's Gaming Mode, gpu-yield keeps a local LLM loaded in Ollama and available to the rest of your network. The moment a game starts, it shuts the AI down and frees the GPU for the game. When the game ends, the model comes back on its own.
+
+It's a single Python file with no dependencies, built for [Bazzite](https://bazzite.gg) and similar Steam-based setups.
 
 | Situation | What happens |
 |---|---|
-| No game running | Ollama runs with the model preloaded in VRAM, reachable from your LAN |
-| Game starts | Ollama is stopped within ~2 s, freeing all of its VRAM. A stand-in takes over port 11434 and answers every request with `503` and a plain-English reason |
-| Game closes | After a 45 s cooldown (so launchers and quick game switches don't cause reload churn), Ollama starts and the model is reloaded |
+| No game running | Ollama runs with your model preloaded in VRAM, reachable from your local network |
+| Game starts | Ollama is stopped within about 2 s, freeing all of its VRAM and RAM. A stand-in answers on Ollama's port with `503` and a plain-English reason |
+| Game closes | After a cooldown (45 s by default, so launchers and quick game switches don't cause reload churn), Ollama starts and the model is reloaded |
 | PC wakes from sleep | Ollama is restarted, since GPU compute can be unreliable after resume |
-| Ollama crashes, hangs or drops the model | It is restarted and the model reloaded, checked every 15 s |
+| Ollama crashes, hangs or drops the model | It is restarted and the model reloaded; checked every 15 s |
 | The config file has a mistake | The AI stays off (a game could start at any time) and clients are told why, until the file is fixed |
 
-Games are detected through Steam's `reaper` helper. Steam launches every game in your library through it, non-Steam shortcuts included, and it lives exactly as long as the game. Windows games started outside Steam, such as from Heroic, are caught by Wine's `wineserver` process. No per-game launch options are needed.
+## Contents
+
+- [Requirements](#requirements)
+- [Install](#install)
+- [Choosing a model](#choosing-a-model)
+- [Connecting clients](#connecting-clients)
+- [Checking on it](#checking-on-it)
+- [From other computers](#from-other-computers)
+- [Sleep and Wake-on-LAN](#sleep-and-wake-on-lan)
+- [Game detection](#game-detection)
+- [Settings](#settings)
+- [Updating](#updating)
+- [Command reference](#command-reference)
+- [Files it creates](#files-it-creates)
+- [Limits and security](#limits-and-security)
+- [Example setup](#example-setup)
+- [Testing](#testing)
+- [Uninstall](#uninstall)
+
+## Requirements
+
+- **Linux with systemd**, where games are launched through Steam. Built and tested on Bazzite in Gaming Mode; other Fedora Atomic images and SteamOS-like setups should work the same way.
+- **Python 3.11 or newer** (included with Bazzite).
+- **An AMD GPU** for the managed Ollama install. gpu-yield picks ROCm or Vulkan for your card automatically. Other GPUs are untested.
+- **A wired network connection** if you want Wake-on-LAN.
+
+Nothing is layered onto the system image: everything installs into your home folder and runs as your user.
 
 ## Install
 
-On the living-room PC, in a terminal (over SSH or in Desktop Mode):
+On the gaming PC, in a terminal (over SSH or in Desktop Mode):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AnonyMap/gpu-yield/main/gpu-yield -o /tmp/gpu-yield
 python3 /tmp/gpu-yield setup
 ```
 
-Setup copies itself into place, so the downloaded file is just a one-time installer (`/tmp` is cleared on reboot). The same two commands upgrade an install from before `gpu-yield update` existed (1.0.x). Setup keeps your existing config.
+Setup copies itself into place, so the downloaded file is only a one-time installer. Run setup as your normal user; it asks for `sudo` only for the firewall and Wake-on-LAN steps. It:
 
-Setup runs as your normal user and asks for `sudo` only for the firewall rule and Wake-on-LAN. It:
-
-1. asks which model to use, from a short list sized for your hardware; you can also type any Ollama model name, or choose none and pick later
-2. writes `~/.config/gpu-yield/config.toml`, then offers to disable any other Ollama service (it would hold the port and the GPU during games)
-3. installs Ollama into `~/.local/opt/ollama` (no system changes, nothing layered with rpm-ostree), with the GPU backend picked for your card: ROCm on the RX 7000 series, RX 6800/6900 and RX 9000; Vulkan on others such as the RX 6700 XT
-4. installs itself to `~/.local/bin/gpu-yield` and enables a systemd **user** service, with linger so it starts at boot
-5. offers a firewall rule that opens the AI port (11434) and the status page (11435) to your local subnet only
+1. asks which model to keep loaded, from a short list sized for your hardware; you can type any Ollama model name instead, or choose none and pick later
+2. writes `~/.config/gpu-yield/config.toml`, and offers to disable any other Ollama service (it would hold the port and the GPU during games)
+3. downloads Ollama into `~/.local/opt/ollama`, with the GPU backend chosen for your card (see [Settings](#settings))
+4. installs itself to `~/.local/bin/gpu-yield` and enables a systemd user service, with linger, so it starts at boot without anyone logging in
+5. offers a firewall rule that opens the AI port (11434) and the status page (11435) to your local network only
 6. offers to turn on Wake-on-LAN, so other computers can wake this PC
-7. downloads the model you chose and loads it into VRAM
-8. prints the Hermes config to paste on the other computer
+7. downloads the model you chose and loads it
+8. prints the address and settings to give your AI clients
 
-Options: `--model` (skips the question), `--context`, `--backend auto|rocm|vulkan`, `--reinstall`, `--skip-pull`, `--no-firewall`, `-y`. Without a terminal to ask in, or with `-y`, setup installs no model rather than guessing.
+Setup options: `--model NAME` (skips the question), `--context TOKENS`, `--backend auto|rocm|vulkan`, `--reinstall` (re-download Ollama), `--skip-pull`, `--no-firewall`, `-y` (accept all prompts). Without a terminal to ask in, or with `-y`, setup installs no model rather than guessing.
 
-To choose or change the model later:
+Re-running setup is safe: it keeps your config, and it's also how to upgrade an install from before `gpu-yield update` existed (1.0.x).
+
+## Choosing a model
 
 ```bash
 gpu-yield model              # pick from the list
-gpu-yield model qwen3.5:9b   # or name it directly
+gpu-yield model qwen3.5:9b   # or name any Ollama model directly
 ```
 
-This downloads the model, loads it, saves it in the config and restarts the watcher. Update `model.default` in Hermes's config to match.
+This downloads the model, loads it, saves it to the config and restarts the watcher. If you switch, it tells you how to delete the old one.
 
-## Updating
+The list setup offers:
 
-From any computer that can SSH to the living-room PC:
+| Model | Size | Notes |
+|---|---|---|
+| `gpt-oss:20b` | ~13 GB | Recommended. Native, reliable tool calling; fast, since only ~3.6B of its parameters are active per token |
+| `qwen3.6:35b-a3b` | ~23 GB | Stronger agent model. Bigger than a 16 GB card, so part of it runs from system RAM; needs ~32 GB of RAM |
+| `qwen3.5:9b` | ~6.6 GB | Smaller and faster, accepts images; lower ceiling. Test its tool calling with your client |
+| `qwen3.5:4b` | ~3.4 GB | Smallest. Fine for quick questions; weak at multi-step tool use |
 
-```bash
-ssh you@livingroom-pc gpu-yield update
-```
+**Fitting a model to your hardware.** What has to fit is the model plus its context (the conversation memory, which grows with `context_length`). Gaming Mode's own interface also holds some VRAM. As a rough guide:
 
-| Command | What it does |
+| GPU memory | Good starting point |
 |---|---|
-| `gpu-yield update --check` | Shows the installed and latest versions of gpu-yield and Ollama |
-| `gpu-yield update` | Downloads the latest gpu-yield from this repo and installs it |
-| `gpu-yield update --file PATH` | Installs a local copy instead of the GitHub version (one downloaded from a chat, or your own edit). Older or same-numbered files are allowed, with a note |
-| `gpu-yield update --ollama` | Also updates Ollama, if a newer release is out |
-| `gpu-yield rollback` | Returns to the version before the last update; run it again to redo |
+| 8 GB | `qwen3.5:4b`, or `qwen3.5:9b` with `context_length` 32768 |
+| 12 GB | `qwen3.5:9b` fits entirely; `gpt-oss:20b` works with part of it in system RAM (needs 16 GB+ of RAM) |
+| 16 GB | `gpt-oss:20b` |
+| 16 GB + 32 GB of RAM | `gpt-oss:20b`, or `qwen3.6:35b-a3b` for a stronger model |
+| 24 GB or more | `gpt-oss:20b` with room for a large context, or `qwen3.6:35b-a3b` mostly on the GPU |
 
-To push a file from your desktop without going through GitHub:
+Most of these are *mixture-of-experts* models, which degrade gracefully when they don't quite fit: Ollama moves expert weights into system RAM first and keeps the rest on the GPU, and each token only reads a few experts. That costs some speed, mostly when reading long prompts, instead of failing outright. A *dense* model that spills over is much slower, so for those, lower `context_length` or pick a smaller model.
 
-```bash
-scp gpu-yield you@livingroom-pc:~/gpu-yield-new
-ssh you@livingroom-pc gpu-yield update --file ~/gpu-yield-new
-```
+`gpu-yield doctor` shows how much of the loaded model is on the GPU and says whether that's expected. If it reports the model running entirely on the CPU, the GPU backend isn't working; doctor suggests the fix.
 
-`update` and `update --check` show what changed between your version and the new one, from [CHANGELOG.md](CHANGELOG.md).
+To make context use less memory, at a small quality cost: `gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0`.
 
-**Automatic updates** are off by default. To turn them on:
+## Connecting clients
 
-```bash
-gpu-yield config auto_update gpu-yield   # or "all" to update Ollama too
-```
+gpu-yield runs a normal Ollama server on port 11434, so anything that talks to Ollama, or to an OpenAI-compatible API, can use it:
 
-The watcher checks once a day and installs only while no game is running and nobody has used the AI for 15 minutes, so an update never interrupts a game or a conversation. Its log is in `journalctl --user -u gpu-yield-autoupdate`, and `gpu-yield rollback` undoes one. After a rollback, automatic updates skip the version you left until a newer one comes out or you run `gpu-yield update` yourself.
+- Ollama API: `http://<gaming-pc>:11434`
+- OpenAI-compatible API: `http://<gaming-pc>:11434/v1` (no API key needed)
 
-Before replacing anything, an update runs the new file's own self-test, and a version that fails it is refused, leaving the working one in place. Ollama updates work the same way: the new version is downloaded and unpacked alongside the old one, and only swapped in once it runs, so a dropped connection never leaves you without Ollama. After swapping in, the new version rewrites its service files and restarts the watcher, so the model reloads once. Updates come from the `main` branch of `AnonyMap/gpu-yield`; to use a fork, set `update_repo` in the config.
+**Match the context length.** Configure your client to use the same context length as gpu-yield (`gpu-yield config context_length` prints it; 65536 by default). If a client asks for a different size, Ollama reloads the model to suit it, which is slow and may not fit. Likewise, use the model name gpu-yield preloads. When a client loads a different model or context, `gpu-yield status` and the status page show a note saying what to change.
 
-## Model choice
+**While a game is running**, every request gets HTTP `503` with a `Retry-After` header and a reason, for example *"The AI server on gaming-pc is paused because a game is running. It comes back automatically about 45s after the game closes."* Requests to `/v1/...` get an OpenAI-style error body (`"code": "gpu_busy"`); others get Ollama's `{"error": "..."}`. A client with a fallback provider configured can use the 503 to fail over.
 
-The PC's 32 GB of system RAM shapes these picks. Ollama (0.30+) handles a mixture-of-experts model that doesn't fit in VRAM by moving expert weights into system RAM first and keeping attention on the GPU. Each token only reads a few experts, so going a little over VRAM costs some speed rather than failing or collapsing to a crawl. Stopping Ollama for a game frees that RAM along with the VRAM.
-
-These are the options setup offers. The context length defaults to 64K for all of them.
-
-**Recommended: gpt-oss:20b.**
-
-- It has native, well-trained tool calling, and Ollama has dedicated support for its format. That makes it the most likely to work with Hermes on the first try.
-- It is mixture-of-experts with about 3.6B parameters active per token, so it generates quickly.
-- At around 13 GB plus 64K of context it sits at or slightly over 16 GB. Any overflow goes to RAM as expert weights. Hermes's docs call 32K the minimum and recommend 64K, and the RAM makes the larger size cheap to take.
-
-**Step up: qwen3.6:35b-a3b (~23 GB).** It's a stronger agent model, with roughly 10 GB of experts living in RAM. Generation stays usable since only about 3B parameters are active. The cost is prompt processing: experts held in RAM have to cross the PCIe bus for every batch, and Hermes's prompts are large because of its tool definitions. Expect the first turn of a session to take several times longer than with gpt-oss; later turns reuse the cached prefix. It isn't the recommendation because its tool calling through Ollama is less proven (the previous Qwen generation had parsing problems there). Try it once gpt-oss is working:
-
-```bash
-gpu-yield model qwen3.6:35b-a3b
-```
-
-**Small and fast: qwen3.5:9b (6.6 GB).** It fits entirely in VRAM with plenty of room, accepts images, and responds fastest, but has a clearly lower ceiling. There have been reports of it printing tool calls as text instead of executing them through Ollama, so test it with Hermes before relying on it.
-
-```bash
-gpu-yield model qwen3.5:9b
-```
-
-**Smallest: qwen3.5:4b (3.4 GB).** Fine for quick questions and light chat; expect it to struggle with Hermes's multi-step tool use.
-
-`gpu-yield doctor` shows how much of the model is on the GPU. For a dense model, anything under 100% means layers spilled into RAM and it will be slow; lower `context_length` or add `OLLAMA_KV_CACHE_TYPE = "q8_0"` under `[ollama_env]`. For a mixture-of-experts model, partial placement is expected and doctor says so. Gaming Mode's own UI holds some VRAM, so a model that barely fits on paper may not.
-
-## Hermes config
-
-On the other computer, in `~/.hermes/config.yaml` (setup prints this with your IP filled in):
+**Example: [Hermes Agent](https://github.com/NousResearch/hermes-agent)** on another computer, in `~/.hermes/config.yaml` (setup prints this with your address filled in):
 
 ```yaml
 model:
   default: gpt-oss:20b
   provider: custom
-  base_url: http://<this-pc-ip>:11434/v1
+  base_url: http://<gaming-pc>:11434/v1
   context_length: 65536
   ollama_num_ctx: 65536
 ```
 
-Set the context numbers to match `context_length` in gpu-yield's config. If Hermes asks for a different size than the one preloaded, Ollama reloads the model on the first request. If they are left unset, Hermes has been known to request the model's full 256K window, which won't fit. When a client loads a different model or context than gpu-yield's, `gpu-yield status` shows a note saying what to change.
+Hermes needs at least 32K of context and works better with 64K. Without the two context lines, it has been known to request a model's full advertised window, which won't fit.
 
-If you configure a cloud fallback in Hermes, the stand-in's 503 is what triggers it, so mid-game requests can fail over instead of just failing.
+## Checking on it
 
-## From your other computers
+```bash
+gpu-yield status     # state, running game, model, when the AI was last used
+gpu-yield doctor     # end-to-end check with fixes for anything wrong
+journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
+```
 
-**Status page.** Open `http://<living-room-pc>:11435` in any browser, including your phone. It shows whether the AI is ready, which game is running, when the AI was last used, and any problem worth fixing. It refreshes every 5 seconds. The same data is at `/status` as JSON, for scripts or for an agent that wants to check before calling. The page is read-only.
+`status` shows games by name, for example `The Riftbreaker (AppId 1820000)`, including non-Steam shortcuts.
 
-**gpu-yield on your desktop.** The remote commands need only the script, not an install:
+**Status page.** Open `http://<gaming-pc>:11435` in any browser, including a phone. It shows whether the AI is ready, which game is running, when the AI was last used, and anything worth fixing, and refreshes every 5 seconds. The page is read-only.
+
+The same data is available as JSON at `/status`, for scripts or for an agent that wants to check before calling:
+
+| Field | Meaning |
+|---|---|
+| `ai_available` | `true` when the model is loaded and requests will be answered |
+| `state` | `ai`, `gaming`, `cooldown` (game just closed) or `paused` |
+| `retry_after` | Seconds to wait before trying again (0 when available) |
+| `games` | Running games, by name |
+| `model`, `context_length`, `model_status` | The configured model and its load state |
+| `in_use`, `last_used` | Whether another machine is talking to the AI right now, and when it last did (Unix time) |
+| `notice` | A problem worth fixing, such as a client loading a different context |
+| `cooldown_remaining`, `since` | Seconds until the model reloads after a game; when the current state began |
+| `host`, `version`, `port`, `mac` | The PC's name, gpu-yield version, AI port, and network card address (used by `wake`) |
+
+## From other computers
+
+The remote commands need only the script, not an install, and should also work on macOS and Windows with Python 3.11+.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AnonyMap/gpu-yield/main/gpu-yield -o ~/.local/bin/gpu-yield
 chmod +x ~/.local/bin/gpu-yield
-gpu-yield status --host avignon.home    # the living-room PC's status
-gpu-yield wake avignon.home             # wake it up, wait until the AI answers
+
+gpu-yield status --host gaming-pc.local   # that PC's status
+gpu-yield wake gaming-pc.local            # wake it up and wait until the AI answers
 ```
 
-**Waking the PC.** If the living-room PC goes to sleep, Hermes can't reach it. Run `gpu-yield wol` on the living-room PC once to turn on Wake-on-LAN (setup offers this too). Then `gpu-yield wake <pc>` from another computer wakes it and waits until it answers. `wake` needs to have seen the PC awake once, through `status --host` or an earlier `wake`, to learn its network card's address; or pass that address directly, as `gpu-yield wol` prints it. Wake-on-LAN needs a wired connection, and some PCs also need it enabled in the BIOS/UEFI, often called "Wake on LAN" or "Power on by PCI-E".
+`--host` accepts a name, an IP address, `name:port`, an IPv6 address in brackets, or the status page URL pasted as-is.
 
-If you'd rather the PC didn't sleep at all, set Steam's own sleep timer to *Never* (Steam → Settings → Power). gpu-yield can't keep the PC awake itself: Linux lets a user override their own sleep blocks, and gpu-yield runs as the same user as Steam, so Steam's sleep would ignore it.
+For anything else, use SSH, for example `ssh gaming-pc.local gpu-yield update`. Setting up an SSH key (`ssh-copy-id`) saves typing a password each time.
 
-## Changing settings
+## Sleep and Wake-on-LAN
+
+If the gaming PC goes to sleep, nothing on the network can reach the AI. There are two ways to handle that.
+
+**Wake it when needed.** Run `gpu-yield wol` on the gaming PC once (setup offers this too). It turns on Wake-on-LAN for the wired network card, through NetworkManager so it survives reboots, and prints the card's address. Then, from another computer:
 
 ```bash
-gpu-yield config                          # list all settings
-gpu-yield config context_length 32768     # change one; it's checked, saved and applied
-gpu-yield config extra_processes "factorio,Game.exe"
-gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0   # Ollama environment variables ("" removes)
+gpu-yield wake gaming-pc.local
 ```
 
-An invalid value is refused and the file is left as it was. You can still edit `~/.config/gpu-yield/config.toml` by hand; apply that with `systemctl --user restart gpu-yield`.
+This sends the wake-up signal and waits until the AI answers, for up to 2 minutes. `wake` needs to know the PC's network card address. It learns that automatically the first time you run `gpu-yield status --host` against the PC while it's awake. You can also pass the address directly, for example `gpu-yield wake 1c:2b:3a:4d:5e:6f`.
 
-## Everyday commands
+Wake-on-LAN needs a wired connection. Some PCs also need it enabled in the BIOS/UEFI, often called *Wake on LAN*, *Power on by PCI-E* or *Resume by LAN*.
+
+**Or don't let it sleep.** Set Steam's sleep timer to *Never* (Steam → Settings → Power). gpu-yield can't keep the PC awake itself: Linux lets a user override their own sleep blocks, and gpu-yield runs as the same user as Steam, so Steam's sleep would ignore a block from gpu-yield.
+
+## Game detection
+
+You don't need to set anything up per game.
+
+- **Everything launched through Steam,** including non-Steam games added to your library. Steam starts each one through a small helper called `reaper`, which lives exactly as long as the game.
+- **Windows games launched outside Steam,** such as from Heroic or Lutris, are caught through Wine's `wineserver` process. This also covers Heroic's *Add to Steam* shortcuts, which can hand the game to an already-open Heroic and exit early. Turn it off with `gpu-yield config detect_wine false` if you run Windows utilities through Wine that shouldn't stop the AI.
+- **Native Linux games launched outside Steam** aren't detected automatically. Add their process name: `gpu-yield config extra_processes "factorio,Game.exe"`. Names are matched against the program's file name or the name `ps -e` shows; case doesn't matter and `.exe` is optional.
+- **To let a particular Steam game run alongside the AI**, add its AppId (shown by `gpu-yield status` while it runs): `gpu-yield config ignore_appids "1820000"`.
+
+## Settings
 
 ```bash
-gpu-yield status        # what it's doing right now, with the running game's name
-gpu-yield pause         # keep the AI off until resume (survives reboots)
-gpu-yield resume
-gpu-yield doctor        # end-to-end check
-gpu-yield model         # choose or change the model
-gpu-yield config        # see "Changing settings"
-gpu-yield update        # see "Updating"
-gpu-yield wol           # Wake-on-LAN for this PC
-gpu-yield firewall      # open the AI and status ports to the local network
-journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
+gpu-yield config                          # list every setting and its current value
+gpu-yield config context_length 32768     # change one: it's checked, saved and applied
+gpu-yield config extra_processes "a,b"    # lists take commas
+gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0   # an Ollama environment variable ("" removes it)
 ```
 
-The Ollama service is regenerated from the config, so don't edit it directly.
+An invalid value is refused and the file is left as it was. You can also edit `~/.config/gpu-yield/config.toml` directly; the file explains each setting. Apply hand edits with `systemctl --user restart gpu-yield`.
 
-## Limits
+| Setting | Default | What it does |
+|---|---|---|
+| `model` | none | Model kept loaded. Change it with `gpu-yield model`, which also downloads it |
+| `context_length` | `65536` | Context window in tokens. Keep your clients set to the same number |
+| `backend` | `"auto"` | `auto`, `rocm` or `vulkan`. `auto` picks ROCm on cards ROCm supports (RX 7000 series, RX 6800/6900, RX 9000, Radeon VII, Ryzen AI Max) and Vulkan on the rest (such as the RX 6700 XT or 6600). A change takes effect after `gpu-yield setup --reinstall` |
+| `port` | `11434` | Port the AI listens on |
+| `status_port` | `11435` | Port of the status page; `0` turns it off |
+| `cooldown_seconds` | `45` | Wait after a game closes before reloading the model |
+| `poll_seconds` | `2` | How often to check for games (0.5 to 60) |
+| `restart_after_suspend` | `true` | Restart Ollama after the PC wakes from sleep |
+| `extra_processes` | `[]` | More programs that count as a game ([Game detection](#game-detection)) |
+| `ignore_appids` | `[]` | Steam AppIds that should not stop the AI |
+| `detect_wine` | `true` | Treat Wine/Proton programs outside Steam as games |
+| `auto_update` | `"off"` | `off`, `gpu-yield`, or `all` (gpu-yield and Ollama). See [Updating](#updating) |
+| `update_repo`, `update_branch` | this repo, `main` | Where updates come from, for forks |
+| `github_token` | none | Read-only token, only needed if `update_repo` is private |
+| `ollama_unit` | managed | Leave as is, unless you run Ollama yourself under another systemd user unit |
+| `[ollama_env]` | none | Extra environment variables for Ollama, set with `gpu-yield config env.NAME VALUE` |
 
-- Games launched through Steam are detected by Steam's `reaper`. Windows games launched any other way (Heroic, Lutris) are detected by Wine's `wineserver` process; this also covers Heroic's "Add to Steam" shortcuts, which can hand the game to an already-open Heroic and exit early. Native Linux games launched outside Steam aren't detected; add their process name to `extra_processes`. Set `detect_wine = false` if you run Windows utilities through Wine that shouldn't stop the AI.
-- The stand-in only exists while Ollama is stopped. There's a gap of under a second during each handoff where connections are refused.
-- Ollama has no authentication. Setup only opens the port to your subnet; don't forward it on your router.
+Settings written by older versions keep working: values in the wrong form, such as numbers in quotes, are read with a warning instead of stopping the AI.
+
+## Updating
+
+```bash
+gpu-yield update --check   # what's available, and what changed
+gpu-yield update           # install the latest gpu-yield from this repo
+gpu-yield update --ollama  # also update Ollama, if a newer release is out
+gpu-yield rollback         # back to the version before the last update; run again to redo
+```
+
+`update` shows the [changelog](CHANGELOG.md) entries between your version and the new one. To install a copy you have locally, such as your own edit, use `gpu-yield update --file PATH`. It also accepts older or same-numbered versions, with a note.
+
+**Automatic updates** are off by default:
+
+```bash
+gpu-yield config auto_update gpu-yield   # or "all" to include Ollama
+```
+
+The watcher checks once a day and installs only while no game is running and the AI hasn't been used for 15 minutes, so an update never interrupts a game or a conversation. It checks for a game again right before installing. After a `rollback`, automatic updates skip the version you left until a newer one comes out or you run `gpu-yield update` yourself. The log is in `journalctl --user -u gpu-yield-autoupdate`.
+
+**What protects an update:**
+
+- The new file runs its own self-test first, and a version that fails is refused, leaving the working one in place.
+- Ollama updates download and unpack alongside the current install and are only swapped in once they run, so a dropped connection never leaves you without Ollama.
+- After swapping in, the new version updates its own service files and restarts, so changes take effect without re-running setup. The model reloads once.
+
+## Command reference
+
+| Command | What it does |
+|---|---|
+| `gpu-yield setup` | Install or repair everything ([Install](#install)) |
+| `gpu-yield status [--host HOST]` | Current state, here or on another PC |
+| `gpu-yield doctor` | Check the whole setup and suggest fixes |
+| `gpu-yield pause` / `gpu-yield resume` | Keep the AI off until resumed; a pause survives reboots |
+| `gpu-yield model [NAME]` | Choose or change the model |
+| `gpu-yield config [KEY [VALUE]]` | Show or change settings |
+| `gpu-yield update [--check] [--ollama] [--file PATH] [--force]` | Update gpu-yield, and optionally Ollama |
+| `gpu-yield rollback` | Undo the last update |
+| `gpu-yield wol` | Show or turn on Wake-on-LAN for this PC |
+| `gpu-yield wake [HOST\|MAC] [--no-wait]` | Wake a sleeping PC and wait until the AI answers |
+| `gpu-yield firewall` | Open the AI and status ports to the local network |
+| `gpu-yield uninstall [--purge]` | Remove it ([Uninstall](#uninstall)) |
+| `gpu-yield run` | The watcher itself; systemd runs this |
+
+## Files it creates
+
+| Path | What |
+|---|---|
+| `~/.local/bin/gpu-yield` | The installed tool |
+| `~/.local/opt/ollama/` | Ollama |
+| `~/.ollama/models/` | Downloaded models (Ollama's usual location) |
+| `~/.config/gpu-yield/config.toml` | Settings |
+| `~/.config/systemd/user/gpu-yield.service` | The watcher service |
+| `~/.config/systemd/user/gpu-yield-ollama.service` | Ollama's service, generated from the config (don't edit it) |
+| `~/.local/state/gpu-yield/` | Pause flag, the previous version for rollback, the auto-update hold |
+| `/run/user/<uid>/gpu-yield/status.json` | Live status (in memory, cleared on reboot) |
+| `~/.cache/gpu-yield/hosts.json` | On *other* computers: PCs that `wake` knows how to reach |
+
+## Limits and security
+
+- **Ollama has no authentication.** Anyone who can reach port 11434 can use the AI. Setup only opens it to your local subnet; don't forward it on your router. The status page is read-only and shows no conversation data.
+- **There's a short gap at each handoff.** The stand-in exists only while Ollama is stopped, so connections are refused for under a second whenever the AI stops or starts.
+- **Native Linux games outside Steam** need to be added to `extra_processes`.
+- **gpu-yield can't keep the PC from sleeping;** see [Sleep and Wake-on-LAN](#sleep-and-wake-on-lan).
+- **Not tested on NVIDIA or Intel GPUs.**
+
+## Example setup
+
+The setup gpu-yield was built for:
+
+- **Gaming PC:** a living-room PC running Bazzite in Steam Gaming Mode, with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, on a wired connection. It runs `gpt-oss:20b` at a 64K context. `backend` resolves to ROCm (the RX 7800 XT is `gfx1101`).
+- **Clients:** Hermes Agent on a desktop on the same network, configured as in [Connecting clients](#connecting-clients), plus the status page on a phone.
+- **Day to day:** games are launched from Big Picture, and updates can be run from the desktop with `ssh <gaming-pc> gpu-yield update`.
+
+On a card with less memory, such as a desktop with an RX 6700 XT (12 GB) and 32 GB of RAM, the same install picks Vulkan automatically. `qwen3.5:9b` fits there entirely, while `gpt-oss:20b` runs with part of it in system RAM.
 
 ## Testing
 
-**Tested on Bazzite** in Steam Gaming Mode, on a PC with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, running gpt-oss:20b at a 64K context:
+**Tested on real hardware** (the [example setup](#example-setup)):
 
-- install with `setup`, and upgrading an earlier install by re-running it
-- detecting a Steam game launched from Big Picture and stopping Ollama to free the GPU
-- reloading the model after the game closed and the cooldown ended
+- installing with `setup`, and upgrading an earlier install by re-running it
+- detecting a game launched from Big Picture and freeing the GPU
+- reloading the model after the game closed
 
-**Tested only in simulation**, against fake processes and a fake Ollama server:
+**Tested in simulation**, against fake processes, a fake Ollama server and a fake GitHub:
 
-- the 503 stand-in replies
-- pause and resume
-- restart after sleep
-- `update`, `rollback` and Ollama updates, including failed downloads
-- Wine/Proton detection for games launched outside Steam
-- game names (Steam manifests, non-Steam shortcuts)
-- recovering from a crashed, hung or emptied Ollama, and from a broken config
-- the status page, `status --host`, `wake`, automatic updates, the `config` command, and backend choice
+- the 503 stand-in, pause and resume, restart after sleep
+- Wine/Proton detection, game names (Steam manifests, non-Steam shortcuts), `extra_processes` matching
+- `update`, `rollback`, automatic updates and Ollama updates, including failed and interrupted downloads
+- recovery from a crashed, hung or emptied Ollama, and from a broken config
+- the status page, `status --host`, `wake`, the `config` command, and backend choice
 
-After installing on new hardware, run `gpu-yield doctor`, then launch a game and check `gpu-yield status`.
+Wake-on-LAN itself (`nmcli`, `ethtool`, the BIOS) can't be simulated; check it with `gpu-yield wol` and a real `gpu-yield wake`. After installing on new hardware, run `gpu-yield doctor`, then start a game and check `gpu-yield status`.
 
-Wake-on-LAN setup (`nmcli`, `ethtool`, BIOS) can't be simulated; check it with `gpu-yield wol` and a real `gpu-yield wake`.
-
-The automated tests run on GitHub for every change. They need only Python 3.11+ (and `zstd` for the Ollama install tests). They run in a throwaway home folder and don't touch a real install:
+The tests run on GitHub for every change. To run them yourself you need only Python 3.11+, plus `zstd` for the Ollama install tests. They run in a throwaway home folder and don't touch a real install:
 
 ```bash
 python3 tests/run_tests.py
@@ -211,8 +326,8 @@ python3 tests/run_tests.py
 ## Uninstall
 
 ```bash
-gpu-yield uninstall            # services only
-gpu-yield uninstall --purge    # also Ollama, config and state
+gpu-yield uninstall            # remove the services and the installed tool
+gpu-yield uninstall --purge    # also remove Ollama, the config and state
 ```
 
-Downloaded models stay in `~/.ollama/models` until you delete them.
+Downloaded models stay in `~/.ollama/models` until you delete them. If setup opened the firewall, `uninstall` prints how to remove those rules.
