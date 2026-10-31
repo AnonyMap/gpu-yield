@@ -326,7 +326,7 @@ The setup gpu-yield was built for:
 - **Gaming PC:** a living-room PC running Bazzite in Steam Gaming Mode, with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, connected over Wi-Fi. It runs `gpt-oss:20b` at a 64K context. `backend` resolves to ROCm (the RX 7800 XT is `gfx1101`).
 - **Clients:** Hermes Agent on a desktop on the same network, configured as in [Connecting clients](#connecting-clients), plus the status page on a phone.
 - **Day to day:** games are launched from Big Picture, and updates can be run from the desktop with `ssh <gaming-pc> gpu-yield update`. Models and context can be changed from the status page on any device.
-- **Sleep:** because the PC is on Wi-Fi, ordinary Wake-on-LAN doesn't apply. `gpu-yield wol` reports whether its Wi-Fi card supports Wake on Wireless LAN. If it doesn't, setting Steam's sleep timer to *Never* keeps the AI reachable.
+- **Sleep:** the PC stays on all the time, so the AI is always reachable and Wake-on-LAN isn't used.
 
 On a card with less memory, such as a desktop with an RX 6700 XT (12 GB) and 32 GB of RAM, the same install picks Vulkan automatically. `qwen3.5:9b` fits there entirely, while `gpt-oss:20b` runs with part of it in system RAM.
 
