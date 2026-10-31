@@ -8,6 +8,8 @@ Keeps a local LLM loaded on the living-room PC while it sits in Steam's Gaming M
 | Game starts | Ollama is stopped within ~2 s, freeing all of its VRAM. A stand-in takes over port 11434 and answers every request with `503` and a plain-English reason |
 | Game closes | After a 45 s cooldown (so launchers and quick game switches don't cause reload churn), Ollama starts and the model is reloaded |
 | PC wakes from sleep | Ollama is restarted, since GPU compute can be unreliable after resume |
+| Ollama crashes, hangs or drops the model | It is restarted and the model reloaded, checked every 15 s |
+| The config file has a mistake | The AI stays off (a game could start at any time) and clients are told why, until the file is fixed |
 
 Games are detected through Steam's `reaper` helper. Steam launches every game in your library through it, non-Steam shortcuts included, and it lives exactly as long as the game. Windows games started outside Steam, such as from Heroic, are caught by Wine's `wineserver` process. No per-game launch options are needed.
 
@@ -16,11 +18,11 @@ Games are detected through Steam's `reaper` helper. Steam launches every game in
 On the living-room PC, in a terminal (over SSH or in Desktop Mode):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AnonyMap/gpu-yield/main/gpu-yield -o ~/gpu-yield
-python3 ~/gpu-yield setup
+curl -fsSL https://raw.githubusercontent.com/AnonyMap/gpu-yield/main/gpu-yield -o /tmp/gpu-yield
+python3 /tmp/gpu-yield setup
 ```
 
-The same two commands upgrade an install from before `gpu-yield update` existed (1.0.x). Setup keeps your existing config.
+Setup copies itself into place, so the downloaded file is just a one-time installer (`/tmp` is cleared on reboot). The same two commands upgrade an install from before `gpu-yield update` existed (1.0.x). Setup keeps your existing config.
 
 Setup runs as your normal user and asks for `sudo` only for the firewall rule. It:
 
@@ -66,7 +68,7 @@ scp gpu-yield you@livingroom-pc:~/gpu-yield-new
 ssh you@livingroom-pc gpu-yield update --file ~/gpu-yield-new
 ```
 
-Before replacing anything, an update runs the new file's own self-test, and a version that fails it is refused, leaving the working one in place. After swapping in, the new version rewrites its service files and restarts the watcher, so the model reloads once. Updates come from the `main` branch of `AnonyMap/gpu-yield`; to use a fork, set `update_repo` in the config.
+Before replacing anything, an update runs the new file's own self-test, and a version that fails it is refused, leaving the working one in place. Ollama updates work the same way: the new version is downloaded and unpacked alongside the old one, and only swapped in once it runs, so a dropped connection never leaves you without Ollama. After swapping in, the new version rewrites its service files and restarts the watcher, so the model reloads once. Updates come from the `main` branch of `AnonyMap/gpu-yield`; to use a fork, set `update_repo` in the config.
 
 ## Model choice
 
@@ -109,14 +111,14 @@ model:
   ollama_num_ctx: 65536
 ```
 
-Set the context numbers to match `context_length` in gpu-yield's config. If Hermes asks for a different size than the one preloaded, Ollama reloads the model on the first request. If they are left unset, Hermes has been known to request the model's full 256K window, which won't fit.
+Set the context numbers to match `context_length` in gpu-yield's config. If Hermes asks for a different size than the one preloaded, Ollama reloads the model on the first request. If they are left unset, Hermes has been known to request the model's full 256K window, which won't fit. When a client loads a different model or context than gpu-yield's, `gpu-yield status` shows a note saying what to change.
 
 If you configure a cloud fallback in Hermes, the stand-in's 503 is what triggers it, so mid-game requests can fail over instead of just failing.
 
 ## Everyday commands
 
 ```bash
-gpu-yield status        # what it's doing right now
+gpu-yield status        # what it's doing right now, with the running game's name
 gpu-yield pause         # keep the AI off until resume (survives reboots)
 gpu-yield resume
 gpu-yield doctor        # end-to-end check
@@ -146,10 +148,18 @@ Edit `~/.config/gpu-yield/config.toml`, then run `systemctl --user restart gpu-y
 - the 503 stand-in replies
 - pause and resume
 - restart after sleep
-- `update` and `rollback`
+- `update`, `rollback` and Ollama updates, including failed downloads
 - Wine/Proton detection for games launched outside Steam
+- game names (Steam manifests, non-Steam shortcuts)
+- recovering from a crashed, hung or emptied Ollama, and from a broken config
 
 After installing on new hardware, run `gpu-yield doctor`, then launch a game and check `gpu-yield status`.
+
+The automated tests need only Python 3.11+ (and `zstd` for the Ollama install tests). They run in a throwaway home folder and don't touch a real install:
+
+```bash
+python3 tests/run_tests.py
+```
 
 ## Uninstall
 
