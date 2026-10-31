@@ -299,6 +299,11 @@ def repair_config(cfg, user):
     if isinstance(poll, (int, float)) and not isinstance(poll, bool) and not 0.5 <= poll <= 60:
         cfg["poll_seconds"] = min(60, max(0.5, poll))     # 1.5 and earlier clamped silently
         warn(f"config: poll_seconds = {poll} is out of range; using {cfg['poll_seconds']}")
+    if "alias" not in user and cfg["alias"] and isinstance(cfg["model"], str) and cfg["model"] \
+            and same_model(cfg["alias"], cfg["model"]):
+        cfg["alias"] = ""
+        warn(f"config: your model is named {cfg['model']}, like the new fixed name for apps; "
+             "turned the fixed name off (set alias to choose one)")
     if "status_port" not in user and cfg["status_port"] == cfg["port"]:
         cfg["status_port"] = cfg["port"] + 1 if cfg["port"] < 65535 else 0
         warn(f"config: port {cfg['port']} is also the status page's default; status page "
@@ -1046,13 +1051,37 @@ def load_speed_results():
         return []
 
 
+_speed_lock = threading.Lock()
+
+
 def save_speed_result(result):
-    results = [result] + load_speed_results()
+    with _speed_lock:
+        results = [result] + load_speed_results()
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = SPEED_FILE.with_name(f".{SPEED_FILE.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(results[:20], indent=1))
+            os.replace(tmp, SPEED_FILE)
+        except OSError as e:
+            log(f"couldn't save the speed test result: {e}")
+
+
+ALIAS_FILE = STATE_DIR / "alias.json"
+
+
+def alias_record():
+    """The fixed-name copy gpu-yield made last: {"name", "digest"}; {} if none."""
+    try:
+        rec = json.loads(ALIAS_FILE.read_text())
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_alias_record(name, digest):
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        tmp = SPEED_FILE.with_suffix(".tmp")
-        tmp.write_text(json.dumps(results[:20], indent=1))
-        os.replace(tmp, SPEED_FILE)
+        ALIAS_FILE.write_text(json.dumps({"name": name, "digest": digest}))
     except OSError:
         pass
 
@@ -1291,8 +1320,10 @@ a { color:inherit; }
     <h3>Speed test</h3>
     <div class="line"><button id="speedbtn" type="button">Test the loaded model</button>
       <span class="muted" id="speedstate"></span></div>
-    <p class="muted">Reads about 2,000 tokens, then writes 128. Takes a few seconds to a minute.
-    <b>Reading</b> is how fast long prompts are taken in; <b>writing</b> is how fast answers appear.</p>
+    <p class="muted">Reads about 2,000 tokens, then writes 128; takes a few seconds to a minute.
+    <b>Reading</b> is how fast long prompts are taken in; <b>writing</b> is how fast answers appear.
+    Best run while nothing else is using the AI: requests wait behind the test, and the next long
+    conversation has to be re-read from the start.</p>
     <table class="speeds" id="speeds" hidden><thead><tr><th>Model</th><th class="num">Reading</th>
       <th class="num">Writing</th><th class="num">Context</th><th class="num">When</th></tr></thead>
       <tbody></tbody></table>
@@ -1310,7 +1341,7 @@ a { color:inherit; }
 const $ = id => document.getElementById(id);
 const KEY = "gpu-yield-password";
 let pw = null, snap = JSON.parse($("initial").textContent), models = null, busy = false;
-let ctxChoice = null, modelsKey = "", jobsKey = "", eventsKey = "", speedKey = "", tick = 0, allEvents = false;   // unapplied dropdown choice; last drawn lists
+let ctxChoice = null, modelsKey = "", jobsKey = "", eventsKey = "", speedKey = "", tick = 0, allEvents = false, lastSpeed = null;   // unapplied dropdown choice; last drawn lists
 try { pw = localStorage.getItem(KEY); } catch (e) {}
 
 function el(tag, attrs, ...kids) {
@@ -1368,7 +1399,8 @@ function renderStatus(s) {
   if (ek !== eventsKey || tick % 10 === 0) {
     eventsKey = ek;
     $("events").replaceChildren(...ev.slice(0, allEvents ? ev.length : 6).map(e => el("li", { class: e.kind || "info" },
-      el("span", { class: "when" }, ago(e.at)), el("span", { class: "what" }, e.text))));
+      el("span", { class: "when" }, ago(e.at)),
+      el("span", { class: "what" }, e.text + (e.count > 1 ? " (×" + e.count + ")" : "")))));
   }
 }
 
@@ -1395,8 +1427,19 @@ function renderControls() {
   if (jk !== jobsKey) { jobsKey = jk; drawJobs(s); }
   const sp = s.speed || {};
   $("speedbtn").disabled = busy || sp.state === "running" || !s.ai_available;
+  const res = sp.result;
   $("speedstate").textContent = sp.state === "running" ? "Testing " + sp.model + "…"
-    : sp.state === "failed" ? "Failed: " + sp.error : !s.ai_available ? "Needs the model loaded" : "";
+    : sp.state === "failed" ? "Failed: " + sp.error
+    : sp.state === "done" && res ? "Reading " + res.read_tps + "/s, writing " + res.write_tps + "/s"
+    : !s.ai_available ? "Needs the model loaded" : "";
+  // Announce a test that finished since the last look (however quickly it ran), but not
+  // results that were already there when the page opened.
+  const outcome = sp.state === "running" ? null : sp.state + "|" + (res ? res.at : "") + "|" + (sp.error || "");
+  if (outcome && lastSpeed !== null && outcome !== lastSpeed && sp.state !== "idle")
+    say(sp.state === "done" && res ? "Speed test done: reading " + res.read_tps + " tokens/s, writing "
+        + res.write_tps + " tokens/s." : "Speed test failed: " + sp.error, sp.state !== "done");
+  if (outcome) lastSpeed = outcome;
+  else if (lastSpeed === null) lastSpeed = "";
   const sk = JSON.stringify([s.speed_results, s.model]);
   if (sk !== speedKey || tick % 10 === 0) { speedKey = sk; drawSpeeds(s); }
 }
@@ -1451,7 +1494,11 @@ async function act(action, body, pending) {
       body: JSON.stringify(body || {}) });
     const d = await r.json().catch(() => ({}));
     if (r.status === 403 && action !== "auth") { forget(); }
-    if (!r.ok) { say(d.error || ("Error " + r.status), true); return false; }
+    if (!r.ok) {
+      if (d.busy && action === "speed" && confirm(d.error + " Run the speed test anyway?"))
+        { busy = false; return act("speed", { force: true }, pending); }
+      say(d.error || ("Error " + r.status), true); return false;
+    }
     say(d.message || "");
     return true;
   } catch (e) { say("Couldn't reach the PC: " + e.message, true); return false; }
@@ -1717,6 +1764,8 @@ class Watcher:
         self.loaded_name = None
         self.speed = {"state": "idle", "error": "", "result": None, "model": ""}
         self.speed_results = load_speed_results()
+        self.speed_mtime = None
+        self.alias_problem = ""
         self.actions = queue.Queue()     # changes requested from the page, applied by run()
         self.downloads = {}              # model name -> progress of a download
         self.dl_lock = threading.Lock()
@@ -1798,19 +1847,38 @@ class Watcher:
         t = time.monotonic()
         target = model
         try:
+            self.alias_problem = ""
             alias = self.cfg["alias"]
+            tags = self.ollama.request("/api/tags", timeout=10).get("models", [])
+            self.forget_old_alias(tags, alias)
             if alias:
                 # Point the fixed name at this model and load it under that name, so apps
                 # using it get the loaded model with no reload. Copies share the files.
-                try:
-                    self.ollama.request("/api/copy", {"source": model, "destination": alias},
-                                        timeout=60)
-                    target = alias
-                except urllib.error.HTTPError as e:
-                    if e.code == 404:
-                        raise
-                    self.event(f"couldn't point {alias} at {model} ({http_error_detail(e)}); "
-                        f"loading it under its own name")
+                if not any(same_model(m.get("name") or m.get("model", ""), model) for m in tags):
+                    raise urllib.error.HTTPError(self.ollama.base, 404, "not found", None, None)
+                existing = next((m for m in tags
+                                 if same_model(m.get("name") or m.get("model", ""), alias)), None)
+                if existing and existing.get("digest") != alias_record().get("digest"):
+                    # A model with this name that gpu-yield didn't make: never overwrite it.
+                    self.alias_problem = (f"a model named {alias} already exists, so gpu-yield "
+                                          f"won't overwrite it. Choose another fixed name: "
+                                          f"gpu-yield config alias SOMETHING-ELSE")
+                    self.event(self.alias_problem, "error")
+                else:
+                    try:
+                        self.ollama.request("/api/copy", {"source": model, "destination": alias},
+                                            timeout=60)
+                        made = next((m for m in self.ollama.request("/api/tags", timeout=10)
+                                     .get("models", []) if same_model(m.get("name", ""), alias)), {})
+                        save_alias_record(alias, made.get("digest"))
+                        target = alias
+                    except urllib.error.HTTPError as e:
+                        if e.code == 404:
+                            raise
+                        self.alias_problem = (f"couldn't point {alias} at {model} "
+                                              f"({http_error_detail(e)}); apps using {alias} may "
+                                              f"get an older model")
+                        self.event(self.alias_problem, "error")
             self.loaded_name = target
             self.ollama.warm(target)
         except urllib.error.HTTPError as e:
@@ -1828,9 +1896,9 @@ class Watcher:
         self.warm_status = f"ready ({model}{named}{where})"
         self.warm_failed_at = None
         self.event(f"{model} loaded{named} in {time.monotonic() - t:.1f}s{where}")
-        _, note = placement_note(self.ollama, model, share)
+        problem, note = placement_note(self.ollama, model, share)
         if note:
-            self.event(note)
+            self.event(note, "error" if problem else "warn")
 
     def update_message(self, now):
         cd = int(self.cfg["cooldown_seconds"])
@@ -1919,7 +1987,9 @@ class Watcher:
                 self.start_warm()
             return
         self.empty_checks = 0
-        ours = [n for n in (model, self.cfg["alias"]) if n]
+        trusted_alias = self.loaded_name if self.loaded_name and self.cfg["alias"] and \
+            same_model(self.loaded_name, self.cfg["alias"]) else None
+        ours = [n for n in (model, trusted_alias) if n]
         mine = [m for m in models
                 if any(same_model(m.get("name") or m.get("model", ""), n) for n in ours)]
         if not mine:
@@ -1935,16 +2005,39 @@ class Watcher:
                            f"Set Hermes's context_length and ollama_num_ctx to {ctx}")
             self.warn_once(("ctx", got), self.notice)
             return
-        self.notice = ""
+        self.notice = self.alias_problem
         self.warned.clear()
 
-    def event(self, text):
-        """Log, and remember for the "Recent events" list on the page and in status."""
+    def event(self, text, kind=None):
+        """Log, and remember for the "Recent events" list on the page and in status.
+        A repeat of the newest event is folded into it ("×N"), so a retry loop can't push
+        everything else out of the list."""
         log(text)
-        low = text.lower()
-        kind = "error" if re.search(r"\b(failed|couldn't|error|not answering|stopped answering)\b", low) \
-            else "warn" if low.startswith("note:") else "info"
+        if kind is None:
+            low = text.lower()
+            kind = "error" if re.search(r"\b(failed|couldn't|error|not answering|stopped answering)\b", low) \
+                else "warn" if low.startswith("note:") else "info"
+        if self.events and self.events[0].get("text") == text:
+            self.events[0]["at"] = time.time()
+            self.events[0]["count"] = self.events[0].get("count", 1) + 1
+            return
         self.events.appendleft({"at": time.time(), "text": text, "kind": kind})
+
+    def forget_old_alias(self, tags, current):
+        """If the fixed name was renamed or turned off, delete the old copy gpu-yield made,
+        so it doesn't keep an old model's files on disk."""
+        rec = alias_record()
+        old = rec.get("name")
+        if not old or (current and same_model(old, current)):
+            return
+        entry = next((m for m in tags if same_model(m.get("name") or m.get("model", ""), old)), None)
+        if entry and entry.get("digest") == rec.get("digest"):
+            try:
+                self.ollama.request("/api/delete", {"model": old}, method="DELETE", timeout=30)
+                self.event(f"removed the old fixed name {old}")
+            except Exception:
+                return
+        ALIAS_FILE.unlink(missing_ok=True)
 
     def warn_once(self, key, msg):
         if key not in self.warned:
@@ -2047,6 +2140,12 @@ class Watcher:
     def _api_speed(self, data):
         if self.state != "ai" or self.warming or not self.warm_status.startswith("ready"):
             return 409, {"error": "The speed test needs the model loaded and no game running."}
+        recently = self.last_used and time.time() - self.last_used < 120
+        if (self.in_use or recently) and not data.get("force"):
+            return 409, {"busy": True,
+                         "error": "The AI is in use. A speed test makes waiting requests queue "
+                                  "behind it and clears the conversation Ollama has cached, so "
+                                  "the next long request starts over."}
         with self.dl_lock:
             if self.speed["state"] == "running":
                 return 409, {"error": "A speed test is already running"}
@@ -2061,7 +2160,6 @@ class Watcher:
             res = speed_test(self.ollama, self.loaded_name or model, self.cfg["context_length"],
                              label=model)
             save_speed_result(res)
-            self.speed_results = [res] + self.speed_results[:19]
             self.speed = {"state": "done", "error": "", "result": res, "model": model}
             self.event(f"speed test of {model}: reading {res['read_tps']} tokens/s, "
                        f"writing {res['write_tps']} tokens/s")
@@ -2074,6 +2172,16 @@ class Watcher:
                 err = str(e) or e.__class__.__name__
             self.speed = {"state": "failed", "error": err, "result": None, "model": model}
             self.event(f"speed test of {model} failed: {err}")
+
+    def current_speed_results(self):
+        try:
+            mtime = SPEED_FILE.stat().st_mtime
+        except OSError:
+            mtime = None
+        if mtime != self.speed_mtime:
+            self.speed_mtime = mtime
+            self.speed_results = load_speed_results()
+        return self.speed_results
 
     def _api_cancel(self, data):
         with self.dl_lock:
@@ -2323,12 +2431,13 @@ class Watcher:
             "paused": PAUSE_FILE.exists(),
             "controls": bool(self.cfg["control_password"]),
             "downloads": self.download_list(),
-            "alias": self.cfg["alias"],
+            "alias": self.cfg["alias"] if self.loaded_name and same_model(
+                self.loaded_name, self.cfg["alias"] or "-") else "",
             "loaded_name": self.loaded_name if ready else None,
             "memory": memory_readings(),
             "events": list(self.events)[:20],
             "speed": self.speed,
-            "speed_results": self.speed_results[:8],
+            "speed_results": self.current_speed_results()[:8],
         }
 
     def write_status(self, now):
@@ -2350,7 +2459,10 @@ class Watcher:
         (STATE_DIR / "status.json").unlink(missing_ok=True)   # pre-1.5 location
         previous = read_status() or {}                            # survives watcher restarts
         self.last_used = previous.get("last_used")
-        self.events.extend(e for e in previous.get("events", []) if isinstance(e, dict))
+        old = previous.get("events")
+        self.events.extend(e for e in (old if isinstance(old, list) else [])
+                           if isinstance(e, dict) and isinstance(e.get("at"), (int, float))
+                           and isinstance(e.get("text"), str))
         self.event(f"gpu-yield {VERSION} watching for games (model {self.cfg['model']}, "
             f"context {self.cfg['context_length']}, cooldown {self.cfg['cooldown_seconds']}s)")
         page = None
@@ -2516,7 +2628,8 @@ def print_status(st, suffix=""):
     if events:
         print("Recent:")
         for e in events[:5]:
-            print(f"  {ago(time.time() - e.get('at', time.time())):>6} ago  {e.get('text', '')}")
+            n = f"  (×{e['count']})" if e.get("count", 1) > 1 else ""
+            print(f"  {ago(time.time() - e.get('at', time.time())):>6} ago  {e.get('text', '')}{n}")
 
 
 # --- other computers: remote status and wake-up
@@ -2761,6 +2874,10 @@ def cmd_speed(args):
     if st.get("state") != "ai" or not str(st.get("model_status", "")).startswith("ready"):
         die("the speed test needs the AI running with its model loaded (no game, not paused)")
     name = st.get("loaded_name") or cfg["model"]
+    if (st.get("in_use") or (st.get("last_used") and time.time() - st["last_used"] < 120)) \
+            and not args.force:
+        die("the AI is in use. A speed test makes waiting requests queue behind it and clears "
+            "the conversation Ollama has cached. Run it later, or add --force")
     print(f"Testing {cfg['model']} at context {cfg['context_length']}: "
           "reading about 2,000 tokens, then writing 128...")
     try:
@@ -3320,9 +3437,22 @@ Useful commands:
 
 def cmd_uninstall(args):
     try:
-        where = models_dir(load_config())     # before --purge removes the config
+        cfg = load_config()
+        where = models_dir(cfg)                # before --purge removes the config
     except SystemExit:
-        where = HOME / ".ollama/models"
+        cfg, where = None, HOME / ".ollama/models"
+    rec = alias_record()
+    if cfg and rec.get("name"):                # the fixed name's copy, if gpu-yield made it
+        o = Ollama(cfg)
+        try:
+            entry = next((m for m in o.request("/api/tags", timeout=5).get("models", [])
+                          if same_model(m.get("name", ""), rec["name"])), None)
+            if entry and entry.get("digest") == rec.get("digest"):
+                o.request("/api/delete", {"model": rec["name"]}, method="DELETE", timeout=30)
+                print(f"Removed the fixed name {rec['name']} from Ollama.")
+        except Exception:
+            print(f"Ollama isn't running, so the fixed name {rec['name']} wasn't removed; "
+                  f"once Ollama runs again: ollama rm {rec['name']}")
     user_systemctl("disable", "--now", WATCHER_UNIT)
     user_systemctl("stop", MANAGED_OLLAMA_UNIT)
     for unit in (WATCHER_UNIT, MANAGED_OLLAMA_UNIT):
@@ -3623,8 +3753,9 @@ def main():
     wk.add_argument("--no-wait", action="store_true", help="don't wait for it to come up")
     wk.set_defaults(func=cmd_wake)
     sub.add_parser("wol", help="show or turn on Wake-on-LAN for this PC").set_defaults(func=cmd_wol)
-    sub.add_parser("speed", help="measure how fast the loaded model reads and writes") \
-        .set_defaults(func=cmd_speed)
+    sp = sub.add_parser("speed", help="measure how fast the loaded model reads and writes")
+    sp.add_argument("--force", action="store_true", help="run even if the AI is in use")
+    sp.set_defaults(func=cmd_speed)
     sub.add_parser("firewall", help="open the AI and status ports to the local network") \
         .set_defaults(func=cmd_firewall)
     up = sub.add_parser("update", help="update gpu-yield from GitHub (and optionally Ollama)")

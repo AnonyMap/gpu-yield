@@ -232,4 +232,117 @@ probe = ("import os, runpy, sys; del os.getuid; del os.geteuid; "
 r = subprocess.run([sys.executable, "-B", "-c", probe], capture_output=True, text=True, timeout=30)
 assert r.returncode == 1 and "can't reach 127.0.0.1:1" in r.stderr and "Traceback" not in r.stderr, r.stderr
 ok("status --host runs on a system without os.getuid (Windows)")
+
+# ---------------------------------------------------------------- 1.8 review fixes
+import urllib.error
+
+
+class StubOllama:
+    """Just enough of Ollama's API for the fixed-name logic."""
+    def __init__(self, tags, copy_error=None):
+        self.tags, self.copy_error, self.calls, self.base = tags, copy_error, [], "http://stub"
+        self.cfg = None
+
+    def request(self, path, payload=None, timeout=5.0, method=None):
+        self.calls.append((path, payload))
+        if path == "/api/tags":
+            return {"models": list(self.tags)}
+        if path == "/api/copy":
+            if self.copy_error:
+                raise urllib.error.HTTPError(self.base, self.copy_error, "boom", None, None)
+            src = next(m for m in self.tags if m["name"] == payload["source"])
+            self.tags = [m for m in self.tags if not gy.same_model(m["name"], payload["destination"])]
+            self.tags.append({"name": payload["destination"] + ":latest", "digest": src["digest"]})
+            return {}
+        if path == "/api/delete":
+            self.tags = [m for m in self.tags if not gy.same_model(m["name"], payload["model"])]
+            return {}
+        return {}
+
+    def wait_ready(self, *a): return True
+    def warm(self, name=None): self.calls.append(("warm", name))
+    def loaded(self): return []
+    def is_moe(self, m): return False
+
+
+def warm_with(tags, alias="gpu-yield", copy_error=None):
+    wx = gy.Watcher(dict(gy.DEFAULTS, port=1, model="gpt-oss:20b", alias=alias))
+    wx.ollama = StubOllama(tags, copy_error)
+    wx.ollama.cfg = wx.cfg
+    wx._warm_inner(wx.warm_gen)
+    return wx
+
+
+gy.ALIAS_FILE.unlink(missing_ok=True)
+base = [{"name": "gpt-oss:20b", "digest": "d1"}]
+wx = warm_with(base)
+assert ("warm", "gpu-yield") in wx.ollama.calls and gy.alias_record() == {"name": "gpu-yield", "digest": "d1"}
+wx = warm_with(wx.ollama.tags)                    # ours already: re-pointed freely
+assert wx.loaded_name == "gpu-yield" and not wx.alias_problem
+gy.ALIAS_FILE.unlink()
+wx = warm_with(base + [{"name": "gpu-yield:latest", "digest": "someone-elses"}])
+assert not any(c[0] == "/api/copy" for c in wx.ollama.calls), "overwrote a model gpu-yield didn't make"
+assert wx.loaded_name == "gpt-oss:20b" and "won't overwrite" in wx.alias_problem
+assert any(e["kind"] == "error" and "won't overwrite" in e["text"] for e in wx.events)
+assert wx.snapshot()["alias"] == ""
+ok("the fixed name never overwrites a model gpu-yield didn't create")
+
+gy.save_alias_record("old-name", "d1")
+wx = warm_with(base + [{"name": "old-name:latest", "digest": "d1"}], alias="new-name")
+assert ("/api/delete", {"model": "old-name"}) in wx.ollama.calls and gy.alias_record()["name"] == "new-name"
+wx = warm_with(wx.ollama.tags, alias="")
+assert ("/api/delete", {"model": "new-name"}) in wx.ollama.calls and gy.alias_record() == {}
+assert ("warm", "gpt-oss:20b") in wx.ollama.calls
+ok("renaming or turning off the fixed name removes the old copy gpu-yield made")
+
+gy.ALIAS_FILE.unlink(missing_ok=True)
+wx = warm_with(base, copy_error=500)
+assert wx.loaded_name == "gpt-oss:20b" and "couldn't point" in wx.alias_problem
+wx.warm_status = "ready"
+wx.check_loaded([{"name": "gpu-yield:latest"}])
+assert "instead of" in wx.notice, "a stale fixed name must not count as the loaded model"
+assert wx.snapshot()["alias"] == ""
+ok("if the fixed name can't be updated, it isn't trusted or advertised, and status says so")
+
+gy.CONFIG_FILE.write_text('model = "gpu-yield"\n')
+assert gy.load_config()["alias"] == ""
+gy.CONFIG_FILE.write_text('model = "gpu-yield"\nalias = "gpu-yield"\n')
+try:
+    gy.load_config(); raise AssertionError("an explicit clash should be reported")
+except SystemExit:
+    pass
+gy.CONFIG_FILE.write_text("")
+ok("upgrading with a model already named gpu-yield turns the fixed name off instead of the AI")
+
+# events: folded repeats, explicit kinds, damaged status file
+wx = gy.Watcher(dict(gy.DEFAULTS, port=1))
+for _ in range(5):
+    wx.event("failed: x is not downloaded")
+assert len(wx.events) == 1 and wx.events[0]["count"] == 5
+wx.event("the model is running entirely on the CPU", "error")
+assert wx.events[0]["kind"] == "error"
+gy.write_status_file({"events": None, "last_used": None})
+ws = gy.Watcher(dict(gy.DEFAULTS, port=free_port(), status_port=0))
+ws.ollama = StubOllama(base); ws.ollama.active = lambda: True; ws.ollama.start = lambda: True
+ws.ollama.stop = lambda: True; ws.ollama.ready = lambda: True
+real_unit = gy.ensure_ollama_unit; gy.ensure_ollama_unit = lambda c: False
+th = threading.Thread(target=ws.run, daemon=True); th.start()
+time.sleep(1.0); ws.stop_evt.set(); th.join(5)
+gy.ensure_ollama_unit = real_unit
+assert not th.is_alive() and ws.state == "ai", "a damaged status file must not stop the watcher"
+ok("events: repeats fold into one with a count; a damaged status file is ignored")
+
+# speed tests: results from the command line show up; no surprise tests while in use
+wx = gy.Watcher(dict(gy.DEFAULTS, port=1, control_password="hunter22", model="m"))
+before = len(wx.current_speed_results())
+time.sleep(0.02)
+gy.save_speed_result({"model": "m", "context_length": 1, "at": time.time(), "prompt_tokens": 1,
+                      "read_tps": 1.0, "gen_tokens": 1, "write_tps": 1.0})
+assert len(wx.current_speed_results()) == before + 1
+wx.state, wx.warm_status, wx.in_use = "ai", "ready", True
+code, body = wx.api("speed", {}, "hunter22")
+assert code == 409 and body.get("busy")
+wx.ollama.request = lambda *a, **k: {"prompt_eval_count": 1, "prompt_eval_duration": 1, "eval_count": 1, "eval_duration": 1}
+assert wx.api("speed", {"force": True}, "hunter22")[0] == 202
+ok("speed test: command-line results appear on the page; asks first while the AI is in use")
 print("feature tests passed")

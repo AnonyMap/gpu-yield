@@ -31,6 +31,10 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
         if not alive["answer"]:
             time.sleep(3)        # longer than the client timeout
             return
+        if self.path == "/api/tags":     # installed models; a copy shares its source's digest
+            copied = any(e[0] == "copy" for e in events)
+            return self._send({"models": [{"name": "gpt-oss:20b", "digest": "d-gptoss"}] +
+                              ([{"name": "gpu-yield:latest", "digest": "d-gptoss"}] if copied else [])})
         self._send({"version": "fake"} if self.path == "/api/version" else loaded)
 
     def do_POST(self):

@@ -11,8 +11,8 @@ from _util import free_port, load, ok, wait
 
 gy = load()
 OLLAMA_PORT, PAGE_PORT = free_port(), free_port()
-ollama = {"models": [{"name": "gpt-oss:20b", "size": 13_000_000_000},
-                     {"name": "qwen3.5:9b", "size": 6_600_000_000}],
+ollama = {"models": [{"name": "gpt-oss:20b", "size": 13_000_000_000, "digest": "d-gptoss"},
+                     {"name": "qwen3.5:9b", "size": 6_600_000_000, "digest": "d-qwen9"}],
           "loaded": [], "generated": [], "deleted": [], "pull_delay": 0.05, "aliases": {}}
 
 
@@ -36,7 +36,9 @@ class FakeOllama(BaseHTTPRequestHandler):
         if self.path == "/api/version":
             return self._json({"version": "fake"})
         if self.path == "/api/tags":     # like Ollama, a copy shows up as its own entry
-            copies = [{"name": a + ":latest", "size": 1} for a in ollama["aliases"]]
+            digest = {m["name"]: m.get("digest") for m in ollama["models"]}
+            copies = [{"name": a + ":latest", "size": 1, "digest": digest.get(src, "d-" + src)}
+                      for a, src in ollama["aliases"].items()]
             return self._json({"models": ollama["models"] + copies})
         if self.path == "/api/ps":
             return self._json({"models": ollama["loaded"]})
@@ -45,6 +47,7 @@ class FakeOllama(BaseHTTPRequestHandler):
     def do_DELETE(self):
         name = self._body()["model"]
         ollama["deleted"].append(name)
+        ollama["aliases"].pop(name.split(":")[0], None)
         ollama["models"] = [m for m in ollama["models"] if m["name"] != name]
         self._json({})
 
@@ -82,7 +85,7 @@ class FakeOllama(BaseHTTPRequestHandler):
                            "total": 1000, "completed": done * 10})
                 chunk({"status": "success"})
                 self.wfile.write(b"0\r\n\r\n")
-                ollama["models"].append({"name": req["model"], "size": 1000})
+                ollama["models"].append({"name": req["model"], "size": 1000, "digest": "d-" + req["model"]})
             except (BrokenPipeError, ConnectionResetError):
                 pass                       # the client cancelled
             return

@@ -100,7 +100,7 @@ Most of these are *mixture-of-experts* models, which degrade gracefully when the
 
 **Be careful with models bigger than the card's memory on ROCm.** That's how it's supposed to work, but on the [example PC](#example-setup) a 23 GB model on a 16 GB card ran through system RAM that the graphics driver had mapped for the GPU. The driver stalled repeatedly, and under that sustained load the power supply eventually shut the PC off. If you try one, watch *GPU memory* on the status page (it shows any RAM mapped for the GPU) and run the speed test before relying on it. A model that fits on the card is the safe choice.
 
-**Comparing models.** The status page's speed test (or `gpu-yield speed`) measures how fast the loaded model *reads* a 2,000-token prompt and *writes* an answer, and keeps the results so models can be compared side by side. Reading speed matters most for agents like Hermes, which send long prompts.
+**Comparing models.** The status page's speed test (or `gpu-yield speed`) measures how fast the loaded model *reads* a 2,000-token prompt and *writes* an answer, and keeps the results so models can be compared side by side. Reading speed matters most for agents like Hermes, which send long prompts. Run it while nothing else is using the AI: requests wait behind the test, and Ollama's cached conversation is replaced, so the next long request is read again from the start. The page asks first if the AI was used in the last two minutes; `gpu-yield speed` needs `--force` then.
 
 `gpu-yield doctor` shows how much of the loaded model is on the GPU and says whether that's expected. If it reports the model running entirely on the CPU, the GPU backend isn't working; doctor suggests the fix.
 
@@ -113,7 +113,7 @@ gpu-yield runs a normal Ollama server on port 11434, so anything that talks to O
 - Ollama API: `http://<gaming-pc>:11434`
 - OpenAI-compatible API: `http://<gaming-pc>:11434/v1` (no API key needed)
 
-**Use the model name `gpu-yield`.** gpu-yield keeps that name pointing at whichever model is loaded, so an app set to use it follows every model switch without being reconfigured. It's an Ollama copy of the model, which shares the model's files, so it takes no extra download or disk space. Change the name, or turn it off, with the `alias` setting.
+**Use the model name `gpu-yield`.** gpu-yield keeps that name pointing at whichever model is loaded, so an app set to use it follows every model switch without being reconfigured. It's an Ollama copy of the model, which shares the model's files, so it takes no extra download or disk space. Change the name, or turn it off, with the `alias` setting; the old copy is removed. gpu-yield never overwrites a model it didn't create: if you already have a model with that name, status shows a note asking you to pick another.
 
 **Match the context length.** Configure your client to use the same context length as gpu-yield (`gpu-yield config context_length` prints it; 65536 by default). If a client asks for a different size, Ollama reloads the model to suit it, which is slow and may not fit. When a client loads a different model or context, `gpu-yield status` and the status page show a note saying what to change.
 
