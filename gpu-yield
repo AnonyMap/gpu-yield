@@ -56,7 +56,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -922,6 +922,32 @@ def placement_note(ollama, model, share):
                   "Lower context_length or pick a smaller model.")
 
 
+def models_dir(cfg):
+    """Where Ollama keeps models: OLLAMA_MODELS if set in the config, else its default."""
+    custom = cfg["ollama_env"].get("OLLAMA_MODELS")
+    return Path(custom).expanduser() if custom else HOME / ".ollama/models"
+
+
+def models_free_space(path):
+    """Free bytes on the filesystem that holds `path` (only that drive, not every drive
+    in the PC). Measured at the nearest folder that exists, since the model folder is
+    only created by the first download."""
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    try:
+        return shutil.disk_usage(p).free
+    except OSError:
+        return None
+
+
+def tilde(path):
+    try:
+        return "~/" + str(Path(path).relative_to(HOME))
+    except ValueError:
+        return str(path)
+
+
 def same_model(a, b):
     """Ollama reports "qwen3.5" as "qwen3.5:latest"; treat the two as the same model."""
     def norm(n):
@@ -1214,7 +1240,7 @@ function renderControls() {
   // Redraw the lists only when they change, so a button isn't replaced under a tap or focus.
   const mk = JSON.stringify([models, s.model, busy]);
   if (mk !== modelsKey) { modelsKey = mk; drawModels(s); }
-  $("disk").textContent = models && models.disk_free ? gb(models.disk_free) + " free for models" : "";
+  $("disk").textContent = models && models.disk_free ? gb(models.disk_free) + " free on the drive that holds " + models.models_dir : "";
   const jk = JSON.stringify(s.downloads || []);
   if (jk !== jobsKey) { jobsKey = jk; drawJobs(s); }
 }
@@ -1855,14 +1881,11 @@ class Watcher:
                 pass
         elif self.state == "ai":
             available = True
-        try:
-            store = HOME / ".ollama/models"
-            free = shutil.disk_usage(store if store.exists() else HOME).free
-        except OSError:
-            free = None
+        store = models_dir(self.cfg)
         vram = detect_memory()[1]
         return {"models": self.models_cache["models"], "available": available,
-                "disk_free": free, "vram_gb": round(vram, 1) if vram else None}
+                "disk_free": models_free_space(store), "models_dir": tilde(store),
+                "vram_gb": round(vram, 1) if vram else None}
 
     def download_list(self):
         now = time.monotonic()
@@ -3006,6 +3029,10 @@ Useful commands:
 
 
 def cmd_uninstall(args):
+    try:
+        where = models_dir(load_config())     # before --purge removes the config
+    except SystemExit:
+        where = HOME / ".ollama/models"
     user_systemctl("disable", "--now", WATCHER_UNIT)
     user_systemctl("stop", MANAGED_OLLAMA_UNIT)
     for unit in (WATCHER_UNIT, MANAGED_OLLAMA_UNIT):
@@ -3020,7 +3047,7 @@ def cmd_uninstall(args):
         for d in (OLLAMA_DIR, CONFIG_DIR, STATE_DIR, CACHE_DIR):
             shutil.rmtree(d, ignore_errors=True)
         print("Ollama install, config and state removed.")
-    print(f"Downloaded models are kept in {HOME / '.ollama/models'} (delete it to free the space).")
+    print(f"Downloaded models are kept in {where} (delete it to free the space).")
     print("If setup opened the firewall: sudo firewall-cmd --permanent --list-rich-rules, then "
           "--remove-rich-rule='<rule>' and sudo firewall-cmd --reload")
 

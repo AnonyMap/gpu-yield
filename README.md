@@ -161,7 +161,7 @@ With a control password set, the status page can also manage the AI, from any br
 - **Download a model** by name, with live progress and a Cancel button, and optionally switch to it when it finishes. You can type or paste:
   - an Ollama model name, such as `qwen3.5:9b`, or its ollama.com link
   - a Hugging Face GGUF repo, such as `hf.co/user/repo` or `hf.co/user/repo:Q4_K_M` to choose the quantization, or its huggingface.co link
-- **Delete models** you no longer need, except the one in use. Free disk space is shown.
+- **Delete models** you no longer need, except the one in use. The page shows the free space on the drive that holds the models (`~/.ollama/models`, or `OLLAMA_MODELS` if you've moved it); other drives in the PC aren't counted, since Ollama doesn't use them.
 - **Pause and resume** the AI.
 
 The controls are off until you set a password on the gaming PC:

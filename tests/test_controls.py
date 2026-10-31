@@ -193,7 +193,17 @@ code, body, _ = call("GET", "/api/models")
 assert [m["name"] for m in body["models"]] == ["gpt-oss:20b", "qwen3.5:9b"] and body["available"]
 code, page, _ = call("GET", "/")
 assert code == 200 and '"controls": true' in page and "gpt-oss:20b" in page
-ok("models list and page served")
+assert body["models_dir"] == "~/.ollama/models" and body["disk_free"] > 0
+ok("models list and page served; free space is for the drive holding the models")
+
+# OLLAMA_MODELS moves the model folder; free space follows it (even before it exists)
+import tempfile, shutil as _sh
+other = tempfile.mkdtemp(prefix="gy-models-")
+cfg2 = dict(w.cfg, ollama_env={"OLLAMA_MODELS": other + "/not/yet/created"})
+assert gy.models_dir(cfg2) == gy.Path(other + "/not/yet/created")
+assert gy.models_free_space(gy.models_dir(cfg2)) == _sh.disk_usage(other).free
+assert gy.tilde(gy.HOME / "x/y") == "~/x/y" and gy.tilde("/mnt/games/models") == "/mnt/games/models"
+ok("a custom OLLAMA_MODELS folder is measured instead of the default")
 
 # --- pause / resume
 assert call("POST", "/api/pause", {"paused": True}, "hunter2")[0] == 200
