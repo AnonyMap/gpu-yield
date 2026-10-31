@@ -1,0 +1,1265 @@
+#!/usr/bin/env python3
+"""gpu-yield: keep a local LLM loaded while a Bazzite gaming PC is idle, and get it
+out of the GPU's way the moment a game starts.
+
+  No game running  -> Ollama runs with the model preloaded in VRAM.
+  Game starts      -> Ollama is stopped immediately. A stand-in answers on the same
+                      port with "503 GPU busy" so remote clients (Hermes) know why.
+  Game exits       -> after a cooldown, Ollama starts and the model is reloaded.
+
+Games are detected through Steam's `reaper` helper, which Steam uses to launch every
+game in its library (including non-Steam shortcuts), so no per-game setup is needed.
+
+Commands:
+  gpu-yield setup       install Ollama (user-level), this tool and its services
+  gpu-yield status      what is happening right now
+  gpu-yield pause       keep the AI off until `resume` (survives reboots)
+  gpu-yield resume
+  gpu-yield doctor      check the whole setup
+  gpu-yield update      update from GitHub (--check to look, --ollama to update Ollama too)
+  gpu-yield rollback    go back to the version before the last update
+  gpu-yield uninstall   remove services (add --purge to remove Ollama and config)
+  gpu-yield run         the watcher itself; systemd runs this
+
+Logs:  journalctl --user -u gpu-yield -u gpu-yield-ollama -f
+"""
+
+import argparse
+import ipaddress
+import json
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python < 3.11
+    tomllib = None
+
+APP = "gpu-yield"
+VERSION = "1.1.0"
+BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
+
+HOME = Path.home()
+XDG_CONFIG = Path(os.environ.get("XDG_CONFIG_HOME") or HOME / ".config")
+XDG_STATE = Path(os.environ.get("XDG_STATE_HOME") or HOME / ".local/state")
+XDG_CACHE = Path(os.environ.get("XDG_CACHE_HOME") or HOME / ".cache")
+
+CONFIG_DIR = XDG_CONFIG / APP
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+STATE_DIR = XDG_STATE / APP
+PAUSE_FILE = STATE_DIR / "paused"
+STATUS_FILE = STATE_DIR / "status.json"
+CACHE_DIR = XDG_CACHE / APP
+UNIT_DIR = XDG_CONFIG / "systemd/user"
+BIN_DIR = HOME / ".local/bin"
+BIN_PATH = BIN_DIR / APP
+OLLAMA_DIR = HOME / ".local/opt/ollama"
+OLLAMA_BIN = OLLAMA_DIR / "bin/ollama"
+
+WATCHER_UNIT = "gpu-yield.service"
+MANAGED_OLLAMA_UNIT = "gpu-yield-ollama.service"
+DOWNLOAD_BASE = "https://ollama.com/download"
+
+DEFAULTS = {
+    "model": "gpt-oss:20b",
+    "context_length": 65536,
+    "backend": "rocm",
+    "port": 11434,
+    "cooldown_seconds": 45,
+    "poll_seconds": 2,
+    "restart_after_suspend": True,
+    "extra_processes": [],
+    "ignore_appids": [],
+    "ollama_unit": MANAGED_OLLAMA_UNIT,
+    "update_repo": "",
+    "update_branch": "main",
+    "github_token": "",
+    "ollama_env": {},
+}
+
+GITHUB_API = os.environ.get("GPU_YIELD_GITHUB_API", "https://api.github.com")
+PREVIOUS_FILE = STATE_DIR / "previous-version"
+
+CONFIG_TEMPLATE = """\
+# gpu-yield configuration.
+# Apply changes with:  systemctl --user restart gpu-yield
+
+# Model kept loaded while the PC is idle. It must be pulled first:  ollama pull <name>
+#   gpt-oss:20b - default. Reliable tool calling, fast (mixture-of-experts), ~13 GB.
+#                 Runs at 64K context; if that doesn't fit in VRAM, a few expert
+#                 weights move to system RAM instead of the load failing.
+#   qwen3.5:9b  - ~6.6 GB, fully in VRAM with room to spare. Pick it for image input
+#                 or the fastest responses; its ceiling is lower.
+#   qwen3.6:35b-a3b - ~23 GB, a stronger agent model. Needs 32 GB of system RAM:
+#                 Ollama puts the expert weights that don't fit in VRAM into RAM.
+#                 Generation stays usable; long prompts are processed more slowly.
+model = "gpt-oss:20b"
+
+# Context window in tokens. Hermes Agent needs at least 32768 and works better with
+# 65536. More context costs memory; drop to 32768 if responses feel slow.
+# Set the SAME number in Hermes (model.context_length and model.ollama_num_ctx),
+# otherwise Hermes asks for a different size and Ollama reloads the model.
+context_length = 65536
+
+# GPU backend of the managed Ollama install: "rocm" or "vulkan".
+# Changing it requires:  gpu-yield setup --reinstall
+backend = "rocm"
+
+port = 11434
+
+# Seconds to wait after a game closes before reloading the model. Stops reload
+# churn when a launcher hands off to the game or you hop between games.
+cooldown_seconds = 45
+poll_seconds = 2
+
+# Restart Ollama after the PC wakes from sleep (GPU compute can be flaky after resume).
+restart_after_suspend = true
+
+# Process names (as `ps` shows them) that should also count as a game. Everything
+# launched from Steam is detected automatically; this is for anything that isn't.
+extra_processes = []
+
+# Steam AppIds that should NOT stop the AI. Empty means every game stops it.
+ignore_appids = []
+
+# systemd user unit that runs Ollama. Leave as-is unless you manage Ollama yourself.
+ollama_unit = "gpu-yield-ollama.service"
+
+# Where `gpu-yield update` gets new versions. Leave update_repo empty to use the
+# repo built into this version. github_token is only needed for a private repo
+# (a fine-grained token with read-only access to that repo's contents).
+update_repo = ""
+update_branch = "main"
+github_token = ""
+
+# Extra environment variables for the managed Ollama, for example:
+#   OLLAMA_KV_CACHE_TYPE = "q8_0"   # roughly halves context memory, small quality cost
+[ollama_env]
+"""
+
+
+# ----------------------------------------------------------------------------- helpers
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print(f"WARNING: {msg}", flush=True)
+
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def run(cmd, check=False, quiet=True, **kw):
+    if quiet:
+        kw.setdefault("capture_output", True)
+    return subprocess.run(cmd, text=True, check=check, **kw)
+
+
+def user_systemctl(*args):
+    return run(["systemctl", "--user", *args])
+
+
+def ago(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 90:
+        return f"{seconds}s"
+    if seconds < 5400:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h {seconds % 3600 // 60}m"
+
+
+def load_config():
+    cfg = json.loads(json.dumps(DEFAULTS))
+    if CONFIG_FILE.exists():
+        if tomllib is None:
+            die("Python 3.11+ is needed to read the config file")
+        with open(CONFIG_FILE, "rb") as f:
+            try:
+                user = tomllib.load(f)
+            except tomllib.TOMLDecodeError as e:
+                die(f"{CONFIG_FILE} has a syntax error: {e}")
+        unknown = set(user) - set(DEFAULTS)
+        if unknown:
+            warn(f"ignoring unknown config keys: {', '.join(sorted(unknown))}")
+        for k in DEFAULTS:
+            if k in user:
+                cfg[k] = user[k]
+    if cfg["backend"] not in ("rocm", "vulkan"):
+        die(f'backend must be "rocm" or "vulkan", not {cfg["backend"]!r}')
+    cfg["ignore_appids"] = [str(a) for a in cfg["ignore_appids"]]
+    cfg["ollama_env"] = {str(k): str(v) for k, v in cfg["ollama_env"].items()}
+    return cfg
+
+
+def set_config_values(values):
+    """Rewrite `key = value` lines in the config file, keeping comments."""
+    lines = CONFIG_FILE.read_text().splitlines()
+    for key, value in values.items():
+        rendered = json.dumps(value) if isinstance(value, str) else str(value).lower() \
+            if isinstance(value, bool) else str(value)
+        for i, line in enumerate(lines):
+            if line.split("=", 1)[0].strip() == key and not line.lstrip().startswith("#"):
+                lines[i] = f"{key} = {rendered}"
+                break
+        else:
+            idx = next((i for i, l in enumerate(lines) if l.strip().startswith("[")), len(lines))
+            lines.insert(idx, f"{key} = {rendered}")
+    CONFIG_FILE.write_text("\n".join(lines) + "\n")
+
+
+def lan_address():
+    """(ip, network) of the interface carrying the default route, or (None, None)."""
+    try:
+        dev = None
+        out = run(["ip", "-4", "route", "show", "default"]).stdout.split()
+        if "dev" in out:
+            dev = out[out.index("dev") + 1]
+        cmd = ["ip", "-4", "-o", "addr", "show", "scope", "global"] + (["dev", dev] if dev else [])
+        for line in run(cmd).stdout.splitlines():
+            parts = line.split()
+            if "inet" in parts:
+                iface = ipaddress.ip_interface(parts[parts.index("inet") + 1])
+                return str(iface.ip), str(iface.network)
+    except (OSError, ValueError, IndexError):
+        pass
+    return None, None
+
+
+# ----------------------------------------------------------------------- game detection
+
+def scan_games(cfg):
+    """Return {pid: label} for every running game.
+
+    Steam starts each game as `reaper SteamLaunch AppId=<id> -- <game command>` and the
+    reaper lives as long as the game does, so it is a reliable "a game is running" flag.
+    """
+    found = {}
+    extra = set(cfg["extra_processes"])
+    ignore = set(cfg["ignore_appids"])
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return found
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry.name}/cmdline", "rb") as f:
+                raw = f.read()
+        except OSError:
+            continue
+        if not raw:
+            continue
+        argv = raw.rstrip(b"\0").split(b"\0")
+        name = os.path.basename(argv[0]).decode(errors="replace")
+        if name == "reaper" and b"SteamLaunch" in argv:
+            appid = next((a[6:].decode(errors="replace") for a in argv if a.startswith(b"AppId=")), "?")
+            if appid == "0" or appid in ignore:
+                continue
+            found[int(entry.name)] = f"Steam AppId {appid}"
+        elif name in extra:
+            found[int(entry.name)] = name
+    return found
+
+
+# ------------------------------------------------------------------------------ Ollama
+
+def ollama_unit_text(cfg):
+    env = {
+        "OLLAMA_HOST": f"0.0.0.0:{cfg['port']}",
+        "OLLAMA_KEEP_ALIVE": "-1",               # stay loaded while idle; we decide when it goes
+        "OLLAMA_CONTEXT_LENGTH": str(cfg["context_length"]),
+        "OLLAMA_NUM_PARALLEL": "1",              # parallel slots multiply context memory
+        "OLLAMA_MAX_LOADED_MODELS": "1",
+    }
+    if cfg["backend"] == "vulkan":
+        env["OLLAMA_VULKAN"] = "1"
+    env.update(cfg["ollama_env"])
+    env_lines = "\n".join(f'Environment="{k}={v}"' for k, v in env.items())
+    return f"""\
+# Generated by gpu-yield from {CONFIG_FILE}. Edit the config, not this file.
+[Unit]
+Description=Ollama (managed by gpu-yield)
+PartOf={WATCHER_UNIT}
+
+[Service]
+ExecStart={OLLAMA_BIN} serve
+{env_lines}
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=15
+"""
+
+
+def watcher_unit_text():
+    return f"""\
+[Unit]
+Description=gpu-yield: run Ollama while the GPU is idle, stop it for games
+
+[Service]
+ExecStart={sys.executable if sys.executable.startswith('/usr/') else '/usr/bin/python3'} {BIN_PATH} run
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def write_unit(name, text):
+    """Write a user unit if its content changed. Returns True if it changed."""
+    UNIT_DIR.mkdir(parents=True, exist_ok=True)
+    path = UNIT_DIR / name
+    if path.exists() and path.read_text() == text:
+        return False
+    path.write_text(text)
+    return True
+
+
+def ensure_ollama_unit(cfg):
+    if cfg["ollama_unit"] != MANAGED_OLLAMA_UNIT:
+        return False
+    changed = write_unit(MANAGED_OLLAMA_UNIT, ollama_unit_text(cfg))
+    if changed:
+        user_systemctl("daemon-reload")
+    return changed
+
+
+class Ollama:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.unit = cfg["ollama_unit"]
+        self.base = f"http://127.0.0.1:{cfg['port']}"
+
+    def active(self):
+        return user_systemctl("is-active", "--quiet", self.unit).returncode == 0
+
+    def start(self):
+        r = user_systemctl("start", self.unit)
+        if r.returncode:
+            log(f"could not start {self.unit}: {r.stderr.strip()}")
+            return False
+        return True
+
+    def stop(self):
+        r = user_systemctl("stop", self.unit)
+        if r.returncode:
+            log(f"could not stop {self.unit}: {r.stderr.strip()}")
+            return False
+        return True
+
+    def request(self, path, payload=None, timeout=5.0):
+        data = json.dumps(payload).encode() if payload is not None else None
+        headers = {"Content-Type": "application/json"} if data else {}
+        req = urllib.request.Request(self.base + path, data=data, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            body = r.read()
+        return json.loads(body) if body else {}
+
+    def ready(self):
+        try:
+            self.request("/api/version", timeout=2)
+            return True
+        except Exception:
+            return False
+
+    def wait_ready(self, timeout, stop_evt=None):
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            if self.ready():
+                return True
+            if stop_evt is not None:
+                if stop_evt.wait(1):
+                    return False
+            else:
+                time.sleep(1)
+        return False
+
+    def warm(self):
+        """Load the model into VRAM and keep it there (empty prompt = load only).
+
+        Deliberately no num_gpu: setting it switches Ollama from expert-aware placement
+        (MoE experts to RAM first) to a plain layer split, which is much slower.
+        """
+        self.request("/api/generate", {
+            "model": self.cfg["model"],
+            "prompt": "",
+            "keep_alive": -1,
+            "options": {"num_ctx": int(self.cfg["context_length"])},
+        }, timeout=900)
+
+    def loaded(self):
+        try:
+            return self.request("/api/ps").get("models", [])
+        except Exception:
+            return None
+
+    def is_moe(self, model):
+        """True if the model is mixture-of-experts (its GGUF metadata has an expert count)."""
+        try:
+            info = self.request("/api/show", {"model": model}, timeout=10).get("model_info", {})
+        except Exception:
+            return False
+        return any(k.endswith(".expert_count") and v for k, v in info.items())
+
+
+def placement_note(ollama, model, share):
+    """(is_problem, message) describing how much of the model is in VRAM."""
+    if share is None or share >= 100:
+        return False, ""
+    if ollama.is_moe(model):
+        return False, (f"{100 - share}% of this mixture-of-experts model is in system RAM. "
+                       "That's expected for models bigger than VRAM: expert weights go to RAM "
+                       "first, so generation stays usable, but long prompts are processed "
+                       "more slowly.")
+    return True, (f"{100 - share}% of this dense model spilled to system RAM, so it will be slow. "
+                  "Lower context_length or pick a smaller model.")
+
+
+def gpu_share(models):
+    """Percent of the loaded model that sits in VRAM (100 = fully on the GPU)."""
+    if not models:
+        return None
+    size = sum(m.get("size", 0) for m in models)
+    vram = sum(m.get("size_vram", 0) for m in models)
+    return round(100 * vram / size) if size else None
+
+
+def http_error_detail(e):
+    try:
+        return json.loads(e.read()).get("error") or str(e)
+    except Exception:
+        return str(e)
+
+
+# ---------------------------------------------------------------------------- stand-in
+
+class StandIn:
+    """Answers every request with 503 + a reason while Ollama is down.
+
+    /v1/* gets an OpenAI-style error body (what Hermes reads); everything else gets
+    Ollama's native {"error": "..."} shape. Retry-After tells clients when to come back.
+    """
+
+    def __init__(self, port):
+        self.port = port
+        self.server = None
+        self.message = "AI server is paused."
+        self.retry_after = 60
+
+    def start(self):
+        if self.server:
+            return True
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = APP
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *args):
+                pass
+
+            def _reply(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                if length:
+                    self.rfile.read(min(length, 50_000_000))
+                if self.path.startswith("/v1"):
+                    body = {"error": {"message": owner.message, "type": "server_error",
+                                      "code": "gpu_busy"}}
+                else:
+                    body = {"error": owner.message}
+                data = json.dumps(body).encode()
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Retry-After", str(int(owner.retry_after)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(data)
+
+            do_GET = do_POST = do_PUT = do_DELETE = do_HEAD = do_OPTIONS = do_PATCH = _reply
+
+        last = None
+        for _ in range(30):  # the port can take a moment to free up after Ollama exits
+            try:
+                server = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+                break
+            except OSError as e:
+                last = e
+                time.sleep(0.5)
+        else:
+            log(f"stand-in could not bind port {self.port}: {last}")
+            return False
+        server.daemon_threads = True
+        self.server = server
+        threading.Thread(target=server.serve_forever, name="stand-in", daemon=True).start()
+        return True
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+
+
+# ----------------------------------------------------------------------------- watcher
+
+class Watcher:
+    OFF_STATES = ("gaming", "cooldown", "paused")
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ollama = Ollama(cfg)
+        self.standin = StandIn(cfg["port"])
+        self.host = socket.gethostname()
+        self.stop_evt = threading.Event()
+        self.state = None
+        self.since = time.time()
+        self.games = []
+        self.cooldown_until = 0.0
+        self.warm_gen = 0
+        self.warm_status = "not loaded"
+        self.warm_failed_at = None
+        self.last_health = 0.0
+        self.last_restart = 0.0
+
+    # --- transitions
+    def set_state(self, state):
+        self.state = state
+        self.since = time.time()
+
+    def go_off(self, state, why):
+        prev = self.state
+        self.set_state(state)
+        self.warm_gen += 1          # any warmup still in flight is now irrelevant
+        self.warm_status = "not loaded"
+        self.update_message(time.monotonic())
+        log(why)
+        if prev in self.OFF_STATES:
+            return                  # already off; only the reason changed
+        t = time.monotonic()
+        self.ollama.stop()
+        log(f"Ollama stopped ({time.monotonic() - t:.1f}s); GPU memory released")
+        if self.standin.start():
+            log(f"stand-in answering on port {self.cfg['port']}")
+
+    def go_on(self, why):
+        self.standin.stop()
+        self.set_state("ai")
+        log(why)
+        self.last_restart = time.monotonic()
+        if not self.ollama.start():
+            self.warm_status = "failed: Ollama would not start (journalctl --user -u " \
+                               f"{self.cfg['ollama_unit']})"
+            self.warm_failed_at = time.monotonic()
+            return
+        self.warm_gen += 1
+        gen = self.warm_gen
+        threading.Thread(target=self._warm, args=(gen,), name="warmup", daemon=True).start()
+
+    def _warm(self, gen):
+        model = self.cfg["model"]
+        self.warm_status = "starting Ollama"
+        if not self.ollama.wait_ready(90, self.stop_evt):
+            if gen == self.warm_gen:
+                self.warm_status = "failed: Ollama did not answer within 90s"
+                self.warm_failed_at = time.monotonic()
+                log(self.warm_status)
+            return
+        if gen != self.warm_gen:
+            return
+        self.warm_status = f"loading {model}"
+        t = time.monotonic()
+        try:
+            self.ollama.warm()
+        except urllib.error.HTTPError as e:
+            detail = http_error_detail(e)
+            if gen == self.warm_gen:
+                hint = f" (run: ollama pull {model})" if e.code == 404 else ""
+                self.warm_status = f"failed: {detail}{hint}"
+                self.warm_failed_at = time.monotonic()
+                log(f"model load failed: {detail}{hint}")
+            return
+        except Exception as e:
+            if gen == self.warm_gen:
+                self.warm_status = f"failed: {e}"
+                self.warm_failed_at = time.monotonic()
+                log(f"model load failed: {e}")
+            return
+        if gen != self.warm_gen:
+            return
+        share = gpu_share(self.ollama.loaded())
+        where = f", {share}% on GPU" if share is not None else ""
+        self.warm_status = f"ready ({model}{where})"
+        self.warm_failed_at = None
+        log(f"{model} loaded in {time.monotonic() - t:.1f}s{where}")
+        _, note = placement_note(self.ollama, model, share)
+        if note:
+            log(note)
+
+    def update_message(self, now):
+        cd = int(self.cfg["cooldown_seconds"])
+        if self.state == "gaming":
+            self.standin.message = (f"The AI server on {self.host} is paused because a game is "
+                                    f"running. It comes back automatically about {cd}s after "
+                                    "the game closes.")
+            self.standin.retry_after = 120
+        elif self.state == "cooldown":
+            left = max(0, int(self.cooldown_until - now))
+            self.standin.message = (f"A game just closed on {self.host}. The AI server resumes "
+                                    f"in about {left}s, plus model loading time.")
+            self.standin.retry_after = left + 30
+        elif self.state == "paused":
+            self.standin.message = (f"The AI server on {self.host} was paused manually "
+                                    "(gpu-yield pause).")
+            self.standin.retry_after = 600
+
+    # --- main loop
+    def step(self, games, paused, slept, now):
+        self.games = sorted(set(games.values()))
+        if paused:
+            if self.state != "paused":
+                self.go_off("paused", "paused manually")
+        elif games:
+            if self.state != "gaming":
+                self.go_off("gaming", "game started: " + ", ".join(self.games))
+        elif self.state == "gaming":
+            self.set_state("cooldown")
+            self.cooldown_until = now + float(self.cfg["cooldown_seconds"])
+            log(f"game closed; reloading the model in {self.cfg['cooldown_seconds']}s "
+                "unless another game starts")
+        elif self.state == "cooldown":
+            if now >= self.cooldown_until:
+                self.go_on("cooldown over; starting Ollama")
+        elif self.state is None:
+            self.go_on("no game running; starting Ollama")
+        elif self.state == "paused":
+            self.go_on("resumed; starting Ollama")
+        elif self.state == "ai":
+            if slept and self.cfg["restart_after_suspend"]:
+                self.ollama.stop()
+                self.go_on("woke from sleep; restarting Ollama")
+            else:
+                self.health(now)
+        if self.state in self.OFF_STATES:
+            self.update_message(now)
+
+    def health(self, now):
+        if now - self.last_health < 15:
+            return
+        self.last_health = now
+        if not self.ollama.active():
+            if now - self.last_restart >= 30:
+                self.go_on("Ollama is not running; restarting it")
+        elif self.warm_failed_at is not None and now - self.warm_failed_at > 300:
+            self.warm_failed_at = None
+            self.warm_gen += 1
+            threading.Thread(target=self._warm, args=(self.warm_gen,), daemon=True).start()
+
+    def write_status(self, now):
+        status = {
+            "state": self.state,
+            "since": self.since,
+            "games": self.games,
+            "cooldown_remaining": max(0, int(self.cooldown_until - now)) if self.state == "cooldown" else None,
+            "model": self.cfg["model"],
+            "context_length": self.cfg["context_length"],
+            "model_status": self.warm_status if self.state == "ai" else "unloaded",
+            "updated": time.time(),
+            "pid": os.getpid(),
+        }
+        try:
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            tmp = STATUS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(status, indent=1))
+            os.replace(tmp, STATUS_FILE)
+        except OSError:
+            pass
+
+    def run(self):
+        if threading.current_thread() is threading.main_thread():
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                signal.signal(sig, lambda *_: self.stop_evt.set())
+        ensure_ollama_unit(self.cfg)
+        # Start from a known state: whatever Ollama was doing, it may carry an old config.
+        self.ollama.stop()
+        log(f"gpu-yield {VERSION} watching for games (model {self.cfg['model']}, "
+            f"context {self.cfg['context_length']}, cooldown {self.cfg['cooldown_seconds']}s)")
+        poll = max(0.5, float(self.cfg["poll_seconds"]))
+        mono0, boot0 = time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
+        while not self.stop_evt.is_set():
+            mono, boot = time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
+            slept = (boot - boot0) - (mono - mono0) > 15   # monotonic pauses during suspend
+            mono0, boot0 = mono, boot
+            try:
+                self.step(scan_games(self.cfg), PAUSE_FILE.exists(), slept, mono)
+            except Exception as e:  # never let one bad loop kill the watcher
+                log(f"watcher error: {e!r}")
+            self.write_status(mono)
+            self.stop_evt.wait(poll)
+        self.standin.stop()
+        log("watcher stopped")
+
+
+# ---------------------------------------------------------------------------- commands
+
+def cmd_run(args):
+    Watcher(load_config()).run()
+
+
+STATE_TEXT = {
+    "ai": "AI running (no game)",
+    "gaming": "game running, AI stopped",
+    "cooldown": "game closed, waiting before reloading the model",
+    "paused": "paused manually",
+    None: "starting up",
+}
+
+
+def read_status():
+    try:
+        return json.loads(STATUS_FILE.read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_status(args):
+    active = user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0
+    st = read_status()
+    print(f"Watcher:  {'running' if active else 'NOT running'}"
+          + ("" if active else f"   (start: systemctl --user start {WATCHER_UNIT})"))
+    if not st:
+        print("No status yet.")
+        return
+    stale = time.time() - st.get("updated", 0) > 30
+    print(f"State:    {STATE_TEXT.get(st.get('state'), st.get('state'))}"
+          f" for {ago(time.time() - st.get('since', time.time()))}"
+          + ("   (stale: last update " + ago(time.time() - st['updated']) + " ago)" if stale else ""))
+    if st.get("games"):
+        print(f"Games:    {', '.join(st['games'])}")
+    if st.get("cooldown_remaining") is not None:
+        print(f"Resumes:  in {st['cooldown_remaining']}s")
+    print(f"Model:    {st.get('model')} @ {st.get('context_length')} ctx: {st.get('model_status')}")
+    if PAUSE_FILE.exists():
+        print("Paused:   yes (gpu-yield resume to undo)")
+
+
+def cmd_pause(args):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PAUSE_FILE.touch()
+    print("Paused. The AI stays off until: gpu-yield resume")
+
+
+def cmd_resume(args):
+    if PAUSE_FILE.exists():
+        PAUSE_FILE.unlink()
+        print("Resumed. The model will load in a few seconds if no game is running.")
+    else:
+        print("Not paused.")
+
+
+def cmd_doctor(args):
+    cfg = load_config()
+    problems = 0
+
+    def ok(msg):
+        print(f"  ok    {msg}")
+
+    def bad(msg):
+        nonlocal problems
+        problems += 1
+        print(f"  FIX   {msg}")
+
+    def note(msg):
+        print(f"        {msg}")
+
+    print(f"gpu-yield {VERSION}, Python {platform.python_version()}")
+    if tomllib is None:
+        bad("Python 3.11+ required")
+    if user_systemctl("show-environment").returncode:
+        bad("systemd user manager not reachable (run as your normal user, not root)")
+    if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0:
+        ok("watcher service running")
+    else:
+        bad(f"watcher not running: systemctl --user enable --now {WATCHER_UNIT}")
+    linger = run(["loginctl", "show-user", os.environ.get("USER", ""), "-p", "Linger", "--value"]).stdout.strip()
+    (ok if linger == "yes" else bad)(f"linger {'enabled' if linger == 'yes' else 'disabled: loginctl enable-linger'}"
+                                       " (services start at boot without waiting for login)")
+
+    if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT:
+        if OLLAMA_BIN.exists():
+            ver = run([str(OLLAMA_BIN), "--version"]).stdout.strip().splitlines()
+            ok(f"Ollama installed: {ver[-1] if ver else OLLAMA_BIN}")
+        else:
+            bad("Ollama not installed: gpu-yield setup")
+    if run(["systemctl", "is-active", "--quiet", "ollama.service"]).returncode == 0:
+        bad("a system-wide ollama.service is running and competes for the port: "
+            "sudo systemctl disable --now ollama.service")
+    if cfg["backend"] == "rocm":
+        kfd = Path("/dev/kfd")
+        if kfd.exists() and os.access(kfd, os.R_OK | os.W_OK):
+            ok("/dev/kfd accessible (ROCm)")
+        else:
+            bad("/dev/kfd missing or not accessible: ROCm will fall back to CPU. "
+                "Try backend = \"vulkan\" or add yourself to the render group")
+    renders = list(Path("/dev/dri").glob("renderD*"))
+    if renders and all(os.access(r, os.R_OK | os.W_OK) for r in renders):
+        ok("GPU render node accessible")
+    else:
+        bad("GPU render node not accessible")
+
+    games = scan_games(cfg)
+    note(f"games detected right now: {', '.join(sorted(set(games.values()))) or 'none'}")
+    st = read_status()
+    if st and st.get("state") == "ai":
+        o = Ollama(cfg)
+        if o.ready():
+            ok(f"Ollama answering on port {cfg['port']}")
+            models = o.loaded() or []
+            if models:
+                share = gpu_share(models)
+                ctx = models[0].get("context_length")
+                problem, msg = placement_note(o, models[0].get("name"), share)
+                (bad if problem else ok)(f"{models[0].get('name')} loaded, {share}% on GPU"
+                                         + (f", context {ctx}" if ctx else ""))
+                if msg:
+                    note(msg)
+            else:
+                bad(f"no model loaded ({st.get('model_status')})")
+        else:
+            bad("Ollama not answering; see journalctl --user -u gpu-yield-ollama")
+    elif st:
+        note(f"state: {STATE_TEXT.get(st.get('state'))}; Ollama checks skipped")
+
+    ip, net = lan_address()
+    if run(["systemctl", "is-active", "--quiet", "firewalld"]).returncode == 0:
+        note(f"firewalld is active; port {cfg['port']} must be open to {net or 'your LAN'} "
+             "(gpu-yield setup offers to do this)")
+    note(f"Hermes base_url: http://{ip or '<this-pc-ip>'}:{cfg['port']}/v1")
+    print("All good." if problems == 0 else f"{problems} thing(s) to fix.")
+
+
+# --- setup
+
+def ask(question, args, default=True):
+    if args.yes:
+        return default
+    if not sys.stdin.isatty():
+        return default
+    suffix = " [Y/n] " if default else " [y/N] "
+    answer = input(question + suffix).strip().lower()
+    return default if not answer else answer.startswith("y")
+
+
+def sudo(cmd):
+    print(f"  $ sudo {' '.join(cmd)}")
+    return subprocess.run(["sudo", *cmd]).returncode == 0
+
+
+def download(url, dest):
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": f"{APP}/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done, shown = 0, -1
+        while chunk := r.read(1 << 20):
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                pct = done * 100 // total
+                if pct // 10 != shown:
+                    shown = pct // 10
+                    print(f"    {dest.name}: {pct}% of {total / 2**30:.1f} GiB", flush=True)
+    return dest
+
+
+def install_ollama(backend):
+    if platform.machine() != "x86_64":
+        die(f"unsupported CPU architecture: {platform.machine()}")
+    if not shutil.which("zstd"):
+        die("zstd is needed to unpack Ollama but was not found")
+    if OLLAMA_DIR.exists():
+        shutil.rmtree(OLLAMA_DIR)           # old libraries must not linger between versions
+    OLLAMA_DIR.mkdir(parents=True)
+    packages = ["ollama-linux-amd64.tar.zst"]
+    if backend == "rocm":
+        packages.append("ollama-linux-amd64-rocm.tar.zst")
+        log("  (the ROCm package is large; this can take a few minutes)")
+    for pkg in packages:
+        archive = download(f"{DOWNLOAD_BASE}/{pkg}", CACHE_DIR / pkg)
+        run(["tar", "--zstd", "-xf", str(archive), "-C", str(OLLAMA_DIR)], check=True)
+        archive.unlink()
+    if not OLLAMA_BIN.exists():
+        die(f"Ollama archive did not contain bin/ollama (looked in {OLLAMA_DIR})")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    link = BIN_DIR / "ollama"
+    if link.is_symlink() or not link.exists():
+        link.unlink(missing_ok=True)
+        link.symlink_to(OLLAMA_BIN)
+    log(f"  installed {run([str(OLLAMA_BIN), '--version']).stdout.strip().splitlines()[-1]}")
+
+
+def check_conflicts(args):
+    if run(["systemctl", "is-active", "--quiet", "ollama.service"]).returncode == 0 or \
+       run(["systemctl", "is-enabled", "--quiet", "ollama.service"]).returncode == 0:
+        warn("a system-wide ollama.service exists. It would hold the port and keep "
+             "using the GPU during games.")
+        if ask("Disable it?", args):
+            sudo(["systemctl", "disable", "--now", "ollama.service"])
+    for unit in ("homebrew.ollama.service", "ollama.service"):
+        if user_systemctl("is-enabled", "--quiet", unit).returncode == 0 or \
+           user_systemctl("is-active", "--quiet", unit).returncode == 0:
+            warn(f"user service {unit} also runs Ollama.")
+            if ask(f"Disable {unit}?", args):
+                user_systemctl("disable", "--now", unit)
+
+
+def setup_firewall(cfg, args):
+    if run(["systemctl", "is-active", "--quiet", "firewalld"]).returncode:
+        log("  firewalld not active; nothing to open")
+        return
+    ip, net = lan_address()
+    if not net:
+        warn("could not work out your LAN subnet; open the port manually if Hermes can't connect")
+        return
+    rule = (f'rule family="ipv4" source address="{net}" '
+            f'port port="{cfg["port"]}" protocol="tcp" accept')
+    if ask(f"Allow port {cfg['port']} from your local network ({net}) only? Needs sudo.", args):
+        if sudo(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"]):
+            sudo(["firewall-cmd", "--reload"])
+
+
+def enable_linger(args):
+    user = os.environ.get("USER") or HOME.name
+    if run(["loginctl", "show-user", user, "-p", "Linger", "--value"]).stdout.strip() == "yes":
+        return
+    if run(["loginctl", "enable-linger", user]).returncode:
+        sudo(["loginctl", "enable-linger", user])
+
+
+def hermes_snippet(cfg):
+    ip, _ = lan_address()
+    return f"""\
+# ~/.hermes/config.yaml on the other computer
+model:
+  default: {cfg['model']}
+  provider: custom
+  base_url: http://{ip or '<this-pc-ip>'}:{cfg['port']}/v1
+  context_length: {cfg['context_length']}
+  ollama_num_ctx: {cfg['context_length']}"""
+
+
+def cmd_setup(args):
+    if os.geteuid() == 0:
+        die("run setup as your normal user, not with sudo (it asks for sudo when needed)")
+    if tomllib is None:
+        die("Python 3.11+ is required")
+    if user_systemctl("show-environment").returncode:
+        die("cannot reach the systemd user manager")
+
+    log("1/7 Config")
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(CONFIG_TEMPLATE)
+        log(f"  wrote {CONFIG_FILE}")
+    overrides = {k: v for k, v in (("model", args.model), ("context_length", args.context),
+                                   ("backend", args.backend)) if v is not None}
+    if overrides:
+        set_config_values(overrides)
+    cfg = load_config()
+    managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
+    log(f"  model {cfg['model']}, context {cfg['context_length']}, backend {cfg['backend']}")
+
+    log("2/7 Checking for other Ollama installs")
+    check_conflicts(args)
+
+    log("3/7 Ollama")
+    if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0:
+        user_systemctl("stop", WATCHER_UNIT)
+    if not managed:
+        log(f"  using your own unit {cfg['ollama_unit']}")
+    elif OLLAMA_BIN.exists() and not args.reinstall:
+        log(f"  already installed at {OLLAMA_DIR} (--reinstall to update)")
+    else:
+        install_ollama(cfg["backend"])
+
+    log("4/7 Services")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    me = Path(__file__).resolve()
+    if me != BIN_PATH.resolve():
+        shutil.copy2(me, BIN_PATH)
+    BIN_PATH.chmod(0o755)
+    write_unit(WATCHER_UNIT, watcher_unit_text())
+    ensure_ollama_unit(cfg)
+    user_systemctl("daemon-reload")
+    r = user_systemctl("enable", "--now", WATCHER_UNIT)
+    if r.returncode:
+        die(f"could not start the watcher: {r.stderr.strip()}")
+    enable_linger(args)
+    log(f"  watcher running; installed as {BIN_PATH}")
+
+    log("5/7 Firewall")
+    if args.no_firewall:
+        log("  skipped")
+    else:
+        setup_firewall(cfg, args)
+
+    log("6/7 Model")
+    o = Ollama(cfg)
+    if args.skip_pull:
+        log("  skipped")
+    elif not o.wait_ready(60):
+        st = read_status() or {}
+        warn(f"Ollama isn't up (state: {STATE_TEXT.get(st.get('state'))}). "
+             f"Pull the model later with: ollama pull {cfg['model']}")
+    else:
+        exe = str(OLLAMA_BIN) if managed else (shutil.which("ollama") or "ollama")
+        env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{cfg['port']}")
+        if subprocess.run([exe, "pull", cfg["model"]], env=env).returncode == 0:
+            log("  loading it into VRAM...")
+            try:
+                o.warm()
+                share = gpu_share(o.loaded())
+                log(f"  loaded, {share}% on GPU" if share is not None else "  loaded")
+                problem, msg = placement_note(o, cfg["model"], share)
+                if msg:
+                    (warn if problem else log)(("" if problem else "  ") + msg)
+            except Exception as e:
+                warn(f"model load failed: {e}")
+        else:
+            warn("pull failed; retry with: ollama pull " + cfg["model"])
+
+    log("7/7 Done\n")
+    print(hermes_snippet(cfg))
+    print(f"""
+Useful commands:
+  gpu-yield status      gpu-yield doctor
+  gpu-yield pause       gpu-yield resume
+  journalctl --user -u gpu-yield -f
+Config: {CONFIG_FILE}  (then: systemctl --user restart gpu-yield)""")
+
+
+def cmd_uninstall(args):
+    user_systemctl("disable", "--now", WATCHER_UNIT)
+    user_systemctl("stop", MANAGED_OLLAMA_UNIT)
+    for unit in (WATCHER_UNIT, MANAGED_OLLAMA_UNIT):
+        (UNIT_DIR / unit).unlink(missing_ok=True)
+    user_systemctl("daemon-reload")
+    BIN_PATH.unlink(missing_ok=True)
+    link = BIN_DIR / "ollama"
+    if link.is_symlink() and str(OLLAMA_DIR) in os.readlink(link):
+        link.unlink()
+    print("Services removed.")
+    if args.purge:
+        for d in (OLLAMA_DIR, CONFIG_DIR, STATE_DIR, CACHE_DIR):
+            shutil.rmtree(d, ignore_errors=True)
+        print("Ollama install, config and state removed.")
+    print(f"Downloaded models are kept in {HOME / '.ollama/models'} (delete it to free the space).")
+    print("If setup opened the firewall: sudo firewall-cmd --permanent --list-rich-rules, then "
+          "--remove-rich-rule='<rule>' and sudo firewall-cmd --reload")
+
+
+# --- update
+
+def parse_version(text):
+    try:
+        return tuple(int(x) for x in text.strip().lstrip("v").split("-")[0].split("."))
+    except ValueError:
+        return (0,)
+
+
+def declared_version(source):
+    m = re.search(rb'^VERSION = "([^"]+)"', source, re.M)
+    return m.group(1).decode() if m else None
+
+
+def github_get(cfg, path, raw=False, timeout=30):
+    headers = {
+        "User-Agent": f"{APP}/{VERSION}",
+        "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    if cfg["github_token"]:
+        headers["Authorization"] = f"Bearer {cfg['github_token']}"
+    req = urllib.request.Request(GITHUB_API + path, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def fetch_latest(cfg):
+    repo = cfg["update_repo"] or BUILTIN_REPO
+    if not repo:
+        die("no update source: set update_repo = \"owner/name\" in " + str(CONFIG_FILE))
+    branch = cfg["update_branch"]
+    try:
+        data = github_get(cfg, f"/repos/{repo}/contents/{APP}?ref={branch}", raw=True)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            die(f"{APP} not found in {repo} on branch {branch}. "
+                "If the repo is private, set github_token in the config.")
+        if e.code in (401, 403):
+            die(f"GitHub refused the request ({e.code}: {http_error_detail(e)}). Check "
+                "github_token; without one GitHub allows 60 requests an hour.")
+        die(f"GitHub error {e.code}: {http_error_detail(e)}")
+    except urllib.error.URLError as e:
+        die(f"could not reach GitHub: {e.reason}")
+    return repo, data
+
+
+def install_script(source, label):
+    """Validate a gpu-yield script, swap it in atomically, and let it migrate itself."""
+    version = declared_version(source)
+    if not version:
+        die(f"{label} doesn't look like gpu-yield (no VERSION line); nothing changed")
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = BIN_DIR / f".{APP}.new"
+    tmp.write_bytes(source)
+    tmp.chmod(0o755)
+    check = run([sys.executable, str(tmp), "--version"])
+    if check.returncode or check.stdout.strip() != version:
+        tmp.unlink(missing_ok=True)
+        die(f"{label} failed its self-test, so nothing changed:\n{check.stderr.strip()[-800:]}")
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if BIN_PATH.exists():
+        shutil.copy2(BIN_PATH, PREVIOUS_FILE)
+    os.replace(tmp, BIN_PATH)
+    # The NEW code rewrites its own units and restarts the watcher, so changes to the
+    # service files in a release take effect without re-running setup.
+    subprocess.run([sys.executable, str(BIN_PATH), "_post-update"])
+    return version
+
+
+def cmd_post_update(args):
+    cfg = load_config()
+    write_unit(WATCHER_UNIT, watcher_unit_text())
+    ensure_ollama_unit(cfg)
+    user_systemctl("daemon-reload")
+    if user_systemctl("is-enabled", "--quiet", WATCHER_UNIT).returncode == 0:
+        user_systemctl("restart", WATCHER_UNIT)
+        log("watcher restarted on the new version (the model reloads in a moment)")
+
+
+def ollama_versions(cfg):
+    installed = latest = None
+    if OLLAMA_BIN.exists():
+        m = re.search(r"(\d+\.\d+\.\d+)", run([str(OLLAMA_BIN), "--version"]).stdout)
+        installed = m.group(1) if m else None
+    try:
+        latest = json.loads(github_get(cfg, "/repos/ollama/ollama/releases/latest"))["tag_name"].lstrip("v")
+    except Exception:
+        pass
+    return installed, latest
+
+
+def cmd_update(args):
+    if os.geteuid() == 0:
+        die("run as your normal user, not with sudo")
+    cfg = load_config()
+    repo, source = fetch_latest(cfg)
+    latest = declared_version(source)
+    if not latest:
+        die(f"the {APP} file in {repo} has no VERSION line")
+    newer = parse_version(latest) > parse_version(VERSION)
+
+    managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
+    o_installed, o_latest = ollama_versions(cfg) if managed else (None, None)
+    o_newer = bool(o_installed and o_latest and parse_version(o_latest) > parse_version(o_installed))
+
+    if args.check:
+        print(f"gpu-yield: installed {VERSION}, latest {latest} in {repo}"
+              + ("  -> update available" if newer else "  (up to date)"))
+        if managed:
+            print(f"Ollama:    installed {o_installed or '?'}, latest {o_latest or '?'}"
+                  + ("  -> run: gpu-yield update --ollama" if o_newer else ""))
+        return
+
+    if newer or args.force:
+        log(f"updating gpu-yield {VERSION} -> {latest} from {repo}")
+        install_script(source, f"version {latest} from {repo}")
+        log(f"gpu-yield is now {latest}. Undo with: gpu-yield rollback")
+    else:
+        log(f"gpu-yield {VERSION} is up to date")
+
+    if args.ollama:
+        if not managed:
+            log("Ollama is managed outside gpu-yield; update it the way you installed it")
+        elif not o_newer and not args.force:
+            log(f"Ollama {o_installed} is up to date")
+        else:
+            log(f"updating Ollama {o_installed} -> {o_latest} (backend {cfg['backend']})")
+            user_systemctl("stop", WATCHER_UNIT)
+            try:
+                install_ollama(cfg["backend"])
+            finally:
+                user_systemctl("start", WATCHER_UNIT)
+    elif o_newer:
+        log(f"Ollama {o_latest} is available (you have {o_installed}): gpu-yield update --ollama")
+
+
+def cmd_rollback(args):
+    if not PREVIOUS_FILE.exists():
+        die("no previous version saved; rollback only works after an update")
+    source = PREVIOUS_FILE.read_bytes()
+    target = declared_version(source)
+    current = BIN_PATH.read_bytes() if BIN_PATH.exists() else None
+    log(f"rolling back gpu-yield {VERSION} -> {target}")
+    install_script(source, "the saved previous version")
+    if current:                       # so a second rollback undoes the first
+        PREVIOUS_FILE.write_bytes(current)
+    log(f"gpu-yield is now {target}")
+
+
+def main():
+    if sys.argv[1:2] == ["_post-update"]:   # internal step run by the new version after an update
+        return cmd_post_update(None)
+    p = argparse.ArgumentParser(prog=APP, description="Run Ollama while the GPU is idle; "
+                                "stop it whenever a Steam game runs.")
+    p.add_argument("--version", action="version", version=VERSION)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    s = sub.add_parser("setup", help="install Ollama, this tool and its services")
+    s.add_argument("--model", help="model to keep loaded (default gpt-oss:20b)")
+    s.add_argument("--context", type=int, help="context length in tokens (default 65536)")
+    s.add_argument("--backend", choices=["rocm", "vulkan"], help="GPU backend (default rocm)")
+    s.add_argument("--reinstall", action="store_true", help="re-download Ollama (updates it)")
+    s.add_argument("--skip-pull", action="store_true", help="don't download the model")
+    s.add_argument("--no-firewall", action="store_true", help="don't touch the firewall")
+    s.add_argument("-y", "--yes", action="store_true", help="accept all prompts")
+    s.set_defaults(func=cmd_setup)
+    for name, fn, text in (("run", cmd_run, "run the watcher (systemd does this)"),
+                           ("status", cmd_status, "show the current state"),
+                           ("pause", cmd_pause, "keep the AI off until resume"),
+                           ("resume", cmd_resume, "undo pause"),
+                           ("doctor", cmd_doctor, "check the setup")):
+        sub.add_parser(name, help=text).set_defaults(func=fn)
+    up = sub.add_parser("update", help="update gpu-yield from GitHub (and optionally Ollama)")
+    up.add_argument("--check", action="store_true", help="only report what's available")
+    up.add_argument("--ollama", action="store_true", help="also update Ollama")
+    up.add_argument("--force", action="store_true", help="reinstall even if up to date")
+    up.set_defaults(func=cmd_update)
+    sub.add_parser("rollback", help="go back to the version before the last update") \
+        .set_defaults(func=cmd_rollback)
+    u = sub.add_parser("uninstall", help="remove the services")
+    u.add_argument("--purge", action="store_true", help="also remove Ollama, config and state")
+    u.set_defaults(func=cmd_uninstall)
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
