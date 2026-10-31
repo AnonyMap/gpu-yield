@@ -2,6 +2,9 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.6.1 (2026-10-31)
+- Fixed: the AI stopped for about a minute whenever Wine ran briefly for something that wasn't a game, such as Proton's `xalia.exe` helper or a Steam background task. A Windows program outside Steam now counts as a game only if it is using the GPU and keeps running for 5 seconds. Steam games are still detected instantly. If you turned `detect_wine` off because of this, you can turn it back on: `gpu-yield config detect_wine true`.
+
 ## 1.6.0 (2026-10-31)
 - Status page for other computers: open `http://<this-pc>:11435` in a browser, or `gpu-yield status --host <this-pc>` from another PC running gpu-yield. JSON at `/status`. Open the port with `gpu-yield firewall`.
 - Wake-on-LAN: `gpu-yield wol` turns it on for this PC; `gpu-yield wake <this-pc>` from another computer wakes it and waits until the AI is reachable.

@@ -188,7 +188,7 @@ Wake-on-LAN needs a wired connection. Some PCs also need it enabled in the BIOS/
 You don't need to set anything up per game.
 
 - **Everything launched through Steam,** including non-Steam games added to your library. Steam starts each one through a small helper called `reaper`, which lives exactly as long as the game.
-- **Windows games launched outside Steam,** such as from Heroic or Lutris, are caught through Wine's `wineserver` process. This also covers Heroic's *Add to Steam* shortcuts, which can hand the game to an already-open Heroic and exit early. Turn it off with `gpu-yield config detect_wine false` if you run Windows utilities through Wine that shouldn't stop the AI.
+- **Windows games launched outside Steam,** such as from Heroic or Lutris, are caught through Wine. A Windows program counts as a game when it is using the GPU and has kept running for 5 seconds, so Wine helpers, installers and Steam's short background tasks don't stop the AI. This also covers Heroic's *Add to Steam* shortcuts, which can hand the game to an already-open Heroic and exit early. Turn it off with `gpu-yield config detect_wine false`.
 - **Native Linux games launched outside Steam** aren't detected automatically. Add their process name: `gpu-yield config extra_processes "factorio,Game.exe"`. Names are matched against the program's file name or the name `ps -e` shows; case doesn't matter and `.exe` is optional.
 - **To let a particular Steam game run alongside the AI**, add its AppId (shown by `gpu-yield status` while it runs): `gpu-yield config ignore_appids "1820000"`.
 
@@ -215,7 +215,7 @@ An invalid value is refused and the file is left as it was. You can also edit `~
 | `restart_after_suspend` | `true` | Restart Ollama after the PC wakes from sleep |
 | `extra_processes` | `[]` | More programs that count as a game ([Game detection](#game-detection)) |
 | `ignore_appids` | `[]` | Steam AppIds that should not stop the AI |
-| `detect_wine` | `true` | Treat Wine/Proton programs outside Steam as games |
+| `detect_wine` | `true` | Treat Windows programs outside Steam that are using the GPU as games |
 | `auto_update` | `"off"` | `off`, `gpu-yield`, or `all` (gpu-yield and Ollama). See [Updating](#updating) |
 | `update_repo`, `update_branch` | this repo, `main` | Where updates come from, for forks |
 | `github_token` | none | Read-only token, only needed if `update_repo` is private |

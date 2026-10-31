@@ -33,12 +33,24 @@ for (appid, argv), want in checks:
 assert gy.game_label("777", []) == "Steam AppId 777"
 
 spawn = fake_process
+import subprocess, sys
+gpu_dir = home / "dri"; gpu_dir.mkdir(); (gpu_dir / "renderD128").write_text("")
+gy.GPU_DEVICE_DIR = str(gpu_dir) + "/"
+
+
+def spawn_gpu(argv0):
+    """A fake Windows program that has the (fake) GPU device open, like a real game."""
+    script = f"f = open({str(gpu_dir / 'renderD128')!r}); import time; time.sleep(120)"
+    return subprocess.Popen([argv0, "-c", script], executable=sys.executable,
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def labels(**over): time.sleep(0.25); return sorted(set(gy.scan_games(dict(gy.DEFAULTS, **over)).values()))
 gy._label_cache.clear(); (cfgdir / "shortcuts.vdf").write_bytes(shortcuts + b"\x08")
 p = [spawn("reaper", "SteamLaunch", "AppId=1091500", "--", "x")]
 assert labels() == ["Cyberpunk 2077 (AppId 1091500)"]
 p[0].kill(); p[0].wait()
-p = [spawn("/opt/wine/bin/wineserver"), spawn(r"Z:\games\Hades2\Hades2.exe"), spawn(r"C:\windows\system32\services.exe")]
+p = [spawn("/opt/wine/bin/wineserver"), spawn_gpu(r"Z:\games\Hades2\Hades2.exe"), spawn_gpu(r"C:\windows\system32\services.exe")]
 assert labels() == ["Hades2.exe (Wine, outside Steam)"]; ok("Wine game outside Steam is named after its .exe, ignoring Wine helpers")
 assert labels(detect_wine=False, extra_processes=["HADES2"]) == ["Hades2.exe"]
 for x in p: x.kill(); x.wait()
@@ -47,17 +59,38 @@ assert labels(extra_processes=["factorio"]) == ["factorio"] and labels() == []
 q[0].kill(); q[0].wait()
 ok("names: Steam manifests in any library, non-Steam shortcuts (all id forms), .exe fallback")
 
-# Wine games outside Steam, and how they interact with Steam's own Proton games
+# Wine running briefly for something that isn't a game must not count (1.6.0 bug:
+# Proton's xalia.exe helper and Steam background tasks stopped the AI)
 w = spawn("/opt/proton/files/bin/wineserver")
-assert labels() == ["Wine/Proton game (outside Steam)"]
+assert labels() == [], "Wine's background process alone is not a game"
+others = [spawn(r"C:\windows\system32\xalia.exe"), spawn_gpu(r"C:\Program Files\Xalia\xalia.exe"),
+          spawn(r"C:\Program Files (x86)\Steam\bin\iscriptevaluator.exe"),
+          spawn_gpu(r"C:\_CommonRedist\vcredist\2022\VC_redist.x64.exe"),
+          spawn(r"Z:\games\SomeTool\SomeTool.exe")]
+assert labels() == [], labels()
+ok("Wine helpers, installers, and programs not using the GPU don't count as games")
+g = spawn_gpu(r"Z:\games\Hades2\Hades2.exe")
+assert labels() == ["Hades2.exe (Wine, outside Steam)"]
 assert labels(detect_wine=False) == []
 r = spawn("reaper", "SteamLaunch", "AppId=1820000", "--", "game")
 assert labels() == ["The Riftbreaker (AppId 1820000)"]
-assert labels(ignore_appids=["1820000"]) == [], "an ignored Steam Proton game must not count via wineserver"
-for p in (r, w):
+assert labels(ignore_appids=["1820000"]) == [], "an ignored Steam Proton game must not count via Wine"
+for p in (r, w, g, *others):
     p.kill(); p.wait()
 assert labels() == []
-ok("wineserver counts only when no Steam game is running; ignore_appids still works")
+ok("a Windows game using the GPU counts, only when no Steam game is running; ignore_appids still works")
+
+# The watcher waits 5 s before acting on a Windows program outside Steam
+wt = gy.Watcher(dict(gy.DEFAULTS, port=1))
+wine_game = {1: "Hades2.exe" + gy.WINE_SUFFIX}
+steam_game = {2: "The Riftbreaker (AppId 1820000)"}
+assert wt.confirm_wine(steam_game, 100.0) == steam_game, "Steam games count at once"
+assert wt.confirm_wine(wine_game, 100.0) == {}
+assert wt.confirm_wine(wine_game, 104.0) == {}
+assert wt.confirm_wine(wine_game, 105.5) == wine_game
+assert wt.confirm_wine({}, 106.0) == {} and wt.wine_since is None
+assert wt.confirm_wine(wine_game, 107.0) == {}, "a new Wine run starts the wait again"
+ok("a Windows program outside Steam must keep running 5 s before the AI stops")
 
 # extra_processes also matches the short name `ps -e` shows (15 chars)
 import shutil, subprocess

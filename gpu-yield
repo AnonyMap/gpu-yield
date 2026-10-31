@@ -52,7 +52,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.6.0"
+VERSION = "1.6.1"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -165,9 +165,10 @@ extra_processes = []
 # Steam AppIds that should NOT stop the AI. Empty means every game stops it.
 ignore_appids = []
 
-# Also treat any running Wine/Proton program as a game. Catches Windows games
-# started outside Steam (Heroic, Lutris), including Heroic's "Add to Steam"
-# shortcuts, which can hand off to an already-open Heroic and exit early.
+# Also detect Windows games started outside Steam (Heroic, Lutris), including Heroic's
+# "Add to Steam" shortcuts, which can hand off to an already-open Heroic and exit early.
+# Only a Windows program that is using the GPU and keeps running for 5 s counts, so
+# Steam's background install scripts and Proton's helpers don't stop the AI.
 detect_wine = true
 
 # systemd user unit that runs Ollama. Leave as-is unless you manage Ollama yourself.
@@ -493,13 +494,42 @@ def scan_games(cfg):
         elif detect_wine:
             if base == b"wineserver":
                 wine_pids.append(int(pid))
-            elif base[-4:].lower() == b".exe" and base.lower() not in _WINE_HELPERS:
-                exes.append(base.decode(errors="replace"))
+            elif base[-4:].lower() == b".exe" and not _is_wine_helper(base):
+                exes.append((pid, base.decode(errors="replace")))
     if wine_pids and not steam_present:
-        what = f"{exes[0]} (Wine, outside Steam)" if exes else "Wine/Proton game (outside Steam)"
-        for pid in wine_pids:
-            found[pid] = what
+        # Wine also runs briefly for things that aren't games: Steam's install scripts,
+        # redistributable installers, Proton's own helpers. A game draws with the GPU, so
+        # only a Windows program that has the GPU open counts.
+        playing = [name for pid, name in exes if _uses_gpu(pid)]
+        if playing:
+            for pid in wine_pids:
+                found[pid] = playing[0] + WINE_SUFFIX
     return found
+
+
+WINE_SUFFIX = " (Wine, outside Steam)"
+WINE_CONFIRM_SECONDS = 5
+GPU_DEVICE_DIR = "/dev/dri/"
+
+
+def _uses_gpu(pid):
+    """True if the process has a GPU device (/dev/dri/renderD*, card*) open."""
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return False
+    for fd in fds:
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{fd}").startswith(GPU_DEVICE_DIR):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _is_wine_helper(base):
+    name = base.lower()
+    return name in _WINE_HELPERS or name.startswith(_WINE_HELPER_PREFIXES)
 
 
 def game_running(cfg):
@@ -513,7 +543,14 @@ _WINE_HELPERS = {s.encode() for s in (
     "services.exe", "winedevice.exe", "explorer.exe", "plugplay.exe", "svchost.exe",
     "rpcss.exe", "conhost.exe", "start.exe", "tabtip.exe", "rundll32.exe", "wineboot.exe",
     "winemenubuilder.exe", "steam.exe", "steamwebhelper.exe", "cmd.exe", "winedbg.exe",
-    "regsvr32.exe", "msiexec.exe", "mscorsvw.exe", "iexplore.exe", "control.exe")}
+    "regsvr32.exe", "msiexec.exe", "mscorsvw.exe", "iexplore.exe", "control.exe",
+    # Proton's controller-navigation helper, and what Steam runs around installs
+    "xalia.exe", "iscriptevaluator.exe", "steamerrorreporter.exe",
+    "steamerrorreporter64.exe", "crashhandler.exe", "unitycrashhandler64.exe")}
+# Redistributable installers and uninstallers Steam and launchers run in the background.
+_WINE_HELPER_PREFIXES = tuple(s.encode() for s in (
+    "vc_redist", "vcredist", "dxsetup", "dotnet", "ndp", "physx", "oalinst",
+    "directx", "unins", "ue4prereq", "ueprereq", "easyanticheat_setup"))
 
 
 def _read_cmdline(pid, full=False):
@@ -678,7 +715,7 @@ def command_name(argv):
         return None
     for arg in reversed(rest):
         base = _basename(arg)
-        if base[-4:].lower() == b".exe" and base.lower() not in _WINE_HELPERS:
+        if base[-4:].lower() == b".exe" and not _is_wine_helper(base):
             return base[:-4].decode(errors="replace")
     return None
 
@@ -1140,6 +1177,7 @@ class Watcher:
         self.last_status_write = 0.0
         self.last_error = ("", 0.0)
         self.in_use = False
+        self.wine_since = None
         self.last_used = None
         self.mac = nic_info()[1]
         self.next_update_check = time.monotonic() + 15 * 60   # first check 15 min after start
@@ -1340,6 +1378,21 @@ class Watcher:
             self.warned.add(key)
             log("note: " + msg)
 
+    def confirm_wine(self, games, now):
+        """Steam games count at once. A Windows program outside Steam has to keep running
+        for WINE_CONFIRM_SECONDS first, so a short Wine run doesn't cost a model reload."""
+        wine = {pid for pid, label in games.items() if label.endswith(WINE_SUFFIX)}
+        if not wine:
+            self.wine_since = None
+            return games
+        if self.state == "gaming":
+            return games
+        if self.wine_since is None:
+            self.wine_since = now
+        if now - self.wine_since >= WINE_CONFIRM_SECONDS:
+            return games
+        return {pid: label for pid, label in games.items() if pid not in wine}
+
     def maybe_auto_update(self, now):
         """Once a day (if enabled), install updates while nothing is going on."""
         mode = self.cfg["auto_update"]
@@ -1464,7 +1517,8 @@ class Watcher:
             slept = (boot - boot0) - (mono - mono0) > 15   # monotonic pauses during suspend
             mono0, boot0 = mono, boot
             try:
-                self.step(scan_games(self.cfg), PAUSE_FILE.exists(), slept, mono)
+                games = self.confirm_wine(scan_games(self.cfg), mono)
+                self.step(games, PAUSE_FILE.exists(), slept, mono)
                 self.track_use()
                 self.maybe_auto_update(mono)
             except Exception as e:  # never let one bad loop kill the watcher
