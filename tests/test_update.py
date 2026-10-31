@@ -66,7 +66,7 @@ def backup():
 
 
 def update(**kw):
-    a = dict(check=False, ollama=False, force=False, file=None)
+    a = dict(check=False, ollama=False, force=False, file=None, if_idle=False)
     a.update(kw)
     try:
         gy.cmd_update(types.SimpleNamespace(**a))

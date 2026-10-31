@@ -149,7 +149,7 @@ assert attempt(state="gaming") == []
 assert attempt(state="ai", in_use=True) == []
 assert attempt(in_use=False, last_used=time.time() - 60) == []
 cmd = attempt(last_used=time.time() - 3600)
-assert cmd and cmd[0][:2] == ["systemd-run", "--user"] and cmd[0][-1] == "update", cmd
+assert cmd and cmd[0][:2] == ["systemd-run", "--user"] and cmd[0][-2:] == ["update", "--if-idle"], cmd
 assert w.next_update_check > now + 23 * 3600
 w.cfg = dict(w.cfg, auto_update="off")
 assert attempt(last_used=None) == []
@@ -157,4 +157,79 @@ gy.fetch_latest = lambda cfg: ("me/gy", f'VERSION = "{gy.VERSION}"\n'.encode())
 w.cfg = dict(w.cfg, auto_update="gpu-yield")
 assert attempt() == []
 ok("auto-update: waits for no game and 15 idle minutes, runs outside the watcher, daily")
+
+# a game starting while the update check runs: no update
+real_scan = gy.scan_games
+gy.scan_games = lambda cfg: {1: "Some Game (AppId 1)"}
+assert attempt(state="ai", in_use=False, last_used=None) == []
+gy.scan_games = real_scan
+ok("auto-update: re-checks for a game right before installing")
+
+# a rollback holds automatic updates back from the version rolled away from
+gy.STATE_DIR.mkdir(parents=True, exist_ok=True)
+gy.fetch_latest = lambda cfg: ("me/gy", f'VERSION = "{newer}"\n'.encode())
+assert attempt(last_used=None), "precondition: an update would normally run here"
+gy.note_skip(newer, gy.VERSION)                 # rolled back from `newer` to this version
+assert gy.auto_update_blocked(newer) and not gy.auto_update_blocked(newer + ".1")
+assert attempt(last_used=None) == [], "auto-update reinstalled the version the user rolled back from"
+gy.fetch_latest = lambda cfg: ("me/gy", f'VERSION = "{newer}.1"\n'.encode())
+assert attempt(last_used=None), "a release newer than the rolled-back one should still install"
+gy.fetch_latest = lambda cfg: ("me/gy", f'VERSION = "{newer}"\n'.encode())
+gy.note_skip(gy.VERSION, newer)                 # redo: going forward clears the hold
+assert not gy.SKIP_FILE.exists() and attempt(last_used=None)
+ok("auto-update: skips a version you rolled back from until you update by hand")
+
+# configs written for older versions keep working (with a warning) instead of keeping the AI off
+gy.CONFIG_FILE.write_text('poll_seconds = 0.25\nport = 11435\nignore_appids = "123"\n'
+                          'context_length = "32768"\ndetect_wine = "no"\n')
+cfg = gy.load_config()
+assert (cfg["poll_seconds"], cfg["status_port"], cfg["ignore_appids"], cfg["context_length"],
+        cfg["detect_wine"]) == (0.5, 11436, ["123"], 32768, False), cfg
+ok("older configs: out-of-range, string-typed and port-clashing values are repaired, not fatal")
+
+# TOML edits survive unusual but valid files
+gy.CONFIG_FILE.write_text('model = "x"\n\n[ollama_env]   # extra variables\nA = "1"\n')
+gy.set_env_value("B", "2")
+assert gy.load_config()["ollama_env"] == {"A": "1", "B": "2"}
+gy.CONFIG_FILE.write_text('ollama_env = { A = "1" }\n')
+try:
+    gy.set_env_value("B", "2"); raise AssertionError("inline table should be refused")
+except SystemExit:
+    pass
+gy.CONFIG_FILE.write_text("")
+gy.set_config_values({"extra_processes": ['it\'s "x"', "a\\b"]})
+assert gy.load_config()["extra_processes"] == ['it\'s "x"', "a\\b"]
+ok("config edits: commented table headers, inline tables refused, lists with quotes/backslashes")
+
+# host names as people type or paste them
+for given, want in (("pc", ("pc", 11435)), ("pc:9000", ("pc", 9000)),
+                    ("http://pc:11435/", ("pc", 11435)), ("[fd00::5]:11435", ("fd00::5", 11435)),
+                    ("fd00::5", ("fd00::5", 11435))):
+    assert gy.split_host(given) == want, (given, gy.split_host(given))
+for bad in ("pc:abc", "pc:0", "http://", ":11435"):
+    try:
+        gy.split_host(bad); raise AssertionError(bad)
+    except ValueError:
+        pass
+ok("host names: pasted URLs, IPv6 and bad ports are handled")
+
+# status reports "starting", not a stale "ready", while Ollama restarts; MAC learned late
+w2 = gy.Watcher(dict(gy.DEFAULTS, port=1, model="m"))
+w2.warm_status = "ready (m)"
+w2.ollama.start = lambda: False
+w2.go_on("restarting")
+assert not w2.snapshot()["ai_available"]
+w2.mac = None
+gy.nic_info = lambda: ("enp5s0", "aa:bb:cc:dd:ee:ff", False)
+assert w2.snapshot()["mac"] == "aa:bb:cc:dd:ee:ff"
+ok("status page: no stale 'ready' during a restart; MAC picked up once the network is up")
+
+# the remote commands work on a computer without os.getuid (Windows)
+import subprocess, sys
+probe = ("import os, runpy, sys; del os.getuid; del os.geteuid; "
+         "sys.argv = ['gpu-yield', 'status', '--host', '127.0.0.1:1']; "
+         f"runpy.run_path({str(gy.__file__)!r}, run_name='__main__')")
+r = subprocess.run([sys.executable, "-B", "-c", probe], capture_output=True, text=True, timeout=30)
+assert r.returncode == 1 and "can't reach 127.0.0.1:1" in r.stderr and "Traceback" not in r.stderr, r.stderr
+ok("status --host runs on a system without os.getuid (Windows)")
 print("feature tests passed")

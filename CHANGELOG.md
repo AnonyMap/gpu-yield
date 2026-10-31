@@ -7,8 +7,9 @@
 - Wake-on-LAN: `gpu-yield wol` turns it on for this PC; `gpu-yield wake <this-pc>` from another computer wakes it and waits until the AI is reachable.
 - `gpu-yield config` lists settings; `gpu-yield config KEY VALUE` changes one, checks it, and applies it.
 - New installs choose the GPU backend automatically (`backend = "auto"`): ROCm on GPUs ROCm supports, Vulkan otherwise. `doctor` warns when a GPU isn't supported by ROCm.
-- Optional automatic updates: `gpu-yield config auto_update gpu-yield` (or `all` to include Ollama). Checked daily; installs only while no game is running and the AI hasn't been used for 15 minutes.
+- Optional automatic updates: `gpu-yield config auto_update gpu-yield` (or `all` to include Ollama). Checked daily; installs only while no game is running and the AI hasn't been used for 15 minutes, and never reinstalls a version you rolled back from.
 - `status` shows when the AI was last used.
+- Config values that older versions accepted (numbers in quotes, a single AppId without brackets, a very short poll interval) are read with a warning instead of keeping the AI off.
 - Tests run on GitHub for every change.
 
 ## 1.5.0 (2026-10-31)

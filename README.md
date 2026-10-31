@@ -79,7 +79,7 @@ ssh you@livingroom-pc gpu-yield update --file ~/gpu-yield-new
 gpu-yield config auto_update gpu-yield   # or "all" to update Ollama too
 ```
 
-The watcher checks once a day and installs only while no game is running and nobody has used the AI for 15 minutes, so an update never interrupts a game or a conversation. Its log is in `journalctl --user -u gpu-yield-autoupdate`, and `gpu-yield rollback` undoes one.
+The watcher checks once a day and installs only while no game is running and nobody has used the AI for 15 minutes, so an update never interrupts a game or a conversation. Its log is in `journalctl --user -u gpu-yield-autoupdate`, and `gpu-yield rollback` undoes one. After a rollback, automatic updates skip the version you left until a newer one comes out or you run `gpu-yield update` yourself.
 
 Before replacing anything, an update runs the new file's own self-test, and a version that fails it is refused, leaving the working one in place. Ollama updates work the same way: the new version is downloaded and unpacked alongside the old one, and only swapped in once it runs, so a dropped connection never leaves you without Ollama. After swapping in, the new version rewrites its service files and restarts the watcher, so the model reloads once. Updates come from the `main` branch of `AnonyMap/gpu-yield`; to use a fork, set `update_repo` in the config.
 
