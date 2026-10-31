@@ -118,7 +118,24 @@ Edit `~/.config/gpu-yield/config.toml`, then run `systemctl --user restart gpu-y
 - Games launched through Steam are detected by Steam's `reaper`. Windows games launched any other way (Heroic, Lutris) are detected by Wine's `wineserver` process; this also covers Heroic's "Add to Steam" shortcuts, which can hand the game to an already-open Heroic and exit early. Native Linux games launched outside Steam aren't detected; add their process name to `extra_processes`. Set `detect_wine = false` if you run Windows utilities through Wine that shouldn't stop the AI.
 - The stand-in only exists while Ollama is stopped. There's a gap of under a second during each handoff where connections are refused.
 - Ollama has no authentication. Setup only opens the port to your subnet; don't forward it on your router.
-- Tested against a simulated Steam `reaper` process and a fake Ollama server, not yet on a real Bazzite install. Run `gpu-yield doctor` after setup, then launch a game and check `gpu-yield status`.
+
+## Testing
+
+**Tested on Bazzite** in Steam Gaming Mode, on a PC with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, running gpt-oss:20b at a 64K context:
+
+- install with `setup`, and upgrading an earlier install by re-running it
+- detecting a Steam game launched from Big Picture and stopping Ollama to free the GPU
+- reloading the model after the game closed and the cooldown ended
+
+**Tested only in simulation**, against fake processes and a fake Ollama server:
+
+- the 503 stand-in replies
+- pause and resume
+- restart after sleep
+- `update` and `rollback`
+- Wine/Proton detection for games launched outside Steam
+
+After installing on new hardware, run `gpu-yield doctor`, then launch a game and check `gpu-yield status`.
 
 ## Uninstall
 
