@@ -35,6 +35,11 @@ class FakeOllamaHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)))
+        if self.path == "/api/copy":                       # the fixed name for apps
+            events.append(("copy", req))
+            code = 404 if req["source"] == "missing:model" else 200
+            self.send_response(code); self.send_header("Content-Length", "0"); self.end_headers()
+            return
         events.append(("generate", req))
         if req["model"] == "missing:model":
             d = b'{"error":"model not found"}'
@@ -101,7 +106,10 @@ def starts():
 wait(lambda: w.state == "ai" and w.warm_status.startswith("ready"), msg="initial load")
 gen = [e for e in events if e[0] == "generate"][-1][1]
 assert gen["keep_alive"] == -1 and gen["options"]["num_ctx"] == 65536 and gen["prompt"] == ""
-ok("starts Ollama and preloads the model with the configured context")
+copy = [e[1] for e in events if e[0] == "copy"][-1]
+assert copy == {"source": "gpt-oss:20b", "destination": "gpu-yield"} and gen["model"] == "gpu-yield"
+assert "as gpu-yield" in w.warm_status
+ok("starts Ollama and preloads the model with the configured context, under the fixed name")
 
 def page(path):
     c = http.client.HTTPConnection("127.0.0.1", STATUS_PORT, timeout=3)
@@ -147,6 +155,9 @@ game = fake_process("reaper", "SteamLaunch", "AppId=99", "--", "game")
 wait(lambda: w.state == "gaming", msg="regame")
 assert starts() == n
 ok("a game starting during cooldown goes straight back to gaming, no reload")
+texts = [e["text"] for e in w.snapshot()["events"]]
+assert any(x.startswith("game started: Steam AppId 1245620") for x in texts) and any(x.startswith("game closed") for x in texts)
+ok("games starting and closing appear in the recent events")
 game.kill(); game.wait()
 wait(lambda: w.state == "ai" and w.warm_status.startswith("ready"), msg="resume")
 held.request("GET", "/api/version")
@@ -169,7 +180,7 @@ ok("pause and resume")
 
 w.step({}, False, True, time.monotonic())
 wait(lambda: w.warm_status.startswith("ready"), msg="after suspend")
-assert [e[0] for e in events[-3:]] == ["stop", "start", "generate"]
+assert [e[0] for e in events if e[0] != "copy"][-3:] == ["stop", "start", "generate"]
 ok("restarts Ollama after waking from sleep")
 
 # --- health checks (call directly instead of waiting 15 s each)

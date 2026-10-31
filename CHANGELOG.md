@@ -2,6 +2,12 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.8.0 (2026-10-31)
+- A fixed model name for your apps: set your app's model to `gpu-yield` and it always gets whichever model is loaded, so switching models no longer means editing the app's settings. It's an Ollama copy of the model, so it takes no extra download or disk space. Change or turn it off with the `alias` setting.
+- Real memory readings: the status page, `status` and `doctor` show actual GPU memory and RAM use from the driver, including system RAM the driver has mapped for the GPU, instead of relying on Ollama's estimate.
+- Speed test: a button on the status page (and `gpu-yield speed`) measures how fast the loaded model reads a long prompt and writes an answer, and keeps results so models can be compared.
+- Recent events: the status page and `status` list what happened lately, such as games starting (by program name), the AI coming back, model switches, downloads and errors.
+
 ## 1.7.1 (2026-10-31)
 - The status page says which folder's drive the free space is for, and follows `OLLAMA_MODELS` if you've moved Ollama's model folder (it used to always measure the default `~/.ollama/models`).
 

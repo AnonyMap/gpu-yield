@@ -13,7 +13,7 @@ gy = load()
 OLLAMA_PORT, PAGE_PORT = free_port(), free_port()
 ollama = {"models": [{"name": "gpt-oss:20b", "size": 13_000_000_000},
                      {"name": "qwen3.5:9b", "size": 6_600_000_000}],
-          "loaded": [], "generated": [], "deleted": [], "pull_delay": 0.05}
+          "loaded": [], "generated": [], "deleted": [], "pull_delay": 0.05, "aliases": {}}
 
 
 class FakeOllama(BaseHTTPRequestHandler):
@@ -35,8 +35,9 @@ class FakeOllama(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/api/version":
             return self._json({"version": "fake"})
-        if self.path == "/api/tags":
-            return self._json({"models": ollama["models"]})
+        if self.path == "/api/tags":     # like Ollama, a copy shows up as its own entry
+            copies = [{"name": a + ":latest", "size": 1} for a in ollama["aliases"]]
+            return self._json({"models": ollama["models"] + copies})
         if self.path == "/api/ps":
             return self._json({"models": ollama["loaded"]})
         self._json({"error": "nope"}, 404)
@@ -49,8 +50,18 @@ class FakeOllama(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = self._body()
+        if self.path == "/api/copy":
+            if not any(m["name"] == req["source"] for m in ollama["models"]):
+                return self._json({"error": "model not found"}, 404)
+            ollama["aliases"][req["destination"]] = req["source"]
+            return self._json({})
         if self.path == "/api/generate":
-            ollama["generated"].append((req["model"], req["options"]["num_ctx"]))
+            if req.get("prompt"):                        # a speed test, not a load
+                ollama.setdefault("speed_tests", []).append(req["model"])
+                return self._json({"prompt_eval_count": 2000, "prompt_eval_duration": 2_000_000_000,
+                                   "eval_count": 128, "eval_duration": 4_000_000_000})
+            ollama["generated"].append((ollama["aliases"].get(req["model"], req["model"]),
+                                        req["options"]["num_ctx"]))
             ollama["loaded"] = [{"name": req["model"], "size": 1, "size_vram": 1,
                                  "context_length": req["options"]["num_ctx"]}]
             return self._json({"done": True})
@@ -265,6 +276,55 @@ code, body, _ = call("POST", "/api/pull", {"name": "qwen3.5:2b"}, "hunter2")
 assert code == 409 and "game" in body["error"]
 w.state = "ai"
 ok("downloads are refused while a game is running, with a reason")
+
+# --- the fixed name for apps
+assert "gpu-yield" in ollama["aliases"] and ollama["aliases"]["gpu-yield"] == gy.load_config()["model"]
+names = [m["name"] for m in call("GET", "/api/models")[1]["models"]]
+assert not any(n.startswith("gpu-yield") for n in names), "the fixed name isn't listed as a model"
+assert call("POST", "/api/delete", {"name": "gpu-yield"}, "hunter2")[0] == 409
+assert call("POST", "/api/model", {"name": "gpu-yield"}, "hunter2")[0] == 400
+assert w.snapshot()["alias"] == "gpu-yield" and w.snapshot()["loaded_name"] == "gpu-yield"
+ok("the fixed name follows the loaded model, isn't listed as a model, can't be deleted or chosen")
+
+# --- speed test
+code, body, _ = call("POST", "/api/speed", {}, "hunter2")
+assert code == 202, body
+wait(lambda: w.snapshot()["speed"]["state"] == "done", msg="speed test")
+res = w.snapshot()["speed"]["result"]
+assert (res["read_tps"], res["write_tps"], res["prompt_tokens"]) == (1000.0, 32.0, 2000), res
+assert ollama["speed_tests"][-1] == "gpu-yield", "tested under the loaded name, so no reload"
+assert w.snapshot()["speed_results"][0]["model"] == gy.load_config()["model"]
+assert gy.load_speed_results()[0]["read_tps"] == 1000.0, "results are kept on disk"
+p1, p2 = gy.speed_prompt(), gy.speed_prompt()
+assert p1 != p2 and p1.splitlines()[1:] == p2.splitlines()[1:], "fresh first line, same notes"
+w.state = "gaming"
+assert call("POST", "/api/speed", {}, "hunter2")[0] == 409
+w.state = "ai"
+ok("speed test: reading and writing speeds, kept for comparison, refused during a game")
+
+# --- recent events
+texts = [e["text"] for e in w.snapshot()["events"]]
+assert any("speed test of" in x for x in texts) and any("loaded" in x for x in texts), texts
+assert all({"at", "text", "kind"} <= set(e) for e in w.snapshot()["events"])
+w.event("model load failed: boom")
+assert w.snapshot()["events"][0]["kind"] == "error"
+ok("recent events are recorded, newest first, with errors marked")
+
+# --- real memory readings
+import tempfile
+drm = gy.Path(tempfile.mkdtemp())
+G = 2**30
+for card, (total, used, gtt) in {"card0": (512e6, 100e6, 0), "card1": (16 * G, 15.1 * G, 2.3 * G)}.items():
+    d = drm / card / "device"; d.mkdir(parents=True)
+    (d / "mem_info_vram_total").write_text(str(int(total))); (d / "mem_info_vram_used").write_text(str(int(used)))
+    (d / "mem_info_gtt_used").write_text(str(int(gtt)))
+gy.DRM_DIR = drm
+m = gy.memory_readings()
+assert m["vram_total"] == 16 * G and m["gtt_used"] == int(2.3 * G) and m["ram_total"] > 0, m
+line = gy.memory_line(m)
+assert line.startswith("GPU 15.1 / 16.0 GB · RAM") and "+2.3 GB of RAM mapped for the GPU" in line, line
+assert w.snapshot()["memory"]["vram_used"] == int(15.1 * G)
+ok("memory readings come from the driver: the biggest GPU's VRAM, RAM mapped for it, and RAM")
 
 # --- names
 for given, want in (("qwen3.5:9b", "qwen3.5:9b"), ("https://ollama.com/library/qwen3.5:9b", "qwen3.5:9b"),

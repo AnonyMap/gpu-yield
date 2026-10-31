@@ -75,7 +75,7 @@ gpu-yield model              # pick from the list
 gpu-yield model qwen3.5:9b   # or name any Ollama model directly
 ```
 
-This downloads the model, loads it, saves it to the config and restarts the watcher. If you switch, it tells you how to delete the old one.
+This downloads the model, loads it, saves it to the config and restarts the watcher. If you switch, it tells you how to delete the old one. Apps set to the model name `gpu-yield` follow the switch automatically ([Connecting clients](#connecting-clients)).
 
 The list setup offers:
 
@@ -98,6 +98,10 @@ The list setup offers:
 
 Most of these are *mixture-of-experts* models, which degrade gracefully when they don't quite fit: Ollama moves expert weights into system RAM first and keeps the rest on the GPU, and each token only reads a few experts. That costs some speed, mostly when reading long prompts, instead of failing outright. A *dense* model that spills over is much slower, so for those, lower `context_length` or pick a smaller model.
 
+**Be careful with models bigger than the card's memory on ROCm.** That's how it's supposed to work, but on the [example PC](#example-setup) a 23 GB model on a 16 GB card ran through system RAM that the graphics driver had mapped for the GPU. The driver stalled repeatedly, and under that sustained load the power supply eventually shut the PC off. If you try one, watch *GPU memory* on the status page (it shows any RAM mapped for the GPU) and run the speed test before relying on it. A model that fits on the card is the safe choice.
+
+**Comparing models.** The status page's speed test (or `gpu-yield speed`) measures how fast the loaded model *reads* a 2,000-token prompt and *writes* an answer, and keeps the results so models can be compared side by side. Reading speed matters most for agents like Hermes, which send long prompts.
+
 `gpu-yield doctor` shows how much of the loaded model is on the GPU and says whether that's expected. If it reports the model running entirely on the CPU, the GPU backend isn't working; doctor suggests the fix.
 
 To make context use less memory, at a small quality cost: `gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0`.
@@ -109,7 +113,9 @@ gpu-yield runs a normal Ollama server on port 11434, so anything that talks to O
 - Ollama API: `http://<gaming-pc>:11434`
 - OpenAI-compatible API: `http://<gaming-pc>:11434/v1` (no API key needed)
 
-**Match the context length.** Configure your client to use the same context length as gpu-yield (`gpu-yield config context_length` prints it; 65536 by default). If a client asks for a different size, Ollama reloads the model to suit it, which is slow and may not fit. Likewise, use the model name gpu-yield preloads. When a client loads a different model or context, `gpu-yield status` and the status page show a note saying what to change.
+**Use the model name `gpu-yield`.** gpu-yield keeps that name pointing at whichever model is loaded, so an app set to use it follows every model switch without being reconfigured. It's an Ollama copy of the model, which shares the model's files, so it takes no extra download or disk space. Change the name, or turn it off, with the `alias` setting.
+
+**Match the context length.** Configure your client to use the same context length as gpu-yield (`gpu-yield config context_length` prints it; 65536 by default). If a client asks for a different size, Ollama reloads the model to suit it, which is slow and may not fit. When a client loads a different model or context, `gpu-yield status` and the status page show a note saying what to change.
 
 **While a game is running**, every request gets HTTP `503` with a `Retry-After` header and a reason, for example *"The AI server on gaming-pc is paused because a game is running. It comes back automatically about 45s after the game closes."* Requests to `/v1/...` get an OpenAI-style error body (`"code": "gpu_busy"`); others get Ollama's `{"error": "..."}`. A client with a fallback provider configured can use the 503 to fail over.
 
@@ -117,7 +123,7 @@ gpu-yield runs a normal Ollama server on port 11434, so anything that talks to O
 
 ```yaml
 model:
-  default: gpt-oss:20b
+  default: gpu-yield
   provider: custom
   base_url: http://<gaming-pc>:11434/v1
   context_length: 65536
@@ -129,7 +135,7 @@ Hermes needs at least 32K of context and works better with 64K. Without the two 
 ## Checking on it
 
 ```bash
-gpu-yield status     # state, running game, model, when the AI was last used
+gpu-yield status     # state, running game, model, real memory use, recent events
 gpu-yield doctor     # end-to-end check with fixes for anything wrong
 journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
 ```
@@ -150,6 +156,10 @@ The same data is available as JSON at `/status`, for scripts or for an agent tha
 | `in_use`, `last_used` | Whether another machine is talking to the AI right now, and when it last did (Unix time) |
 | `notice` | A problem worth fixing, such as a client loading a different context |
 | `cooldown_remaining`, `since` | Seconds until the model reloads after a game; when the current state began |
+| `alias`, `loaded_name` | The fixed model name for apps, and the name the model is loaded under |
+| `memory` | Actual use from the driver and kernel, in bytes: `vram_used`, `vram_total`, `gtt_used` (system RAM mapped for the GPU), `ram_used`, `ram_total` |
+| `events` | Recent events, newest first: `at` (Unix time), `text`, `kind` (`info`, `warn`, `error`) |
+| `speed_results` | Recent speed tests: `model`, `read_tps`, `write_tps` (tokens per second), `context_length`, `at` |
 | `host`, `version`, `port`, `mac` | The PC's name, gpu-yield version, AI port, and network card address (used by `wake`) |
 
 ## Controls on the status page
@@ -163,6 +173,7 @@ With a control password set, the status page can also manage the AI, from any br
   - a Hugging Face GGUF repo, such as `hf.co/user/repo` or `hf.co/user/repo:Q4_K_M` to choose the quantization, or its huggingface.co link
 - **Delete models** you no longer need, except the one in use. The page shows the free space on the drive that holds the models (`~/.ollama/models`, or `OLLAMA_MODELS` if you've moved it); other drives in the PC aren't counted, since Ollama doesn't use them.
 - **Pause and resume** the AI.
+- **Run a speed test** of the loaded model, and compare it with earlier tests of other models.
 
 The controls are off until you set a password on the gaming PC:
 
@@ -246,6 +257,7 @@ An invalid value is refused and the file is left as it was. You can also edit `~
 | `ignore_appids` | `[]` | Steam AppIds that should not stop the AI |
 | `detect_wine` | `true` | Treat Windows programs outside Steam that are using the GPU as games |
 | `auto_update` | `"off"` | `off`, `gpu-yield`, or `all` (gpu-yield and Ollama). See [Updating](#updating) |
+| `alias` | `"gpu-yield"` | A fixed model name for your apps that always points at the loaded model; empty turns it off |
 | `control_password` | none | Turns on the [controls on the status page](#controls-on-the-status-page); at least 8 characters. `gpu-yield config` shows it only as "(set)" |
 | `update_repo`, `update_branch` | this repo, `main` | Where updates come from, for forks |
 | `github_token` | none | Read-only token, only needed if `update_repo` is private |
@@ -291,6 +303,7 @@ The watcher checks once a day and installs only while no game is running and the
 | `gpu-yield config [KEY [VALUE]]` | Show or change settings |
 | `gpu-yield update [--check] [--ollama] [--file PATH] [--force]` | Update gpu-yield, and optionally Ollama |
 | `gpu-yield rollback` | Undo the last update |
+| `gpu-yield speed` | Measure how fast the loaded model reads and writes |
 | `gpu-yield wol` | Show or turn on Wake-on-LAN for this PC |
 | `gpu-yield wake [HOST\|MAC] [--no-wait]` | Wake a sleeping PC and wait until the AI answers |
 | `gpu-yield firewall` | Open the AI and status ports to the local network |
@@ -324,7 +337,8 @@ The watcher checks once a day and installs only while no game is running and the
 The setup gpu-yield was built for:
 
 - **Gaming PC:** a living-room PC running Bazzite in Steam Gaming Mode, with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, connected over Wi-Fi. It runs `gpt-oss:20b` at a 64K context. `backend` resolves to ROCm (the RX 7800 XT is `gfx1101`).
-- **Clients:** Hermes Agent on a desktop on the same network, configured as in [Connecting clients](#connecting-clients), plus the status page on a phone.
+- **Clients:** Hermes Agent on a desktop on the same network, set to the model name `gpu-yield` as in [Connecting clients](#connecting-clients), plus the status page on a phone.
+- **A model that didn't fit:** `qwen3.6:35b-a3b` (about 23 GB) loaded on this 16 GB card, but on ROCm the GPU read part of it from system RAM through the graphics driver. The driver logged repeated stalls, and after about 15 minutes of heavy use the 750 W power supply's protection shut the PC off. `gpt-oss:20b` fits on the card and has run without trouble.
 - **Day to day:** games are launched from Big Picture, and updates can be run from the desktop with `ssh <gaming-pc> gpu-yield update`. Models and context can be changed from the status page on any device.
 - **Sleep:** the PC stays on all the time, so the AI is always reachable and Wake-on-LAN isn't used.
 

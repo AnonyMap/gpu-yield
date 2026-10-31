@@ -56,7 +56,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.7.1"
+VERSION = "1.8.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -110,6 +110,7 @@ DEFAULTS = {
     "github_token": "",
     "auto_update": "off",
     "control_password": "",
+    "alias": "gpu-yield",
     "ollama_env": {},
 }
 
@@ -198,6 +199,11 @@ auto_update = "off"
 # unencrypted over your local network, so don't reuse an important password.
 control_password = ""
 
+# A fixed model name for your AI apps. gpu-yield keeps it pointing at whichever model
+# is loaded (an Ollama copy: no extra download or disk space), so an app set to use
+# "gpu-yield" follows every model switch. Empty turns it off.
+alias = "gpu-yield"
+
 # Extra environment variables for the managed Ollama, for example:
 #   OLLAMA_KV_CACHE_TYPE = "q8_0"   # roughly halves context memory, small quality cost
 [ollama_env]
@@ -261,6 +267,10 @@ def config_problem(cfg):
             return f"{key} must be between {lo} and {hi}, not {cfg[key]}"
     if cfg["status_port"] == cfg["port"]:
         return "status_port must differ from port"
+    if cfg["alias"] and not (MODEL_NAME_RE.fullmatch(cfg["alias"]) and len(cfg["alias"]) <= 100):
+        return f"alias must be a simple model name like \"gpu-yield\", not {cfg['alias']!r}"
+    if cfg["alias"] and cfg["model"] and same_model(cfg["alias"], cfg["model"]):
+        return "alias must differ from the model's own name"
     return None
 
 
@@ -877,14 +887,14 @@ class Ollama:
                 time.sleep(1)
         return False
 
-    def warm(self):
+    def warm(self, name=None):
         """Load the model into VRAM and keep it there (empty prompt = load only).
 
         Deliberately no num_gpu: setting it switches Ollama from expert-aware placement
         (MoE experts to RAM first) to a plain layer split, which is much slower.
         """
         self.request("/api/generate", {
-            "model": self.cfg["model"],
+            "model": name or self.cfg["model"],
             "prompt": "",
             "keep_alive": -1,
             "options": {"num_ctx": int(self.cfg["context_length"])},
@@ -946,6 +956,105 @@ def tilde(path):
         return "~/" + str(Path(path).relative_to(HOME))
     except ValueError:
         return str(path)
+
+
+DRM_DIR = Path("/sys/class/drm")
+
+
+def memory_readings():
+    """Actual memory use, from the GPU driver and the kernel (not Ollama's estimate):
+    VRAM, system RAM the driver has mapped for the GPU (GTT), and RAM. Bytes, or None."""
+    gpu = None
+    for dev in DRM_DIR.glob("card*/device"):
+        try:
+            total = int(_read_text(dev / "mem_info_vram_total"))
+            used = int(_read_text(dev / "mem_info_vram_used"))
+        except ValueError:
+            continue
+        if gpu is None or total > gpu["vram_total"]:
+            try:
+                gtt = int(_read_text(dev / "mem_info_gtt_used"))
+            except ValueError:
+                gtt = None
+            gpu = {"vram_used": used, "vram_total": total, "gtt_used": gtt}
+    info = dict(re.findall(r"^(\w+):\s+(\d+) kB", _read_text(Path("/proc/meminfo")), re.M))
+    ram = None
+    if "MemTotal" in info and "MemAvailable" in info:
+        total = int(info["MemTotal"]) * 1024
+        ram = {"ram_used": total - int(info["MemAvailable"]) * 1024, "ram_total": total}
+    if not gpu and not ram:
+        return None
+    return {**(gpu or {}), **(ram or {})}
+
+
+def memory_line(m):
+    """'GPU 15.1 / 16.0 GB · RAM 9.8 / 31.3 GB (+2.3 GB of RAM mapped for the GPU)'."""
+    if not m:
+        return ""
+    g = lambda b: f"{b / 2**30:.1f}"      # GiB: how cards and RAM are sold ("16 GB")
+    parts = []
+    if m.get("vram_total"):
+        parts.append(f"GPU {g(m['vram_used'])} / {g(m['vram_total'])} GB")
+    if m.get("ram_total"):
+        parts.append(f"RAM {g(m['ram_used'])} / {g(m['ram_total'])} GB")
+    line = " · ".join(parts)
+    if m.get("gtt_used") and m["gtt_used"] > 2**30:
+        line += f" (+{g(m['gtt_used'])} GB of RAM mapped for the GPU)"
+    return line
+
+
+SPEED_FILE = STATE_DIR / "speed-tests.json"
+SPEED_TOPICS = ("the history of lighthouses", "how bread rises", "the water cycle",
+                "why the sky is blue", "how bicycles stay upright", "the life of honeybees",
+                "how a refrigerator works", "the tides", "how vaccines train the immune system",
+                "the invention of the printing press")
+
+
+def speed_prompt():
+    """About 2,000 tokens of plain notes, with a fresh first line so Ollama's prompt cache
+    can't skip the reading."""
+    lines = [f"Run {os.urandom(4).hex()}. Below are study notes."]
+    for i in range(1, 61):
+        topic = SPEED_TOPICS[i % len(SPEED_TOPICS)]
+        lines.append(f"Note {i}: A short explanation of {topic}, written for a curious "
+                     f"reader, covering the main idea, one surprising detail, and a common "
+                     f"misunderstanding people have about {topic}.")
+    lines.append("Summarize these notes in three sentences.")
+    return "\n".join(lines)
+
+
+def speed_test(ollama, name, context_length, label=None):
+    """Read a ~2,000-token prompt and write 128 tokens; return the speeds."""
+    r = ollama.request("/api/generate", {
+        "model": name, "prompt": speed_prompt(), "stream": False, "keep_alive": -1,
+        "options": {"num_ctx": int(context_length), "num_predict": 128, "temperature": 0,
+                    "seed": 1}}, timeout=600)
+    pt, pd = r.get("prompt_eval_count") or 0, r.get("prompt_eval_duration") or 0
+    gt, gd = r.get("eval_count") or 0, r.get("eval_duration") or 0
+    if not (pt and pd and gt and gd):
+        raise RuntimeError("Ollama didn't report timings")
+    return {"model": label or name, "context_length": int(context_length), "at": time.time(),
+            "prompt_tokens": pt, "read_tps": round(pt / (pd / 1e9), 1),
+            "gen_tokens": gt, "write_tps": round(gt / (gd / 1e9), 1)}
+
+
+def load_speed_results():
+    try:
+        data = json.loads(SPEED_FILE.read_text())
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def save_speed_result(result):
+    results = [result] + load_speed_results()
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SPEED_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(results[:20], indent=1))
+        os.replace(tmp, SPEED_FILE)
+    except OSError:
+        pass
 
 
 def same_model(a, b):
@@ -1112,6 +1221,15 @@ progress { width:100%; height:8px; accent-color:var(--ok); }
 .job { padding:8px 0; border-top:1px solid var(--line); }
 label.check { display:flex; gap:8px; align-items:center; font-size:14px; margin-top:8px; }
 #msg { min-height:1.5em; margin:12px 0 0; font-size:14px; }
+.events { list-style:none; margin:0; padding:0; font-size:14px; }
+.events li { display:flex; gap:10px; padding:5px 0; border-top:1px solid var(--line); }
+.events li:first-child { border-top:0; }
+.events .when { color:var(--mut); flex:none; width:4.5em; text-align:right; }
+.events .error .what { color:var(--bad); } .events .warn .what { color:var(--wait); }
+table.speeds { width:100%; border-collapse:collapse; font-size:14px; margin-top:8px; }
+table.speeds th { text-align:left; font-weight:600; color:var(--mut); font-size:12px; }
+table.speeds td, table.speeds th { padding:5px 6px 5px 0; border-top:1px solid var(--line); }
+table.speeds td.num, table.speeds th.num { text-align:right; }
 #msg.err { color:var(--bad); }
 footer { color:var(--mut); font-size:13px; }
 a { color:inherit; }
@@ -1124,6 +1242,12 @@ a { color:inherit; }
   <dl id="rows"></dl>
   <div class="note" id="notice" hidden></div>
   <noscript><p class="muted">Turn on JavaScript for live updates and controls, or see <a href="/status">the raw status</a>.</p></noscript>
+</section>
+
+<section class="card" id="eventscard" hidden>
+  <h2>Recent events</h2>
+  <ul class="events" id="events"></ul>
+  <button type="button" id="evmore" hidden style="margin-top:8px">Show all</button>
 </section>
 
 <section class="card" id="controls">
@@ -1163,6 +1287,16 @@ a { color:inherit; }
     </form>
     <p class="muted">An Ollama name such as <code>qwen3.5:9b</code>, or a Hugging Face GGUF repo such as <code>hf.co/user/repo:Q4_K_M</code>. Pasting a link from either site works too.</p>
     <div id="jobs"></div>
+
+    <h3>Speed test</h3>
+    <div class="line"><button id="speedbtn" type="button">Test the loaded model</button>
+      <span class="muted" id="speedstate"></span></div>
+    <p class="muted">Reads about 2,000 tokens, then writes 128. Takes a few seconds to a minute.
+    <b>Reading</b> is how fast long prompts are taken in; <b>writing</b> is how fast answers appear.</p>
+    <table class="speeds" id="speeds" hidden><thead><tr><th>Model</th><th class="num">Reading</th>
+      <th class="num">Writing</th><th class="num">Context</th><th class="num">When</th></tr></thead>
+      <tbody></tbody></table>
+
     <p class="muted"><a href="#" id="lock">Lock controls on this device</a></p>
   </div>
   <p id="msg" role="status"></p>
@@ -1176,7 +1310,7 @@ a { color:inherit; }
 const $ = id => document.getElementById(id);
 const KEY = "gpu-yield-password";
 let pw = null, snap = JSON.parse($("initial").textContent), models = null, busy = false;
-let ctxChoice = null, modelsKey = "", jobsKey = "";   // unapplied dropdown choice; last drawn lists
+let ctxChoice = null, modelsKey = "", jobsKey = "", eventsKey = "", speedKey = "", tick = 0, allEvents = false;   // unapplied dropdown choice; last drawn lists
 try { pw = localStorage.getItem(KEY); } catch (e) {}
 
 function el(tag, attrs, ...kids) {
@@ -1191,6 +1325,7 @@ function ago(t) {
   const s = Math.max(0, Math.round(Date.now() / 1000 - t));
   return s < 90 ? s + "s" : s < 5400 ? Math.round(s / 60) + "m" : Math.floor(s / 3600) + "h " + Math.round(s % 3600 / 60) + "m";
 }
+function gb1(bytes) { return (bytes / 1073741824).toFixed(1); }   // GiB, as cards and RAM are sold
 function gb(bytes) { return bytes < 1e9 ? Math.max(1, Math.round(bytes / 1e6)) + " MB" : (bytes / 1e9).toFixed(bytes >= 1e10 ? 0 : 1) + " GB"; }
 function say(text, err) { $("msg").textContent = text || ""; $("msg").className = err ? "err" : ""; }
 function same(a, b) {
@@ -1214,12 +1349,27 @@ function renderStatus(s) {
   if (s.games && s.games.length) rows.push(["Game", s.games.join(", ")]);
   if (s.model) rows.push(["Model", s.model + " · " + s.context_length + " context"]);
   else rows.push(["Model", "none chosen"]);
+  if (s.model && s.alias) rows.push(["Apps use", s.alias + " (always the loaded model)"]);
+  const m = s.memory;
+  if (m && m.vram_total) rows.push(["GPU memory", gb1(m.vram_used) + " / " + gb1(m.vram_total) + " GB"
+    + (m.gtt_used > 1073741824 ? " (+" + gb1(m.gtt_used) + " GB of RAM mapped for the GPU)" : "")]);
+  if (m && m.ram_total) rows.push(["RAM", gb1(m.ram_used) + " / " + gb1(m.ram_total) + " GB"]);
   if (s.in_use) rows.push(["In use", "yes, right now"]);
   else if (s.last_used) rows.push(["Last used", ago(s.last_used) + " ago"]);
   if (s.since) rows.push(["Since", ago(s.since) + " ago"]);
   $("rows").replaceChildren(...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, String(v))]));
   $("notice").hidden = !s.notice;
   $("notice").textContent = s.notice || "";
+  const ev = s.events || [];
+  $("eventscard").hidden = !ev.length;
+  const ek = JSON.stringify([ev.map(e => [e.at, e.text]), allEvents]);
+  $("evmore").hidden = ev.length <= 6;
+  $("evmore").textContent = allEvents ? "Show fewer" : "Show all " + ev.length;
+  if (ek !== eventsKey || tick % 10 === 0) {
+    eventsKey = ek;
+    $("events").replaceChildren(...ev.slice(0, allEvents ? ev.length : 6).map(e => el("li", { class: e.kind || "info" },
+      el("span", { class: "when" }, ago(e.at)), el("span", { class: "what" }, e.text))));
+  }
 }
 
 function renderControls() {
@@ -1243,6 +1393,21 @@ function renderControls() {
   $("disk").textContent = models && models.disk_free ? gb(models.disk_free) + " free on the drive that holds " + models.models_dir : "";
   const jk = JSON.stringify(s.downloads || []);
   if (jk !== jobsKey) { jobsKey = jk; drawJobs(s); }
+  const sp = s.speed || {};
+  $("speedbtn").disabled = busy || sp.state === "running" || !s.ai_available;
+  $("speedstate").textContent = sp.state === "running" ? "Testing " + sp.model + "…"
+    : sp.state === "failed" ? "Failed: " + sp.error : !s.ai_available ? "Needs the model loaded" : "";
+  const sk = JSON.stringify([s.speed_results, s.model]);
+  if (sk !== speedKey || tick % 10 === 0) { speedKey = sk; drawSpeeds(s); }
+}
+
+function drawSpeeds(s) {
+  const rs = s.speed_results || [];
+  $("speeds").hidden = !rs.length;
+  $("speeds").tBodies[0].replaceChildren(...rs.map(r => el("tr", {},
+    el("td", {}, r.model + (same(r.model, s.model) ? " ●" : "")),
+    el("td", { class: "num" }, r.read_tps + "/s"), el("td", { class: "num" }, r.write_tps + "/s"),
+    el("td", { class: "num" }, String(r.context_length)), el("td", { class: "num" }, ago(r.at) + " ago"))));
 }
 
 function drawModels(s) {
@@ -1326,8 +1491,10 @@ $("pull").addEventListener("submit", ev => {
   act("pull", { name, use: $("pulluse").checked }, "Starting download…").then(ok => { if (ok) $("pullname").value = ""; });
 });
 
+$("speedbtn").addEventListener("click", () => act("speed", {}, "Starting the speed test…"));
+$("evmore").addEventListener("click", () => { allEvents = !allEvents; renderStatus(snap); });
+
 renderStatus(snap); renderControls(); refresh(true);
-let tick = 0;
 setInterval(() => { tick++; refresh(tick % 5 === 0); }, 3000);
 </script>
 </body></html>
@@ -1546,6 +1713,10 @@ class Watcher:
         self.last_status_write = 0.0
         self.last_error = ("", 0.0)
         self.in_use = False
+        self.events = collections.deque(maxlen=30)
+        self.loaded_name = None
+        self.speed = {"state": "idle", "error": "", "result": None, "model": ""}
+        self.speed_results = load_speed_results()
         self.actions = queue.Queue()     # changes requested from the page, applied by run()
         self.downloads = {}              # model name -> progress of a download
         self.dl_lock = threading.Lock()
@@ -1569,7 +1740,7 @@ class Watcher:
         self.warm_gen += 1          # any warmup still in flight is now irrelevant
         self.warm_status = "not loaded"
         self.update_message(time.monotonic())
-        log(why)
+        self.event(why)
         if prev in self.OFF_STATES:
             return                  # already off; only the reason changed
         t = time.monotonic()
@@ -1582,7 +1753,7 @@ class Watcher:
         self.standin.stop()
         self.warm_status = "starting Ollama"     # not "ready" from before, while restarting
         self.set_state("ai")
-        log(why)
+        self.event(why)
         self.last_restart = time.monotonic()
         if not self.ollama.start():
             self.warm_status = "failed: Ollama would not start (journalctl --user -u " \
@@ -1614,7 +1785,7 @@ class Watcher:
             self.warm_status = status
             self.warm_failed_at = time.monotonic()
             self.warm_retry = retry
-            log(status)
+            self.event(status)
 
     def _warm_inner(self, gen):
         model = self.cfg["model"]
@@ -1625,8 +1796,23 @@ class Watcher:
             return
         self.warm_status = f"loading {model}"
         t = time.monotonic()
+        target = model
         try:
-            self.ollama.warm()
+            alias = self.cfg["alias"]
+            if alias:
+                # Point the fixed name at this model and load it under that name, so apps
+                # using it get the loaded model with no reload. Copies share the files.
+                try:
+                    self.ollama.request("/api/copy", {"source": model, "destination": alias},
+                                        timeout=60)
+                    target = alias
+                except urllib.error.HTTPError as e:
+                    if e.code == 404:
+                        raise
+                    self.event(f"couldn't point {alias} at {model} ({http_error_detail(e)}); "
+                        f"loading it under its own name")
+            self.loaded_name = target
+            self.ollama.warm(target)
         except urllib.error.HTTPError as e:
             if e.code == 404:   # not downloaded (yet): check again soon, it may be mid-pull
                 return self._fail(gen, f"failed: {model} is not downloaded "
@@ -1638,12 +1824,13 @@ class Watcher:
             return
         share = gpu_share(self.ollama.loaded())
         where = f", {share}% on GPU" if share is not None else ""
-        self.warm_status = f"ready ({model}{where})"
+        named = f" as {target}" if target != model else ""
+        self.warm_status = f"ready ({model}{named}{where})"
         self.warm_failed_at = None
-        log(f"{model} loaded in {time.monotonic() - t:.1f}s{where}")
+        self.event(f"{model} loaded{named} in {time.monotonic() - t:.1f}s{where}")
         _, note = placement_note(self.ollama, model, share)
         if note:
-            log(note)
+            self.event(note)
 
     def update_message(self, now):
         cd = int(self.cfg["cooldown_seconds"])
@@ -1674,7 +1861,7 @@ class Watcher:
         elif self.state == "gaming":
             self.set_state("cooldown")
             self.cooldown_until = now + float(self.cfg["cooldown_seconds"])
-            log(f"game closed; reloading the model in {self.cfg['cooldown_seconds']}s "
+            self.event(f"game closed; reloading the model in {self.cfg['cooldown_seconds']}s "
                 "unless another game starts")
         elif self.state == "cooldown":
             if now >= self.cooldown_until:
@@ -1728,15 +1915,18 @@ class Watcher:
             self.empty_checks += 1
             if self.empty_checks >= 2:
                 self.empty_checks = 0
-                log(f"{model} is no longer loaded; loading it again")
+                self.event(f"{model} is no longer loaded; loading it again")
                 self.start_warm()
             return
         self.empty_checks = 0
-        mine = [m for m in models if same_model(m.get("name") or m.get("model", ""), model)]
+        ours = [n for n in (model, self.cfg["alias"]) if n]
+        mine = [m for m in models
+                if any(same_model(m.get("name") or m.get("model", ""), n) for n in ours)]
         if not mine:
             other = ", ".join(sorted(m.get("name", "?") for m in models))
-            self.notice = (f"a client loaded {other} instead of {model}. Set Hermes's "
-                           f"model.default to {model}, or switch with: gpu-yield model {other}")
+            use = self.cfg["alias"] or model
+            self.notice = (f"a client loaded {other} instead of {model}. Set your app's model "
+                           f"to {use}, or switch with: gpu-yield model {other}")
             self.warn_once(("model", other), self.notice)
             return
         got = mine[0].get("context_length")
@@ -1748,10 +1938,18 @@ class Watcher:
         self.notice = ""
         self.warned.clear()
 
+    def event(self, text):
+        """Log, and remember for the "Recent events" list on the page and in status."""
+        log(text)
+        low = text.lower()
+        kind = "error" if re.search(r"\b(failed|couldn't|error|not answering|stopped answering)\b", low) \
+            else "warn" if low.startswith("note:") else "info"
+        self.events.appendleft({"at": time.time(), "text": text, "kind": kind})
+
     def warn_once(self, key, msg):
         if key not in self.warned:
             self.warned.add(key)
-            log("note: " + msg)
+            self.event("note: " + msg)
 
     # --- controls from the status page. Handlers run on the page's threads; anything
     # that changes the config or Ollama is queued and applied by the main loop.
@@ -1775,7 +1973,7 @@ class Watcher:
             if not hmac.compare_digest(str(password).encode(), secret.encode()):
                 self.failures.append(now)
                 if len(self.failures) == self.MAX_FAILURES:
-                    log("status page: too many wrong control passwords; locked for a minute")
+                    self.event("status page: too many wrong control passwords; locked for a minute")
                 return 403, {"error": "Wrong password"}
         handler = getattr(self, "_api_" + action.replace("-", "_"), None) \
             if re.fullmatch(r"[a-z_-]+", action) else None
@@ -1786,7 +1984,7 @@ class Watcher:
         except ValueError as e:
             return 400, {"error": str(e)}
         except Exception as e:      # a bad request must get an answer, not a dropped connection
-            log(f"status page: {action} failed: {e!r}")
+            self.event(f"status page: {action} failed: {e!r}")
             return 500, {"error": f"{action} failed: {e}"}
 
     def _api_auth(self, data):
@@ -1802,6 +2000,8 @@ class Watcher:
 
     def _api_model(self, data):
         name = normalize_model_name(data.get("name"))
+        if self.cfg["alias"] and same_model(name, self.cfg["alias"]):
+            raise ValueError(f"{name} is the fixed name; pick the model it should point at")
         listing = self.api_models()
         installed = [m["name"] for m in listing["models"]]
         if not installed and not listing["available"]:
@@ -1812,7 +2012,9 @@ class Watcher:
         name = next((m for m in installed if same_model(name, m)), name)
         self.actions.put(("model", name))
         when = "" if self.state == "ai" else " It loads when the AI is back on."
-        return 202, {"message": f"Switching to {name}. Set your AI apps to use {name} too.{when}"}
+        apps = f"Apps using {self.cfg['alias']} follow automatically." if self.cfg["alias"] \
+            else f"Set your AI apps to use {name} too."
+        return 202, {"message": f"Switching to {name}. {apps}{when}"}
 
     def _api_context(self, data):
         n = data.get("context_length")
@@ -1842,6 +2044,37 @@ class Watcher:
         threading.Thread(target=self._pull, args=(name,), name="download", daemon=True).start()
         return 202, {"message": f"Downloading {name}"}
 
+    def _api_speed(self, data):
+        if self.state != "ai" or self.warming or not self.warm_status.startswith("ready"):
+            return 409, {"error": "The speed test needs the model loaded and no game running."}
+        with self.dl_lock:
+            if self.speed["state"] == "running":
+                return 409, {"error": "A speed test is already running"}
+            self.speed = {"state": "running", "error": "", "result": None, "model": self.cfg["model"]}
+        threading.Thread(target=self._speed, name="speed-test", daemon=True).start()
+        return 202, {"message": f"Testing {self.cfg['model']}: reading about 2,000 tokens, "
+                                f"then writing 128"}
+
+    def _speed(self):
+        model = self.cfg["model"]
+        try:
+            res = speed_test(self.ollama, self.loaded_name or model, self.cfg["context_length"],
+                             label=model)
+            save_speed_result(res)
+            self.speed_results = [res] + self.speed_results[:19]
+            self.speed = {"state": "done", "error": "", "result": res, "model": model}
+            self.event(f"speed test of {model}: reading {res['read_tps']} tokens/s, "
+                       f"writing {res['write_tps']} tokens/s")
+        except Exception as e:
+            if self.state != "ai":
+                err = "a game started, which stops the AI"
+            elif isinstance(e, urllib.error.HTTPError):
+                err = http_error_detail(e)
+            else:
+                err = str(e) or e.__class__.__name__
+            self.speed = {"state": "failed", "error": err, "result": None, "model": model}
+            self.event(f"speed test of {model} failed: {err}")
+
     def _api_cancel(self, data):
         with self.dl_lock:
             job = self.downloads.get(normalize_model_name(data.get("name")))
@@ -1854,6 +2087,9 @@ class Watcher:
         name = normalize_model_name(data.get("name"))
         if same_model(name, self.cfg["model"]):
             return 409, {"error": "That's the model in use. Switch to another one first."}
+        if self.cfg["alias"] and same_model(name, self.cfg["alias"]):
+            return 409, {"error": f"{name} is the fixed name for your apps, not a separate "
+                                  "model; it takes no extra space"}
         if self.state != "ai" or not self.ollama.ready():
             return 409, {"error": "Deleting needs the AI running. Try again when no game is "
                                   "running and the AI isn't paused."}
@@ -1864,7 +2100,7 @@ class Watcher:
         except OSError:
             return 409, {"error": "Ollama didn't answer (did a game just start?). Try again later."}
         self.models_cache["at"] = 0
-        log(f"deleted {name} (from the status page)")
+        self.event(f"deleted {name} (from the status page)")
         return 200, {"message": f"Deleted {name}"}
 
     def api_models(self):
@@ -1873,9 +2109,12 @@ class Watcher:
         if self.state == "ai" and time.monotonic() - self.models_cache["at"] > 5:
             try:
                 tags = self.ollama.request("/api/tags", timeout=3).get("models", [])
+                alias = self.cfg["alias"]
                 self.models_cache = {"at": time.monotonic(), "models": sorted(
                     ({"name": m.get("name") or m.get("model"), "size": m.get("size", 0)}
-                     for m in tags), key=lambda m: m["name"])}
+                     for m in tags
+                     if not (alias and same_model(m.get("name") or m.get("model", ""), alias))),
+                    key=lambda m: m["name"])}
                 available = True
             except Exception:
                 pass
@@ -1907,7 +2146,7 @@ class Watcher:
                 for line in r:
                     if job["cancel"]:
                         job["state"] = "cancelled"       # closing the stream stops Ollama's pull
-                        log(f"download of {name} cancelled")
+                        self.event(f"download of {name} cancelled")
                         return
                     if not line.strip():
                         continue
@@ -1921,7 +2160,7 @@ class Watcher:
                         job["total"] = sum(tot for _, tot in layers.values())
             job["state"] = "done"
             self.models_cache["at"] = 0
-            log(f"downloaded {name} (from the status page)")
+            self.event(f"downloaded {name} (from the status page)")
             if job["use"]:
                 self.actions.put(("model", name))
         except Exception as e:
@@ -1932,7 +2171,7 @@ class Watcher:
                 job["error"] = http_error_detail(e)
             else:
                 job["error"] = str(e) or e.__class__.__name__
-            log(f"download of {name} failed: {job['error']}")
+            self.event(f"download of {name} failed: {job['error']}")
         finally:
             job["finished"] = time.monotonic()
 
@@ -1951,7 +2190,7 @@ class Watcher:
             try:
                 self.apply_settings(latest)
             except Exception as e:
-                log(f"couldn't apply {latest} from the status page: {e!r}")
+                self.event(f"couldn't apply {latest} from the status page: {e!r}")
 
     def apply_settings(self, values):
         """Change only these settings, keeping everything else as the watcher runs it.
@@ -1959,7 +2198,7 @@ class Watcher:
         new = dict(self.cfg, **values)
         problem = config_problem(new)
         if problem:
-            log(f"status page: not applied: {problem}")
+            self.event(f"status page: not applied: {problem}")
             return
         if CONFIG_FILE.exists():
             set_config_values(values)
@@ -1967,7 +2206,7 @@ class Watcher:
         self.notice = ""
         self.warned.clear()
         ensure_ollama_unit(new)
-        log(", ".join(f"{k} set to {v}" for k, v in values.items()) + " (from the status page)")
+        self.event(", ".join(f"{k} set to {v}" for k, v in values.items()) + " (from the status page)")
         if self.state != "ai" or game_running(new):
             return                       # applied when the AI next comes on
         if "context_length" in values:
@@ -2010,13 +2249,13 @@ class Watcher:
             try:
                 _, source = fetch_latest(self.cfg)
             except SystemExit:
-                log("auto-update: couldn't check for a new version; trying again tomorrow")
+                self.event("auto-update: couldn't check for a new version; trying again tomorrow")
                 return
             todo = []
             latest = declared_version(source) or "0"
             if parse_version(latest) > parse_version(VERSION):
                 if auto_update_blocked(latest):
-                    log(f"auto-update: skipping {latest} (you rolled back from it; "
+                    self.event(f"auto-update: skipping {latest} (you rolled back from it; "
                         "gpu-yield update installs it anyway)")
                 else:
                     todo.append(f"gpu-yield {VERSION} -> {latest}")
@@ -2038,12 +2277,12 @@ class Watcher:
                 + (["--ollama"] if with_ollama else [])
             r = run(cmd)
             if r.returncode:
-                log(f"auto-update: couldn't start ({r.stderr.strip()})")
+                self.event(f"auto-update: couldn't start ({r.stderr.strip()})")
             else:
-                log(f"auto-update: installing {' and '.join(todo)} "
+                self.event(f"auto-update: installing {' and '.join(todo)} "
                     f"(log: journalctl --user -u {AUTOUPDATE_UNIT})")
         except Exception as e:
-            log(f"auto-update: {e!r}")
+            self.event(f"auto-update: {e!r}")
         finally:
             self.updating = False
 
@@ -2084,6 +2323,12 @@ class Watcher:
             "paused": PAUSE_FILE.exists(),
             "controls": bool(self.cfg["control_password"]),
             "downloads": self.download_list(),
+            "alias": self.cfg["alias"],
+            "loaded_name": self.loaded_name if ready else None,
+            "memory": memory_readings(),
+            "events": list(self.events)[:20],
+            "speed": self.speed,
+            "speed_results": self.speed_results[:8],
         }
 
     def write_status(self, now):
@@ -2103,8 +2348,10 @@ class Watcher:
         # Start from a known state: whatever Ollama was doing, it may carry an old config.
         self.ollama.stop()
         (STATE_DIR / "status.json").unlink(missing_ok=True)   # pre-1.5 location
-        self.last_used = (read_status() or {}).get("last_used")  # survives watcher restarts
-        log(f"gpu-yield {VERSION} watching for games (model {self.cfg['model']}, "
+        previous = read_status() or {}                            # survives watcher restarts
+        self.last_used = previous.get("last_used")
+        self.events.extend(e for e in previous.get("events", []) if isinstance(e, dict))
+        self.event(f"gpu-yield {VERSION} watching for games (model {self.cfg['model']}, "
             f"context {self.cfg['context_length']}, cooldown {self.cfg['cooldown_seconds']}s)")
         page = None
         if self.cfg["status_port"]:
@@ -2126,17 +2373,17 @@ class Watcher:
             except Exception as e:  # never let one bad loop kill the watcher
                 msg = f"watcher error: {e!r}"
                 if msg != self.last_error[0] or mono - self.last_error[1] > 300:
-                    log(msg)    # same error every 2 s would flood the journal
+                    self.event(msg)    # same error every 2 s would flood the journal
                     self.last_error = (msg, mono)
             try:
                 self.write_status(mono)
             except Exception as e:
-                log(f"couldn't write status: {e!r}")
+                self.event(f"couldn't write status: {e!r}")
             self.stop_evt.wait(poll)
         self.standin.stop()
         if page:
             page.stop()
-        log("watcher stopped")
+        self.event("watcher stopped")
 
 
 # ---------------------------------------------------------------------------- commands
@@ -2255,12 +2502,21 @@ def print_status(st, suffix=""):
         print(f"Model:    {st['model']} @ {st.get('context_length')} ctx: {st.get('model_status')}")
     else:
         print("Model:    none chosen (run: gpu-yield model)")
+    if st.get("alias") and st.get("model"):
+        print(f"Apps:     use the name {st['alias']} (always the loaded model)")
+    if st.get("memory"):
+        print(f"Memory:   {memory_line(st['memory'])}")
     if st.get("in_use"):
         print("Used:     right now")
     elif st.get("last_used"):
         print(f"Used:     {ago(time.time() - st['last_used'])} ago")
     if st.get("notice"):
         print(f"Note:     {st['notice']}")
+    events = st.get("events") or []
+    if events:
+        print("Recent:")
+        for e in events[:5]:
+            print(f"  {ago(time.time() - e.get('at', time.time())):>6} ago  {e.get('text', '')}")
 
 
 # --- other computers: remote status and wake-up
@@ -2499,6 +2755,35 @@ def cmd_firewall(args):
     open_firewall(load_config(), args)
 
 
+def cmd_speed(args):
+    cfg = load_config()
+    st = read_status() or {}
+    if st.get("state") != "ai" or not str(st.get("model_status", "")).startswith("ready"):
+        die("the speed test needs the AI running with its model loaded (no game, not paused)")
+    name = st.get("loaded_name") or cfg["model"]
+    print(f"Testing {cfg['model']} at context {cfg['context_length']}: "
+          "reading about 2,000 tokens, then writing 128...")
+    try:
+        res = speed_test(Ollama(cfg), name, cfg["context_length"], label=cfg["model"])
+    except urllib.error.HTTPError as e:
+        die(http_error_detail(e))
+    except Exception as e:
+        die(str(e) or e.__class__.__name__)
+    save_speed_result(res)
+    print(f"Reading: {res['read_tps']:>8} tokens/s  ({res['prompt_tokens']} tokens)")
+    print(f"Writing: {res['write_tps']:>8} tokens/s  ({res['gen_tokens']} tokens)")
+    seen, others = {cfg["model"]}, []
+    for r in load_speed_results()[1:]:
+        if r.get("model") not in seen:
+            seen.add(r.get("model"))
+            others.append(r)
+    if others:
+        print("\nEarlier tests of other models:")
+        for r in others[:5]:
+            print(f"  {r['model']:<24} reading {r['read_tps']:>7}  writing {r['write_tps']:>6} tokens/s"
+                  f"  (context {r.get('context_length')}, {ago(time.time() - r['at'])} ago)")
+
+
 def cmd_pause(args):
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     PAUSE_FILE.touch()
@@ -2594,6 +2879,9 @@ def cmd_doctor(args):
             bad("Ollama not answering; see journalctl --user -u gpu-yield-ollama")
     elif st:
         note(f"state: {STATE_TEXT.get(st.get('state'))}; Ollama checks skipped")
+    mem = memory_readings()
+    if mem:
+        note("memory (from the driver, not Ollama): " + memory_line(mem))
 
     ip, net = lan_address()
     if run(["systemctl", "is-active", "--quiet", "firewalld"]).returncode == 0:
@@ -2848,7 +3136,9 @@ def cmd_model(args):
         sys.exit(1)
     set_config_values({"model": name})
     user_systemctl("restart", WATCHER_UNIT)   # the watcher picks up the new model
-    print(f"\nNow using {name}. Set model.default to {name} in Hermes's config to match.")
+    alias = load_config()["alias"]
+    print(f"\nNow using {name}." + (f" Apps set to use {alias} follow automatically."
+                                    if alias else f" Set your AI apps to use {name} too."))
     if old and old != name:
         print(f"The old model is still on disk; free the space with: ollama rm {old}")
 
@@ -2934,7 +3224,7 @@ def hermes_snippet(cfg):
     return f"""\
 # ~/.hermes/config.yaml on the other computer
 model:
-  default: {cfg['model'] or '<the model you choose with gpu-yield model>'}
+  default: {cfg['alias'] or cfg['model'] or '<the model you choose with gpu-yield model>'}
   provider: custom
   base_url: http://{ip or '<this-pc-ip>'}:{cfg['port']}/v1
   context_length: {cfg['context_length']}
@@ -3333,6 +3623,8 @@ def main():
     wk.add_argument("--no-wait", action="store_true", help="don't wait for it to come up")
     wk.set_defaults(func=cmd_wake)
     sub.add_parser("wol", help="show or turn on Wake-on-LAN for this PC").set_defaults(func=cmd_wol)
+    sub.add_parser("speed", help="measure how fast the loaded model reads and writes") \
+        .set_defaults(func=cmd_speed)
     sub.add_parser("firewall", help="open the AI and status ports to the local network") \
         .set_defaults(func=cmd_firewall)
     up = sub.add_parser("update", help="update gpu-yield from GitHub (and optionally Ollama)")
