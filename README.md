@@ -24,15 +24,24 @@ The same two commands upgrade an install from before `gpu-yield update` existed 
 
 Setup runs as your normal user and asks for `sudo` only for the firewall rule. It:
 
-1. writes `~/.config/gpu-yield/config.toml`
-2. offers to disable any other Ollama service (it would hold the port and the GPU during games)
+1. asks which model to use, from a short list sized for your hardware; you can also type any Ollama model name, or choose none and pick later
+2. writes `~/.config/gpu-yield/config.toml`, then offers to disable any other Ollama service (it would hold the port and the GPU during games)
 3. installs Ollama into `~/.local/opt/ollama` with the ROCm backend (no system changes, nothing layered with rpm-ostree)
 4. installs itself to `~/.local/bin/gpu-yield` and enables a systemd **user** service, with linger so it starts at boot
 5. offers a firewall rule that opens port 11434 to your local subnet only
-6. pulls the model and loads it into VRAM
+6. downloads the model you chose and loads it into VRAM
 7. prints the Hermes config to paste on the other computer
 
-Options: `--model`, `--context`, `--backend vulkan`, `--reinstall`, `--skip-pull`, `--no-firewall`, `-y`.
+Options: `--model` (skips the question), `--context`, `--backend vulkan`, `--reinstall`, `--skip-pull`, `--no-firewall`, `-y`. Without a terminal to ask in, or with `-y`, setup installs no model rather than guessing.
+
+To choose or change the model later:
+
+```bash
+gpu-yield model              # pick from the list
+gpu-yield model qwen3.5:9b   # or name it directly
+```
+
+This downloads the model, loads it, saves it in the config and restarts the watcher. Update `model.default` in Hermes's config to match.
 
 ## Updating
 
@@ -63,23 +72,27 @@ Before replacing anything, an update runs the new file's own self-test, and a ve
 
 The PC's 32 GB of system RAM shapes these picks. Ollama (0.30+) handles a mixture-of-experts model that doesn't fit in VRAM by moving expert weights into system RAM first and keeping attention on the GPU. Each token only reads a few experts, so going a little over VRAM costs some speed rather than failing or collapsing to a crawl. Stopping Ollama for a game frees that RAM along with the VRAM.
 
-**Default: gpt-oss:20b at a 64K context.**
+These are the options setup offers. The context length defaults to 64K for all of them.
+
+**Recommended: gpt-oss:20b.**
 
 - It has native, well-trained tool calling, and Ollama has dedicated support for its format. That makes it the most likely to work with Hermes on the first try.
 - It is mixture-of-experts with about 3.6B parameters active per token, so it generates quickly.
 - At around 13 GB plus 64K of context it sits at or slightly over 16 GB. Any overflow goes to RAM as expert weights. Hermes's docs call 32K the minimum and recommend 64K, and the RAM makes the larger size cheap to take.
 
-**Step up: qwen3.6:35b-a3b (~23 GB).** It's a stronger agent model, with roughly 10 GB of experts living in RAM. Generation stays usable since only about 3B parameters are active. The cost is prompt processing: experts held in RAM have to cross the PCIe bus for every batch, and Hermes's prompts are large because of its tool definitions. Expect the first turn of a session to take several times longer than with gpt-oss; later turns reuse the cached prefix. It isn't the default because its tool calling through Ollama is less proven (the previous Qwen generation had parsing problems there). Try it once gpt-oss is working:
+**Step up: qwen3.6:35b-a3b (~23 GB).** It's a stronger agent model, with roughly 10 GB of experts living in RAM. Generation stays usable since only about 3B parameters are active. The cost is prompt processing: experts held in RAM have to cross the PCIe bus for every batch, and Hermes's prompts are large because of its tool definitions. Expect the first turn of a session to take several times longer than with gpt-oss; later turns reuse the cached prefix. It isn't the recommendation because its tool calling through Ollama is less proven (the previous Qwen generation had parsing problems there). Try it once gpt-oss is working:
 
 ```bash
-gpu-yield setup --model qwen3.6:35b-a3b
+gpu-yield model qwen3.6:35b-a3b
 ```
 
 **Small and fast: qwen3.5:9b (6.6 GB).** It fits entirely in VRAM with plenty of room, accepts images, and responds fastest, but has a clearly lower ceiling. There have been reports of it printing tool calls as text instead of executing them through Ollama, so test it with Hermes before relying on it.
 
 ```bash
-gpu-yield setup --model qwen3.5:9b
+gpu-yield model qwen3.5:9b
 ```
+
+**Smallest: qwen3.5:4b (3.4 GB).** Fine for quick questions and light chat; expect it to struggle with Hermes's multi-step tool use.
 
 `gpu-yield doctor` shows how much of the model is on the GPU. For a dense model, anything under 100% means layers spilled into RAM and it will be slow; lower `context_length` or add `OLLAMA_KV_CACHE_TYPE = "q8_0"` under `[ollama_env]`. For a mixture-of-experts model, partial placement is expected and doctor says so. Gaming Mode's own UI holds some VRAM, so a model that barely fits on paper may not.
 
@@ -107,6 +120,7 @@ gpu-yield status        # what it's doing right now
 gpu-yield pause         # keep the AI off until resume (survives reboots)
 gpu-yield resume
 gpu-yield doctor        # end-to-end check
+gpu-yield model         # choose or change the model
 gpu-yield update        # see "Updating"
 journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
 ```

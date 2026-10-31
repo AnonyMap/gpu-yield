@@ -13,6 +13,7 @@ game in its library (including non-Steam shortcuts), so no per-game setup is nee
 Commands:
   gpu-yield setup       install Ollama (user-level), this tool and its services
   gpu-yield status      what is happening right now
+  gpu-yield model       choose or change the model (downloads it)
   gpu-yield pause       keep the AI off until `resume` (survives reboots)
   gpu-yield resume
   gpu-yield doctor      check the whole setup
@@ -49,7 +50,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -74,7 +75,7 @@ MANAGED_OLLAMA_UNIT = "gpu-yield-ollama.service"
 DOWNLOAD_BASE = "https://ollama.com/download"
 
 DEFAULTS = {
-    "model": "gpt-oss:20b",
+    "model": "",
     "context_length": 65536,
     "backend": "rocm",
     "port": 11434,
@@ -98,16 +99,18 @@ CONFIG_TEMPLATE = """\
 # gpu-yield configuration.
 # Apply changes with:  systemctl --user restart gpu-yield
 
-# Model kept loaded while the PC is idle. It must be pulled first:  ollama pull <name>
-#   gpt-oss:20b - default. Reliable tool calling, fast (mixture-of-experts), ~13 GB.
-#                 Runs at 64K context; if that doesn't fit in VRAM, a few expert
-#                 weights move to system RAM instead of the load failing.
-#   qwen3.5:9b  - ~6.6 GB, fully in VRAM with room to spare. Pick it for image input
-#                 or the fastest responses; its ceiling is lower.
+# Model kept loaded while the PC is idle. Empty means none: Ollama still runs, but
+# nothing is preloaded. Choose or change it with:  gpu-yield model
+# (that downloads it and restarts the watcher; editing this line alone doesn't download)
+#   gpt-oss:20b     - ~13 GB. Reliable tool calling, fast (mixture-of-experts).
+#                     Runs at 64K context; if that doesn't fit in VRAM, a few expert
+#                     weights move to system RAM instead of the load failing.
 #   qwen3.6:35b-a3b - ~23 GB, a stronger agent model. Needs 32 GB of system RAM:
-#                 Ollama puts the expert weights that don't fit in VRAM into RAM.
-#                 Generation stays usable; long prompts are processed more slowly.
-model = "gpt-oss:20b"
+#                     the expert weights that don't fit in VRAM go into RAM.
+#                     Generation stays usable; long prompts are processed more slowly.
+#   qwen3.5:9b      - ~6.6 GB, fully in VRAM. Faster, accepts images; lower ceiling.
+#   qwen3.5:4b      - ~3.4 GB. Quick answers; weak at multi-step tool use.
+model = ""
 
 # Context window in tokens. Hermes Agent needs at least 32768 and works better with
 # 65536. More context costs memory; drop to 32768 if responses feel slow.
@@ -590,6 +593,9 @@ class Watcher:
                                f"{self.cfg['ollama_unit']})"
             self.warm_failed_at = time.monotonic()
             return
+        if not self.cfg["model"]:
+            self.warm_status = "no model chosen (run: gpu-yield model)"
+            return
         self.warm_gen += 1
         gen = self.warm_gen
         threading.Thread(target=self._warm, args=(gen,), name="warmup", daemon=True).start()
@@ -776,7 +782,10 @@ def cmd_status(args):
         print(f"Games:    {', '.join(st['games'])}")
     if st.get("cooldown_remaining") is not None:
         print(f"Resumes:  in {st['cooldown_remaining']}s")
-    print(f"Model:    {st.get('model')} @ {st.get('context_length')} ctx: {st.get('model_status')}")
+    if st.get("model"):
+        print(f"Model:    {st['model']} @ {st.get('context_length')} ctx: {st.get('model_status')}")
+    else:
+        print("Model:    none chosen (run: gpu-yield model)")
     if PAUSE_FILE.exists():
         print("Paused:   yes (gpu-yield resume to undo)")
 
@@ -974,12 +983,116 @@ def enable_linger(args):
         sudo(["loginctl", "enable-linger", user])
 
 
+# name, approximate size in GB, one-line description, system RAM (GiB) it needs
+MODEL_CHOICES = [
+    ("gpt-oss:20b", 13, "recommended: reliable tool calling, fast", 0),
+    ("qwen3.6:35b-a3b", 23, "stronger agent model; part of it runs from system RAM", 30),
+    ("qwen3.5:9b", 6.6, "smaller and faster, accepts images", 0),
+    ("qwen3.5:4b", 3.4, "smallest; quick answers, weak at multi-step tool use", 0),
+]
+
+
+def detect_memory():
+    """(system RAM GiB, largest GPU VRAM GiB); either may be None."""
+    ram = vram = None
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            if line.startswith("MemTotal:"):
+                ram = int(line.split()[1]) / 2**20
+    except (OSError, ValueError):
+        pass
+    for f in Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"):
+        try:
+            vram = max(vram or 0, int(f.read_text()) / 2**30)
+        except (OSError, ValueError):
+            pass
+    return ram, vram
+
+
+def choose_model(args):
+    """Ask which model to use. Returns a model name, "" for skip, or None if no one can answer."""
+    if getattr(args, "yes", False) or not sys.stdin.isatty():
+        return None
+    ram, vram = detect_memory()
+    hw = ", ".join(x for x in (f"{vram:.0f} GB VRAM" if vram else "",
+                               f"{ram:.0f} GB RAM" if ram else "") if x)
+    print(f"\nWhich model should stay loaded while the PC is idle?" + (f"  (this PC: {hw})" if hw else ""))
+    for i, (name, size, blurb, min_ram) in enumerate(MODEL_CHOICES, 1):
+        short = f"   [needs ~32 GB RAM, this PC has {ram:.0f}]" if min_ram and ram and ram < min_ram else ""
+        print(f"  {i}) {name:<16} {'~' + format(size, 'g') + ' GB':<8} {blurb}{short}")
+    n = len(MODEL_CHOICES)
+    print(f"  {n + 1}) another model (type its Ollama name)")
+    print(f"  {n + 2}) none for now (choose later with: gpu-yield model)")
+    while True:
+        answer = input("Choice [1]: ").strip() or "1"
+        if answer.isdigit() and 1 <= int(answer) <= n:
+            return MODEL_CHOICES[int(answer) - 1][0]
+        if answer == str(n + 1):
+            name = input("Ollama model name (e.g. gemma4:12b): ").strip()
+            if name:
+                return name
+        elif answer == str(n + 2):
+            return ""
+        else:
+            print(f"Enter a number from 1 to {n + 2}.")
+
+
+def pull_and_load(cfg, name):
+    """Download a model and load it into VRAM. Returns True if the download worked."""
+    managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
+    exe = str(OLLAMA_BIN) if managed else (shutil.which("ollama") or "ollama")
+    env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{cfg['port']}")
+    if subprocess.run([exe, "pull", name], env=env).returncode:
+        warn(f"download failed; check the name, then retry with: gpu-yield model {name}")
+        return False
+    log("  loading it into VRAM...")
+    o = Ollama(dict(cfg, model=name))
+    try:
+        o.warm()
+        share = gpu_share(o.loaded())
+        log(f"  loaded, {share}% on GPU" if share is not None else "  loaded")
+        problem, msg = placement_note(o, name, share)
+        if msg:
+            (warn if problem else log)(("" if problem else "  ") + msg)
+    except Exception as e:
+        warn(f"model downloaded but loading failed: {e}")
+    return True
+
+
+def cmd_model(args):
+    if os.geteuid() == 0:
+        die("run as your normal user, not with sudo")
+    cfg = load_config()
+    old = cfg["model"]
+    print(f"Current model: {old or 'none'}")
+    name = args.name
+    if not name:
+        name = choose_model(args)
+        if name is None:
+            die("no terminal to ask in; give the name: gpu-yield model <name>")
+        if not name:
+            print("No change.")
+            return
+    o = Ollama(cfg)
+    if not o.ready():
+        st = read_status() or {}
+        die(f"Ollama isn't running right now ({STATE_TEXT.get(st.get('state'), 'unknown state')}). "
+            "Try again when no game is running and gpu-yield isn't paused.")
+    if not pull_and_load(cfg, name):
+        sys.exit(1)
+    set_config_values({"model": name})
+    user_systemctl("restart", WATCHER_UNIT)   # the watcher picks up the new model
+    print(f"\nNow using {name}. Set model.default to {name} in Hermes's config to match.")
+    if old and old != name:
+        print(f"The old model is still on disk; free the space with: ollama rm {old}")
+
+
 def hermes_snippet(cfg):
     ip, _ = lan_address()
     return f"""\
 # ~/.hermes/config.yaml on the other computer
 model:
-  default: {cfg['model']}
+  default: {cfg['model'] or '<the model you choose with gpu-yield model>'}
   provider: custom
   base_url: http://{ip or '<this-pc-ip>'}:{cfg['port']}/v1
   context_length: {cfg['context_length']}
@@ -1004,8 +1117,14 @@ def cmd_setup(args):
     if overrides:
         set_config_values(overrides)
     cfg = load_config()
+    if not cfg["model"]:
+        choice = choose_model(args)
+        if choice:
+            set_config_values({"model": choice})
+            cfg = load_config()
     managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
-    log(f"  model {cfg['model']}, context {cfg['context_length']}, backend {cfg['backend']}")
+    log(f"  model {cfg['model'] or 'none yet'}, context {cfg['context_length']}, "
+        f"backend {cfg['backend']}")
 
     log("2/7 Checking for other Ollama installs")
     check_conflicts(args)
@@ -1042,29 +1161,16 @@ def cmd_setup(args):
         setup_firewall(cfg, args)
 
     log("6/7 Model")
-    o = Ollama(cfg)
-    if args.skip_pull:
+    if not cfg["model"]:
+        log("  none chosen; pick one any time with: gpu-yield model")
+    elif args.skip_pull:
         log("  skipped")
-    elif not o.wait_ready(60):
+    elif not Ollama(cfg).wait_ready(60):
         st = read_status() or {}
         warn(f"Ollama isn't up (state: {STATE_TEXT.get(st.get('state'))}). "
-             f"Pull the model later with: ollama pull {cfg['model']}")
+             f"Download the model later with: gpu-yield model {cfg['model']}")
     else:
-        exe = str(OLLAMA_BIN) if managed else (shutil.which("ollama") or "ollama")
-        env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{cfg['port']}")
-        if subprocess.run([exe, "pull", cfg["model"]], env=env).returncode == 0:
-            log("  loading it into VRAM...")
-            try:
-                o.warm()
-                share = gpu_share(o.loaded())
-                log(f"  loaded, {share}% on GPU" if share is not None else "  loaded")
-                problem, msg = placement_note(o, cfg["model"], share)
-                if msg:
-                    (warn if problem else log)(("" if problem else "  ") + msg)
-            except Exception as e:
-                warn(f"model load failed: {e}")
-        else:
-            warn("pull failed; retry with: ollama pull " + cfg["model"])
+        pull_and_load(cfg, cfg["model"])
 
     log("7/7 Done\n")
     print(hermes_snippet(cfg))
@@ -1276,7 +1382,7 @@ def main():
     p.add_argument("--version", action="version", version=VERSION)
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("setup", help="install Ollama, this tool and its services")
-    s.add_argument("--model", help="model to keep loaded (default gpt-oss:20b)")
+    s.add_argument("--model", help="model to keep loaded (asks if not given)")
     s.add_argument("--context", type=int, help="context length in tokens (default 65536)")
     s.add_argument("--backend", choices=["rocm", "vulkan"], help="GPU backend (default rocm)")
     s.add_argument("--reinstall", action="store_true", help="re-download Ollama (updates it)")
@@ -1296,6 +1402,9 @@ def main():
     up.add_argument("--ollama", action="store_true", help="also update Ollama")
     up.add_argument("--force", action="store_true", help="reinstall even if up to date")
     up.set_defaults(func=cmd_update)
+    m = sub.add_parser("model", help="choose or change the model (downloads it)")
+    m.add_argument("name", nargs="?", help="Ollama model name; omit to pick from a list")
+    m.set_defaults(func=cmd_model)
     sub.add_parser("rollback", help="go back to the version before the last update") \
         .set_defaults(func=cmd_rollback)
     u = sub.add_parser("uninstall", help="remove the services")
