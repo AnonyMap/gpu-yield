@@ -27,6 +27,7 @@ Logs:  journalctl --user -u gpu-yield -u gpu-yield-ollama -f
 """
 
 import argparse
+import html
 import http.client
 import ipaddress
 import json
@@ -51,7 +52,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -81,13 +82,15 @@ OLLAMA_BIN = OLLAMA_DIR / "bin/ollama"
 
 WATCHER_UNIT = "gpu-yield.service"
 MANAGED_OLLAMA_UNIT = "gpu-yield-ollama.service"
+AUTOUPDATE_UNIT = "gpu-yield-autoupdate"
 DOWNLOAD_BASE = "https://ollama.com/download"
 
 DEFAULTS = {
     "model": "",
     "context_length": 65536,
-    "backend": "rocm",
+    "backend": "auto",
     "port": 11434,
+    "status_port": 11435,
     "cooldown_seconds": 45,
     "poll_seconds": 2,
     "restart_after_suspend": True,
@@ -98,8 +101,11 @@ DEFAULTS = {
     "update_repo": "",
     "update_branch": "main",
     "github_token": "",
+    "auto_update": "off",
     "ollama_env": {},
 }
+
+CHOICES = {"backend": ("auto", "rocm", "vulkan"), "auto_update": ("off", "gpu-yield", "all")}
 
 GITHUB_API = os.environ.get("GPU_YIELD_GITHUB_API", "https://api.github.com")
 PREVIOUS_FILE = STATE_DIR / "previous-version"
@@ -127,11 +133,17 @@ model = ""
 # otherwise Hermes asks for a different size and Ollama reloads the model.
 context_length = 65536
 
-# GPU backend of the managed Ollama install: "rocm" or "vulkan".
-# Changing it requires:  gpu-yield setup --reinstall
-backend = "rocm"
+# GPU backend of the managed Ollama install: "auto", "rocm" or "vulkan".
+# auto uses ROCm on GPUs AMD's ROCm supports (RX 7000 series, RX 6800/6900, RX 9000)
+# and Vulkan on everything else (e.g. RX 6700 XT). Changing it requires:
+#   gpu-yield setup --reinstall
+backend = "auto"
 
 port = 11434
+
+# Status page for other computers: http://<this-pc>:11435 (JSON at /status).
+# Read-only. 0 turns it off.
+status_port = 11435
 
 # Seconds to wait after a game closes before reloading the model. Stops reload
 # churn when a launcher hands off to the game or you hop between games.
@@ -163,6 +175,11 @@ ollama_unit = "gpu-yield-ollama.service"
 update_repo = ""
 update_branch = "main"
 github_token = ""
+
+# Install updates automatically: "off", "gpu-yield", or "all" (gpu-yield and Ollama).
+# Checked once a day; installs only while no game is running and nobody has used the
+# AI for 15 minutes. Undo a bad one with:  gpu-yield rollback
+auto_update = "off"
 
 # Extra environment variables for the managed Ollama, for example:
 #   OLLAMA_KV_CACHE_TYPE = "q8_0"   # roughly halves context memory, small quality cost
@@ -204,6 +221,32 @@ def ago(seconds):
     return f"{seconds // 3600}h {seconds % 3600 // 60}m"
 
 
+def config_problem(cfg):
+    """A human-readable reason the config is invalid, or None."""
+    for key, default in DEFAULTS.items():
+        value = cfg[key]
+        if isinstance(default, bool):
+            ok_type = isinstance(value, bool)
+        elif isinstance(default, int):
+            ok_type = isinstance(value, (int, float)) and not isinstance(value, bool)
+        else:
+            ok_type = isinstance(value, type(default))
+        if not ok_type:
+            kind = {bool: "true or false", int: "a number", str: "text in quotes",
+                    list: "a list like [\"a\", \"b\"]", dict: "a table"}[type(default)]
+            return f"{key} must be {kind}, not {value!r}"
+        if key in CHOICES and value not in CHOICES[key]:
+            return f"{key} must be one of {', '.join(CHOICES[key])}, not {value!r}"
+    limits = {"context_length": (512, 10_000_000), "port": (1, 65535), "status_port": (0, 65535),
+              "cooldown_seconds": (0, 86400), "poll_seconds": (0.5, 60)}
+    for key, (lo, hi) in limits.items():
+        if not lo <= cfg[key] <= hi:
+            return f"{key} must be between {lo} and {hi}, not {cfg[key]}"
+    if cfg["status_port"] == cfg["port"]:
+        return "status_port must differ from port"
+    return None
+
+
 def load_config():
     cfg = json.loads(json.dumps(DEFAULTS))
     if CONFIG_FILE.exists():
@@ -220,8 +263,9 @@ def load_config():
         for k in DEFAULTS:
             if k in user:
                 cfg[k] = user[k]
-    if cfg["backend"] not in ("rocm", "vulkan"):
-        die(f'backend must be "rocm" or "vulkan", not {cfg["backend"]!r}')
+    problem = config_problem(cfg)
+    if problem:
+        die(f"{CONFIG_FILE}: {problem}")
     cfg["ignore_appids"] = [str(a) for a in cfg["ignore_appids"]]
     cfg["ollama_env"] = {str(k): str(v) for k, v in cfg["ollama_env"].items()}
     return cfg
@@ -252,6 +296,98 @@ def set_config_values(values):
     tmp = CONFIG_FILE.with_suffix(".tmp")
     tmp.write_text("\n".join(lines) + "\n")
     os.replace(tmp, CONFIG_FILE)
+
+
+def set_env_value(name, value):
+    """Set (or with value "" remove) a key in the [ollama_env] table, keeping comments."""
+    lines = CONFIG_FILE.read_text().splitlines()
+    header = next((i for i, l in enumerate(lines) if l.strip() == "[ollama_env]"), None)
+    if header is None:
+        lines += ["", "[ollama_env]"]
+        header = len(lines) - 1
+    end = next((i for i in range(header + 1, len(lines)) if lines[i].strip().startswith("[")),
+               len(lines))
+    rendered = f"{json.dumps(name) if not re.fullmatch(r'[A-Za-z0-9_-]+', name) else name} = {json.dumps(value)}"
+    for i in range(header + 1, end):
+        if "=" in lines[i] and lines[i].split("=", 1)[0].strip().strip("\"'") == name \
+                and not lines[i].lstrip().startswith("#"):
+            if value == "":
+                del lines[i]
+            else:
+                lines[i] = rendered
+            break
+    else:
+        if value != "":
+            lines.insert(end, rendered)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text("\n".join(lines) + "\n")
+    os.replace(tmp, CONFIG_FILE)
+
+
+def parse_setting(key, text):
+    """Turn command-line text into the type the setting needs."""
+    default = DEFAULTS[key]
+    if isinstance(default, bool):
+        low = text.strip().lower()
+        if low in ("true", "yes", "on", "1"):
+            return True
+        if low in ("false", "no", "off", "0"):
+            return False
+        raise ValueError(f"{key} must be true or false")
+    if isinstance(default, int):
+        try:
+            return int(text)
+        except ValueError:
+            try:
+                return float(text)
+            except ValueError:
+                raise ValueError(f"{key} must be a number") from None
+    if isinstance(default, list):
+        return [x.strip() for x in text.split(",") if x.strip()]
+    return text
+
+
+def default_route_dev():
+    """Network interface carrying the default route (e.g. "enp5s0"), or None."""
+    for line in _read_text(Path("/proc/net/route")).splitlines()[1:]:
+        parts = line.split()
+        if len(parts) > 2 and parts[1] == "00000000":
+            return parts[0]
+    return None
+
+
+def nic_info():
+    """(interface, MAC, is_wireless) for the default route."""
+    dev = default_route_dev()
+    if not dev:
+        return None, None, False
+    mac = _read_text(Path(f"/sys/class/net/{dev}/address")).strip() or None
+    return dev, mac, Path(f"/sys/class/net/{dev}/wireless").exists()
+
+
+def _loopback_hex(addr):
+    """True for 127.x/::1/::ffff:127.x in /proc/net/tcp's little-endian hex."""
+    if len(addr) == 8:
+        return addr[6:8] == "7F"
+    if addr == "00000000000000000000000001000000":
+        return True
+    return addr.startswith("0000000000000000FFFF0000") and addr[30:32] == "7F"
+
+
+def client_connections(port):
+    """TCP connections to `port` from other machines (ignores loopback, e.g. our own
+    health checks). Includes connections just closing, so a short request between two
+    polls still counts."""
+    n = 0
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        for line in _read_text(Path(table)).splitlines()[1:]:
+            parts = line.split()
+            if len(parts) < 4 or parts[3] == "0A":         # 0A = LISTEN
+                continue
+            local, remote = parts[1].rsplit(":", 1), parts[2].rsplit(":", 1)
+            if int(local[1], 16) == port and not _loopback_hex(remote[0]):
+                n += 1
+    return n
 
 
 def lan_address():
@@ -505,6 +641,30 @@ def command_name(argv):
 
 # ------------------------------------------------------------------------------ Ollama
 
+# GPU targets Ollama's ROCm build supports on Linux. Anything else uses Vulkan.
+ROCM_TARGETS = {"gfx906", "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1101",
+                "gfx1102", "gfx1151", "gfx1200", "gfx1201"}
+KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+
+
+def gpu_targets():
+    """AMD GPU architectures present, e.g. {"gfx1101"} for an RX 7800 XT."""
+    targets = set()
+    for props in KFD_NODES.glob("*/properties"):
+        m = re.search(r"^gfx_target_version (\d+)$", _read_text(props), re.M)
+        if m and int(m.group(1)):
+            v = int(m.group(1))   # 110001 -> gfx1101, 100301 -> gfx1031, 90010 -> gfx90a
+            targets.add(f"gfx{v // 10000}{v // 100 % 100:x}{v % 100:x}")
+    return targets
+
+
+def resolve_backend(cfg):
+    if cfg["backend"] != "auto":
+        return cfg["backend"]
+    targets = gpu_targets()
+    return "rocm" if targets & ROCM_TARGETS else "vulkan"
+
+
 def systemd_quote(value):
     """Escape a value for use inside Environment="..." (backslash, quote, % specifiers)."""
     return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
@@ -518,7 +678,7 @@ def ollama_unit_text(cfg):
         "OLLAMA_NUM_PARALLEL": "1",              # parallel slots multiply context memory
         "OLLAMA_MAX_LOADED_MODELS": "1",
     }
-    if cfg["backend"] == "vulkan":
+    if resolve_backend(cfg) == "vulkan":
         env["OLLAMA_VULKAN"] = "1"
     env.update(cfg["ollama_env"])
     env_lines = "\n".join(f'Environment="{systemd_quote(k)}={systemd_quote(v)}"'
@@ -782,6 +942,130 @@ class StandIn:
             self.server = None
 
 
+# ------------------------------------------------------------------------- status page
+
+STATUS_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>gpu-yield on {host}</title>
+<style>
+:root {{ --bg:#f6f6f4; --fg:#1d1d1b; --mut:#6b6b66; --card:#fff; --line:#e3e3df;
+        --ok:#1f8a4c; --wait:#b7791f; --off:#8a8a85; }}
+@media (prefers-color-scheme: dark) {{ :root {{ --bg:#141413; --fg:#ecece8; --mut:#9a9a94;
+        --card:#1e1e1c; --line:#2e2e2b; --ok:#3fbf73; --wait:#e0a83a; --off:#77776f; }} }}
+body {{ margin:0; background:var(--bg); color:var(--fg);
+       font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }}
+main {{ max-width:560px; margin:0 auto; padding:24px 16px; }}
+h1 {{ font-size:15px; font-weight:600; color:var(--mut); margin:0 0 12px; }}
+.card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; }}
+.state {{ display:flex; align-items:center; gap:10px; font-size:21px; font-weight:600; }}
+.dot {{ width:12px; height:12px; border-radius:50%; background:var(--{tone}); flex:none; }}
+dl {{ display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:16px 0 0; }}
+dt {{ color:var(--mut); }} dd {{ margin:0; overflow-wrap:anywhere; }}
+.note {{ margin-top:14px; padding:10px 12px; border-radius:8px; border:1px solid var(--line); }}
+footer {{ color:var(--mut); font-size:13px; margin-top:12px; }}
+a {{ color:inherit; }}
+</style></head><body><main>
+<h1>gpu-yield on {host}</h1>
+<div class="card">
+<div class="state"><span class="dot"></span>{headline}</div>
+<dl>{rows}</dl>{note}
+</div>
+<footer>gpu-yield {version} · refreshes every 5 s · <a href="/status">JSON</a></footer>
+</main></body></html>
+"""
+
+
+class StatusServer:
+    """Read-only status for other computers: GET / (page) and GET /status (JSON)."""
+
+    def __init__(self, port, snapshot):
+        self.port = port
+        self.snapshot = snapshot
+        self.server = None
+
+    def start(self):
+        owner = self
+
+        class Handler(BaseHTTPRequestHandler):
+            server_version = APP
+            timeout = 5
+
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    snap = owner.snapshot()
+                except Exception as e:
+                    snap = {"state": "error", "error": str(e)}
+                if path in ("/status", "/status.json"):
+                    body, ctype = json.dumps(snap, indent=1).encode(), "application/json"
+                elif path == "/":
+                    body, ctype = render_status_page(snap).encode(), "text/html; charset=utf-8"
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+
+            do_HEAD = do_GET
+
+        try:
+            server = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+        except OSError as e:
+            log(f"status page could not use port {self.port}: {e}")
+            return False
+        server.daemon_threads = True
+        self.server = server
+        threading.Thread(target=server.serve_forever, name="status-page", daemon=True).start()
+        return True
+
+    def stop(self):
+        if self.server:
+            self.server.shutdown()
+            self.server.server_close()
+            self.server = None
+
+
+def render_status_page(s):
+    esc = html.escape
+    state = s.get("state")
+    if s.get("ai_available"):
+        tone, headline = "ok", "AI ready"
+    elif state == "ai":
+        tone, headline = "wait", "AI starting: " + str(s.get("model_status", ""))
+    elif state == "cooldown":
+        tone, headline = "wait", f"Game closed, AI back in about {s.get('cooldown_remaining', 0)} s"
+    elif state == "gaming":
+        tone, headline = "off", "Game running, AI paused"
+    else:
+        tone, headline = "off", STATE_TEXT.get(state, str(state))
+    rows = []
+    if s.get("games"):
+        rows.append(("Game", ", ".join(s["games"])))
+    if s.get("model"):
+        rows.append(("Model", f"{s['model']} · {s.get('context_length')} context"))
+    if s.get("in_use"):
+        rows.append(("In use", "yes, right now"))
+    elif s.get("last_used"):
+        rows.append(("Last used", ago(time.time() - s["last_used"]) + " ago"))
+    rows.append(("Since", ago(time.time() - s.get("since", time.time())) + " ago"))
+    note = f'<div class="note">{esc(s["notice"])}</div>' if s.get("notice") else ""
+    return STATUS_PAGE.format(
+        host=esc(s.get("host", "")), tone=tone, headline=esc(headline), note=note,
+        version=esc(s.get("version", "")),
+        rows="".join(f"<dt>{esc(k)}</dt><dd>{esc(str(v))}</dd>" for k, v in rows))
+
+
 # ----------------------------------------------------------------------------- watcher
 
 class Watcher:
@@ -811,6 +1095,11 @@ class Watcher:
         self.last_status = None
         self.last_status_write = 0.0
         self.last_error = ("", 0.0)
+        self.in_use = False
+        self.last_used = None
+        self.mac = nic_info()[1]
+        self.next_update_check = time.monotonic() + 15 * 60   # first check 15 min after start
+        self.updating = False
 
     # --- transitions
     def set_state(self, state):
@@ -1006,19 +1295,89 @@ class Watcher:
             self.warned.add(key)
             log("note: " + msg)
 
-    def write_status(self, now):
-        status = {
+    def maybe_auto_update(self, now):
+        """Once a day (if enabled), install updates while nothing is going on."""
+        mode = self.cfg["auto_update"]
+        if mode == "off" or self.updating or now < self.next_update_check:
+            return
+        idle = self.last_used is None or time.time() - self.last_used > 15 * 60
+        if self.state != "ai" or self.in_use or not idle:
+            self.next_update_check = now + 30 * 60     # busy: look again in half an hour
+            return
+        self.next_update_check = now + 24 * 3600
+        self.updating = True
+        threading.Thread(target=self._auto_update, args=(mode,), name="auto-update",
+                         daemon=True).start()
+
+    def _auto_update(self, mode):
+        try:
+            try:
+                _, source = fetch_latest(self.cfg)
+            except SystemExit:
+                log("auto-update: couldn't check for a new version; trying again tomorrow")
+                return
+            todo = []
+            latest = declared_version(source) or "0"
+            if parse_version(latest) > parse_version(VERSION):
+                todo.append(f"gpu-yield {VERSION} -> {latest}")
+            with_ollama = mode == "all" and self.cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
+            if with_ollama:
+                have, newest = ollama_versions(self.cfg)
+                if have and newest and parse_version(newest) > parse_version(have):
+                    todo.append(f"Ollama {have} -> {newest}")
+            if not todo:
+                return
+            # The update restarts this watcher, so it has to run outside the watcher's
+            # own service: a transient unit of its own.
+            cmd = ["systemd-run", "--user", "--quiet", "--collect", f"--unit={AUTOUPDATE_UNIT}",
+                   sys.executable, str(BIN_PATH), "update"] + (["--ollama"] if with_ollama else [])
+            r = run(cmd)
+            if r.returncode:
+                log(f"auto-update: couldn't start ({r.stderr.strip()})")
+            else:
+                log(f"auto-update: installing {' and '.join(todo)} "
+                    f"(log: journalctl --user -u {AUTOUPDATE_UNIT})")
+        except Exception as e:
+            log(f"auto-update: {e!r}")
+        finally:
+            self.updating = False
+
+    def track_use(self):
+        """Note when other machines are talking to Ollama (feeds `last used` and the
+        idle check before automatic updates)."""
+        self.in_use = self.state == "ai" and client_connections(int(self.cfg["port"])) > 0
+        if self.in_use:
+            self.last_used = time.time()
+
+    def snapshot(self, now=None):
+        now = time.monotonic() if now is None else now
+        cooldown = max(0, int(self.cooldown_until - now)) if self.state == "cooldown" else None
+        ready = self.state == "ai" and self.warm_status.startswith("ready")
+        retry = {"gaming": self.standin.retry_after, "paused": self.standin.retry_after,
+                 "cooldown": (cooldown or 0) + 30}.get(self.state, 0 if ready else 30)
+        return {
+            "host": self.host,
+            "version": VERSION,
             "state": self.state,
+            "state_text": STATE_TEXT.get(self.state, str(self.state)),
             "since": self.since,
             "games": self.games,
-            "cooldown_remaining": max(0, int(self.cooldown_until - now)) if self.state == "cooldown" else None,
+            "cooldown_remaining": cooldown,
+            "ai_available": ready,
+            "retry_after": retry,
             "model": self.cfg["model"],
             "context_length": self.cfg["context_length"],
             "model_status": self.warm_status if self.state == "ai" else "unloaded",
             "notice": self.notice if self.state == "ai" else "",
+            "in_use": self.in_use,
+            "last_used": self.last_used,
+            "mac": self.mac,
+            "port": self.cfg["port"],
             "pid": os.getpid(),
-            "version": VERSION,
         }
+
+    def write_status(self, now):
+        status = self.snapshot(now)
         # Only write when something changed, plus a heartbeat so `status` can tell a
         # live watcher from a dead one.
         if status == self.last_status and now - self.last_status_write < 10:
@@ -1034,8 +1393,14 @@ class Watcher:
         # Start from a known state: whatever Ollama was doing, it may carry an old config.
         self.ollama.stop()
         (STATE_DIR / "status.json").unlink(missing_ok=True)   # pre-1.5 location
+        self.last_used = (read_status() or {}).get("last_used")  # survives watcher restarts
         log(f"gpu-yield {VERSION} watching for games (model {self.cfg['model']}, "
             f"context {self.cfg['context_length']}, cooldown {self.cfg['cooldown_seconds']}s)")
+        page = None
+        if self.cfg["status_port"]:
+            page = StatusServer(int(self.cfg["status_port"]), self.snapshot)
+            if page.start():
+                log(f"status page on http://{self.host}:{self.cfg['status_port']}/")
         poll = max(0.5, float(self.cfg["poll_seconds"]))
         mono0, boot0 = time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
         while not self.stop_evt.is_set():
@@ -1044,6 +1409,8 @@ class Watcher:
             mono0, boot0 = mono, boot
             try:
                 self.step(scan_games(self.cfg), PAUSE_FILE.exists(), slept, mono)
+                self.track_use()
+                self.maybe_auto_update(mono)
             except Exception as e:  # never let one bad loop kill the watcher
                 msg = f"watcher error: {e!r}"
                 if msg != self.last_error[0] or mono - self.last_error[1] > 300:
@@ -1052,6 +1419,8 @@ class Watcher:
             self.write_status(mono)
             self.stop_evt.wait(poll)
         self.standin.stop()
+        if page:
+            page.stop()
         log("watcher stopped")
 
 
@@ -1125,6 +1494,17 @@ def read_status():
 
 
 def cmd_status(args):
+    if args.host:
+        host, port = split_host(args.host)
+        try:
+            st = fetch_remote_status(host, port)
+        except OSError as e:
+            die(f"can't reach {host}:{port} ({getattr(e, 'reason', e)}). If it's asleep, "
+                f"wake it with: gpu-yield wake {args.host}")
+        remember_host(args.host, st)
+        print(f"Host:     {st.get('host')} ({host}), gpu-yield {st.get('version')}")
+        print_status(st)
+        return
     active = user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0
     st = read_status()
     print(f"Watcher:  {'running' if active else 'NOT running'}"
@@ -1133,9 +1513,18 @@ def cmd_status(args):
         print("No status yet.")
         return
     stale = time.time() - st.get("updated", 0) > 30
+    print_status(st, "   (stale: last update " + ago(time.time() - st['updated']) + " ago)"
+                 if stale else "")
+    if st.get("version") and st["version"] != VERSION:
+        print(f"Version:  watcher runs {st['version']}, this command is {VERSION} "
+              f"(apply with: systemctl --user restart {WATCHER_UNIT})")
+    if PAUSE_FILE.exists():
+        print("Paused:   yes (gpu-yield resume to undo)")
+
+
+def print_status(st, suffix=""):
     print(f"State:    {STATE_TEXT.get(st.get('state'), st.get('state'))}"
-          f" for {ago(time.time() - st.get('since', time.time()))}"
-          + ("   (stale: last update " + ago(time.time() - st['updated']) + " ago)" if stale else ""))
+          f" for {ago(time.time() - st.get('since', time.time()))}{suffix}")
     if st.get("games"):
         print(f"Games:    {', '.join(st['games'])}")
     if st.get("cooldown_remaining") is not None:
@@ -1146,13 +1535,174 @@ def cmd_status(args):
         print(f"Model:    {st['model']} @ {st.get('context_length')} ctx: {st.get('model_status')}")
     else:
         print("Model:    none chosen (run: gpu-yield model)")
+    if st.get("in_use"):
+        print("Used:     right now")
+    elif st.get("last_used"):
+        print(f"Used:     {ago(time.time() - st['last_used'])} ago")
     if st.get("notice"):
         print(f"Note:     {st['notice']}")
-    if st.get("version") and st["version"] != VERSION:
-        print(f"Version:  watcher runs {st['version']}, this command is {VERSION} "
-              f"(apply with: systemctl --user restart {WATCHER_UNIT})")
-    if PAUSE_FILE.exists():
-        print("Paused:   yes (gpu-yield resume to undo)")
+
+
+# --- other computers: remote status and wake-up
+
+MAC_RE = re.compile(r"^[0-9a-f]{2}([:-][0-9a-f]{2}){5}$", re.I)
+HOSTS_FILE = CACHE_DIR / "hosts.json"
+
+
+def split_host(target):
+    host, _, port = target.partition(":") if target.count(":") == 1 else (target, "", "")
+    return host, int(port) if port else DEFAULTS["status_port"]
+
+
+def fetch_remote_status(host, port, timeout=4):
+    req = urllib.request.Request(f"http://{host}:{port}/status",
+                                 headers={"User-Agent": f"{APP}/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def load_hosts():
+    try:
+        return json.loads(HOSTS_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def remember_host(target, st):
+    """Cache what we need to wake this PC later, while it's awake to tell us."""
+    hosts = load_hosts()
+    entry = hosts.get(target, {})
+    if st.get("mac"):
+        entry["mac"] = st["mac"]
+    try:
+        entry["ip"] = socket.gethostbyname(split_host(target)[0])
+    except OSError:
+        pass
+    hosts[target] = entry
+    try:
+        HOSTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        HOSTS_FILE.write_text(json.dumps(hosts, indent=1))
+    except OSError:
+        pass
+
+
+def magic_packet(mac):
+    return b"\xff" * 6 + bytes.fromhex(re.sub(r"[:-]", "", mac)) * 16
+
+
+def send_magic_packet(mac, ip=None):
+    targets = {"255.255.255.255"}
+    if ip:
+        targets.add(ip.rsplit(".", 1)[0] + ".255")   # the usual /24 home network
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for addr in targets:
+            for port in (9, 7):
+                try:
+                    s.sendto(magic_packet(mac), (addr, port))
+                except OSError:
+                    pass
+
+
+def cmd_wake(args):
+    hosts = load_hosts()
+    target = args.target or (next(iter(hosts)) if len(hosts) == 1 else None)
+    if not target:
+        die("which PC? gpu-yield wake HOSTNAME (or its MAC address, like 1c:2b:...)")
+    if MAC_RE.match(target):
+        send_magic_packet(target)
+        print(f"Wake-up packet sent to {target}.")
+        return
+    host, port = split_host(target)
+    try:
+        st = fetch_remote_status(host, port, timeout=2)
+        remember_host(target, st)
+        print(f"{host} is already awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
+        return
+    except OSError:
+        pass
+    info = hosts.get(target, {})
+    if not info.get("mac"):
+        die(f"don't know {host}'s network card address yet. While it's awake, run once:\n"
+            f"  gpu-yield status --host {target}\n"
+            f"or pass the address directly: gpu-yield wake AA:BB:CC:DD:EE:FF "
+            f"(shown by gpu-yield wol on that PC)")
+    send_magic_packet(info["mac"], info.get("ip"))
+    print(f"Wake-up packet sent to {host} ({info['mac']}).")
+    if args.no_wait:
+        return
+    print("Waiting for it to come up", end="", flush=True)
+    end = time.time() + 120
+    while time.time() < end:
+        time.sleep(3)
+        print(".", end="", flush=True)
+        try:
+            st = fetch_remote_status(host, port, timeout=2)
+        except OSError:
+            continue
+        print(f" awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
+        return
+    print()
+    die(f"no answer from {host} after 2 minutes. On that PC, check Wake-on-LAN with "
+        "gpu-yield wol, and that it's enabled in the BIOS/UEFI.")
+
+
+def wol_state(dev):
+    """(supported modes, current mode) from ethtool, e.g. ("pumbg", "g"); Nones if unknown."""
+    if not shutil.which("ethtool"):
+        return None, None
+    out = run(["ethtool", dev]).stdout
+    sup = re.search(r"Supports Wake-on:\s*(\S+)", out)
+    cur = re.search(r"^\s*Wake-on:\s*(\S+)", out, re.M)
+    return (sup.group(1) if sup else None), (cur.group(1) if cur else None)
+
+
+def enable_wol(args):
+    dev, mac, wireless = nic_info()
+    if not dev:
+        warn("no network connection found")
+        return
+    if wireless:
+        log(f"  {dev} is Wi-Fi; Wake-on-LAN generally needs a wired connection. Skipped.")
+        return
+    supported, current = wol_state(dev)
+    if supported is not None and "g" not in supported:
+        log(f"  {dev}'s network card doesn't support Wake-on-LAN")
+        return
+    if current and "g" in current:
+        log(f"  already on for {dev} ({mac})")
+        return
+    if not ask(f"Turn on Wake-on-LAN for {dev}, so your other computers can wake this PC? "
+               "Needs sudo.", args):
+        return
+    conn = run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", dev]).stdout.strip()
+    saved = bool(conn) and sudo(["nmcli", "connection", "modify", conn,
+                                 "802-3-ethernet.wake-on-lan", "magic"])
+    now = shutil.which("ethtool") and sudo(["ethtool", "-s", dev, "wol", "g"])
+    if saved or now:
+        log(f"  Wake-on-LAN on for {dev} ({mac})" + ("" if saved else " until the next reboot")
+            + ("" if now else "; takes effect after a reboot"))
+        log("  If waking doesn't work, also enable \"Wake on LAN\" / \"Power on by PCI-E\" "
+            "in the BIOS/UEFI.")
+    else:
+        warn("couldn't turn on Wake-on-LAN")
+
+
+def cmd_wol(args):
+    dev, mac, wireless = nic_info()
+    print(f"Network:  {dev or 'none'}" + (" (Wi-Fi)" if wireless else "") + (f", MAC {mac}" if mac else ""))
+    supported, current = wol_state(dev) if dev else (None, None)
+    if current is not None:
+        print(f"Wake-on:  {'on' if 'g' in current else 'off'} (supported: {supported or '?'})")
+    args.yes = False
+    enable_wol(args)
+    print(f"\nTo wake this PC from another computer with gpu-yield:\n"
+          f"  gpu-yield wake {socket.gethostname()}      (or: gpu-yield wake {mac or 'MAC'})")
+
+
+def cmd_firewall(args):
+    args.yes = False
+    open_firewall(load_config(), args)
 
 
 def cmd_pause(args):
@@ -1206,7 +1756,14 @@ def cmd_doctor(args):
     if run(["systemctl", "is-active", "--quiet", "ollama.service"]).returncode == 0:
         bad("a system-wide ollama.service is running and competes for the port: "
             "sudo systemctl disable --now ollama.service")
-    if cfg["backend"] == "rocm":
+    backend, targets = resolve_backend(cfg), gpu_targets()
+    gpus = ", ".join(sorted(targets)) or "no AMD GPU found"
+    note(f"GPU: {gpus}; backend {backend}" + (" (chosen automatically)" if cfg["backend"] == "auto" else ""))
+    if backend == "rocm" and targets and not targets & ROCM_TARGETS:
+        bad(f"ROCm doesn't support {gpus}, so Ollama would run on the CPU. "
+            "Set backend to auto or vulkan: gpu-yield config backend auto, then "
+            "gpu-yield setup --reinstall")
+    if backend == "rocm":
         kfd = Path("/dev/kfd")
         if kfd.exists() and os.access(kfd, os.R_OK | os.W_OK):
             ok("/dev/kfd accessible (ROCm)")
@@ -1246,9 +1803,19 @@ def cmd_doctor(args):
 
     ip, net = lan_address()
     if run(["systemctl", "is-active", "--quiet", "firewalld"]).returncode == 0:
-        note(f"firewalld is active; port {cfg['port']} must be open to {net or 'your LAN'} "
-             "(gpu-yield setup offers to do this)")
+        ports = " and ".join(str(p) for p in (cfg["port"], cfg["status_port"]) if p)
+        note(f"firewalld is active; ports {ports} must be open to {net or 'your LAN'} "
+             "(gpu-yield firewall does this)")
     note(f"Hermes base_url: http://{ip or '<this-pc-ip>'}:{cfg['port']}/v1")
+    if cfg["status_port"]:
+        note(f"status page: http://{ip or socket.gethostname()}:{cfg['status_port']}/")
+    dev, mac, wireless = nic_info()
+    if dev:
+        _, current = wol_state(dev)
+        state = "Wi-Fi, not available" if wireless else \
+            ("on" if current and "g" in current else "off (turn on: gpu-yield wol)") if current \
+            else "unknown (gpu-yield wol)"
+        note(f"Wake-on-LAN: {state}; {dev} {mac or ''}")
     print("All good." if problems == 0 else f"{problems} thing(s) to fix.")
 
 
@@ -1354,19 +1921,27 @@ def check_conflicts(args):
                 user_systemctl("disable", "--now", unit)
 
 
-def setup_firewall(cfg, args):
+def open_firewall(cfg, args):
+    """Open the AI port and the status page port to the local network only."""
     if run(["systemctl", "is-active", "--quiet", "firewalld"]).returncode:
         log("  firewalld not active; nothing to open")
         return
     ip, net = lan_address()
     if not net:
-        warn("could not work out your LAN subnet; open the port manually if Hermes can't connect")
+        warn("could not work out your LAN subnet; open the ports manually if Hermes can't connect")
         return
-    rule = (f'rule family="ipv4" source address="{net}" '
-            f'port port="{cfg["port"]}" protocol="tcp" accept')
-    if ask(f"Allow port {cfg['port']} from your local network ({net}) only? Needs sudo.", args):
-        if sudo(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"]):
-            sudo(["firewall-cmd", "--reload"])
+    ports = [cfg["port"]] + ([cfg["status_port"]] if cfg["status_port"] else [])
+    names = " and ".join(str(p) for p in ports)
+    if not ask(f"Allow port{'s' if len(ports) > 1 else ''} {names} from your local network "
+               f"({net}) only? Needs sudo.", args):
+        return
+    done = True
+    for port in ports:
+        rule = (f'rule family="ipv4" source address="{net}" '
+                f'port port="{port}" protocol="tcp" accept')
+        done &= sudo(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"])
+    if done:
+        sudo(["firewall-cmd", "--reload"])
 
 
 def enable_linger(args):
@@ -1481,6 +2056,77 @@ def cmd_model(args):
         print(f"The old model is still on disk; free the space with: ollama rm {old}")
 
 
+def fmt_setting(value):
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, (str, list, dict)):
+        return json.dumps(value)
+    return str(value)
+
+
+def cmd_config(args):
+    if not CONFIG_FILE.exists():
+        die("no config yet; run: gpu-yield setup")
+    if args.key is None:
+        cfg = load_config()
+        print(f"Settings ({CONFIG_FILE}):")
+        for k in DEFAULTS:
+            if k == "ollama_env":
+                continue
+            v = ('"(set)"' if cfg[k] else '""') if k == "github_token" else fmt_setting(cfg[k])
+            if k == "backend" and cfg[k] == "auto":
+                v += f"  (currently {resolve_backend(cfg)})"
+            print(f"  {k:<22} {v}" + ("" if cfg[k] == DEFAULTS[k] else "   *changed"))
+        for k, v in cfg["ollama_env"].items():
+            print(f"  {'env.' + k:<22} {json.dumps(v)}")
+        print("\nChange a setting:   gpu-yield config KEY VALUE")
+        print("Ollama variables:   gpu-yield config env.NAME VALUE   (\"\" removes it)")
+        print("Lists take commas:  gpu-yield config extra_processes \"game1,game2.exe\"")
+        return
+    key = args.key
+    if args.value is None:
+        cfg = load_config()
+        if key.startswith("env."):
+            print(json.dumps(cfg["ollama_env"].get(key[4:], "")))
+        elif key in DEFAULTS:
+            print(fmt_setting(cfg[key]))
+        else:
+            die(f"unknown setting {key!r}; run gpu-yield config to list them")
+        return
+    if key == "model":
+        die(f"use: gpu-yield model {args.value}   (it downloads the model as well)")
+    if key == "ollama_env" or (key not in DEFAULTS and not key.startswith("env.")):
+        die(f"unknown setting {key!r}; run gpu-yield config to list them")
+    before = CONFIG_FILE.read_text()
+    if key.startswith("env."):
+        set_env_value(key[4:], args.value)
+    else:
+        try:
+            set_config_values({key: parse_setting(key, args.value)})
+        except ValueError as e:
+            die(f"{e}; nothing changed")
+    try:
+        cfg = load_config()
+    except SystemExit:
+        tmp = CONFIG_FILE.with_suffix(".tmp")
+        tmp.write_text(before)
+        os.replace(tmp, CONFIG_FILE)
+        print("Nothing changed.")
+        sys.exit(1)
+    shown = json.dumps(cfg["ollama_env"].get(key[4:], "")) if key.startswith("env.") \
+        else fmt_setting(cfg[key])
+    print(f"{key} = {shown}")
+    if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0:
+        user_systemctl("restart", WATCHER_UNIT)
+        print("Applied (watcher restarted; the model reloads in a moment).")
+    if key == "context_length":
+        print(f"Set context_length and ollama_num_ctx to {cfg[key]} in Hermes's config too.")
+    elif key == "backend":
+        print("The Ollama download depends on the backend; finish with: gpu-yield setup --reinstall")
+    elif key in ("port", "status_port"):
+        print("If the firewall is on, open the new port with: gpu-yield firewall")
+
+
 def hermes_snippet(cfg):
     ip, _ = lan_address()
     return f"""\
@@ -1501,7 +2147,7 @@ def cmd_setup(args):
     if user_systemctl("show-environment").returncode:
         die("cannot reach the systemd user manager")
 
-    log("1/7 Config")
+    log("1/8 Config")
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
         CONFIG_FILE.write_text(CONFIG_TEMPLATE)
@@ -1518,12 +2164,12 @@ def cmd_setup(args):
             cfg = load_config()
     managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
     log(f"  model {cfg['model'] or 'none yet'}, context {cfg['context_length']}, "
-        f"backend {cfg['backend']}")
+        f"backend {resolve_backend(cfg)}" + (" (auto)" if cfg["backend"] == "auto" else ""))
 
-    log("2/7 Checking for other Ollama installs")
+    log("2/8 Checking for other Ollama installs")
     check_conflicts(args)
 
-    log("3/7 Ollama")
+    log("3/8 Ollama")
     if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0:
         user_systemctl("stop", WATCHER_UNIT)
     if not managed:
@@ -1531,9 +2177,9 @@ def cmd_setup(args):
     elif OLLAMA_BIN.exists() and not args.reinstall:
         log(f"  already installed at {OLLAMA_DIR} (--reinstall to update)")
     else:
-        install_ollama(cfg["backend"])
+        install_ollama(resolve_backend(cfg))
 
-    log("4/7 Services")
+    log("4/8 Services")
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     me = Path(__file__).resolve()
     if me != BIN_PATH.resolve():
@@ -1548,13 +2194,16 @@ def cmd_setup(args):
     enable_linger(args)
     log(f"  watcher running; installed as {BIN_PATH}")
 
-    log("5/7 Firewall")
+    log("5/8 Firewall")
     if args.no_firewall:
         log("  skipped")
     else:
-        setup_firewall(cfg, args)
+        open_firewall(cfg, args)
 
-    log("6/7 Model")
+    log("6/8 Wake-on-LAN")
+    enable_wol(args)
+
+    log("7/8 Model")
     if not cfg["model"]:
         log("  none chosen; pick one any time with: gpu-yield model")
     elif args.skip_pull:
@@ -1566,14 +2215,15 @@ def cmd_setup(args):
     else:
         pull_and_load(cfg, cfg["model"])
 
-    log("7/7 Done\n")
+    log("8/8 Done\n")
     print(hermes_snippet(cfg))
     print(f"""
+Status page: http://{socket.gethostname()}:{cfg['status_port']}/
+
 Useful commands:
-  gpu-yield status      gpu-yield doctor
-  gpu-yield pause       gpu-yield resume
-  journalctl --user -u gpu-yield -f
-Config: {CONFIG_FILE}  (then: systemctl --user restart gpu-yield)""")
+  gpu-yield status      gpu-yield doctor      gpu-yield config
+  gpu-yield pause       gpu-yield resume      gpu-yield model
+  journalctl --user -u gpu-yield -f""")
 
 
 def cmd_uninstall(args):
@@ -1641,6 +2291,33 @@ def fetch_latest(cfg):
     except urllib.error.URLError as e:
         die(f"could not reach GitHub: {e.reason}")
     return repo, data
+
+
+def changelog_entries(text, old, new):
+    """Sections of CHANGELOG.md ("## 1.6.0 ...") for versions after old, up to new."""
+    out = []
+    for section in re.split(r"^## ", text, flags=re.M)[1:]:
+        version = section.split(None, 1)[0] if section.strip() else ""
+        if parse_version(old) < parse_version(version) <= parse_version(new):
+            out.append("## " + section.strip())
+    return out
+
+
+def print_whats_new(cfg, repo, old, new, max_lines=40):
+    try:
+        text = github_get(cfg, f"/repos/{repo}/contents/CHANGELOG.md?ref={cfg['update_branch']}",
+                          raw=True, timeout=10).decode(errors="replace")
+    except Exception:
+        return      # the changelog is a nicety; never block an update on it
+    lines = "\n\n".join(changelog_entries(text, old, new)).splitlines()
+    if not lines:
+        return
+    print("\nWhat's new:")
+    for line in lines[:max_lines]:
+        print("  " + line)
+    if len(lines) > max_lines:
+        print(f"  ... (full list: https://github.com/{repo}/blob/{cfg['update_branch']}/CHANGELOG.md)")
+    print()
 
 
 def install_script(source, label):
@@ -1744,9 +2421,13 @@ def cmd_update(args):
         if managed:
             print(f"Ollama:    installed {o_installed or '?'}, latest {o_latest or '?'}"
                   + ("  -> run: gpu-yield update --ollama" if o_newer else ""))
+        if newer:
+            print_whats_new(cfg, repo, VERSION, latest)
         return
 
     if newer or args.force:
+        if newer:
+            print_whats_new(cfg, repo, VERSION, latest)
         log(f"updating gpu-yield {VERSION} -> {latest} from {repo}")
         install_script(source, f"version {latest} from {repo}")
         log(f"gpu-yield is now {latest}. Undo with: gpu-yield rollback")
@@ -1759,10 +2440,10 @@ def cmd_update(args):
         elif not o_newer and not args.force:
             log(f"Ollama {o_installed} is up to date")
         else:
-            log(f"updating Ollama {o_installed} -> {o_latest} (backend {cfg['backend']})")
+            log(f"updating Ollama {o_installed} -> {o_latest} (backend {resolve_backend(cfg)})")
             user_systemctl("stop", WATCHER_UNIT)
             try:
-                install_ollama(cfg["backend"])
+                install_ollama(resolve_backend(cfg))
             finally:
                 user_systemctl("start", WATCHER_UNIT)
     elif o_newer:
@@ -1792,18 +2473,27 @@ def main():
     s = sub.add_parser("setup", help="install Ollama, this tool and its services")
     s.add_argument("--model", help="model to keep loaded (asks if not given)")
     s.add_argument("--context", type=int, help="context length in tokens (default 65536)")
-    s.add_argument("--backend", choices=["rocm", "vulkan"], help="GPU backend (default rocm)")
+    s.add_argument("--backend", choices=list(CHOICES["backend"]), help="GPU backend (default auto)")
     s.add_argument("--reinstall", action="store_true", help="re-download Ollama (updates it)")
     s.add_argument("--skip-pull", action="store_true", help="don't download the model")
     s.add_argument("--no-firewall", action="store_true", help="don't touch the firewall")
     s.add_argument("-y", "--yes", action="store_true", help="accept all prompts")
     s.set_defaults(func=cmd_setup)
     for name, fn, text in (("run", cmd_run, "run the watcher (systemd does this)"),
-                           ("status", cmd_status, "show the current state"),
                            ("pause", cmd_pause, "keep the AI off until resume"),
                            ("resume", cmd_resume, "undo pause"),
                            ("doctor", cmd_doctor, "check the setup")):
         sub.add_parser(name, help=text).set_defaults(func=fn)
+    st = sub.add_parser("status", help="show the current state (here, or --host another PC)")
+    st.add_argument("--host", help="ask another PC running gpu-yield (HOST or HOST:PORT)")
+    st.set_defaults(func=cmd_status)
+    wk = sub.add_parser("wake", help="wake a sleeping PC over the network (Wake-on-LAN)")
+    wk.add_argument("target", nargs="?", help="hostname you've used with status --host, or a MAC")
+    wk.add_argument("--no-wait", action="store_true", help="don't wait for it to come up")
+    wk.set_defaults(func=cmd_wake)
+    sub.add_parser("wol", help="show or turn on Wake-on-LAN for this PC").set_defaults(func=cmd_wol)
+    sub.add_parser("firewall", help="open the AI and status ports to the local network") \
+        .set_defaults(func=cmd_firewall)
     up = sub.add_parser("update", help="update gpu-yield from GitHub (and optionally Ollama)")
     up.add_argument("--file", metavar="PATH", help="install from a local file instead of GitHub")
     up.add_argument("--check", action="store_true", help="only report what's available")
@@ -1813,6 +2503,10 @@ def main():
     m = sub.add_parser("model", help="choose or change the model (downloads it)")
     m.add_argument("name", nargs="?", help="Ollama model name; omit to pick from a list")
     m.set_defaults(func=cmd_model)
+    c = sub.add_parser("config", help="show settings, or change one: config KEY VALUE")
+    c.add_argument("key", nargs="?", help="setting name, or env.NAME for an Ollama variable")
+    c.add_argument("value", nargs="?", help="new value (lists: comma-separated)")
+    c.set_defaults(func=cmd_config)
     sub.add_parser("rollback", help="go back to the version before the last update") \
         .set_defaults(func=cmd_rollback)
     u = sub.add_parser("uninstall", help="remove the services")

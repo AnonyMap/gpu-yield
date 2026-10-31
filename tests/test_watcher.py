@@ -75,8 +75,9 @@ class FakeOllama(gy.Ollama):
 gy.Ollama = FakeOllama
 gy.ensure_ollama_unit = lambda cfg: False
 
-cfg = dict(gy.load_config(), port=PORT, poll_seconds=0.3, cooldown_seconds=2,
-           model="gpt-oss:20b", context_length=65536)
+STATUS_PORT = free_port()
+cfg = dict(gy.load_config(), port=PORT, status_port=STATUS_PORT, poll_seconds=0.3,
+           cooldown_seconds=2, model="gpt-oss:20b", context_length=65536)
 w = gy.Watcher(cfg)
 threading.Thread(target=w.run, daemon=True).start()
 
@@ -102,10 +103,30 @@ gen = [e for e in events if e[0] == "generate"][-1][1]
 assert gen["keep_alive"] == -1 and gen["options"]["num_ctx"] == 65536 and gen["prompt"] == ""
 ok("starts Ollama and preloads the model with the configured context")
 
+def page(path):
+    c = http.client.HTTPConnection("127.0.0.1", STATUS_PORT, timeout=3)
+    c.request("GET", path)
+    r = c.getresponse()
+    return r.status, r.read().decode()
+
+
+code, body = page("/status")
+snap = json.loads(body)
+assert code == 200 and snap["state"] == "ai" and snap["ai_available"] is True
+assert snap["model"] == "gpt-oss:20b" and snap["version"] == gy.VERSION and "mac" in snap
+code, body = page("/")
+assert code == 200 and "AI ready" in body and "gpt-oss:20b" in body
+assert page("/nope")[0] == 404
+ok("status page serves JSON at /status and a readable page at /")
+
 game = fake_process("reaper", "SteamLaunch", "AppId=1245620", "--", "game")
 t0 = time.time()
 wait(lambda: w.state == "gaming" and w.standin.server is not None, msg="gaming")
 ok(f"game detected and Ollama stopped in {time.time() - t0:.1f}s")
+snap = json.loads(page("/status")[1])
+assert snap["state"] == "gaming" and not snap["ai_available"] and snap["retry_after"] == 120
+assert "Game running" in page("/")[1]
+ok("status page reports the game and when to retry")
 code, body, hdr = get("/v1/chat/completions", b'{"model":"x","messages":[]}')
 assert code == 503 and json.loads(body)["error"]["code"] == "gpu_busy", (code, body)
 assert hdr.get("Connection") == "close" and hdr.get("Retry-After") == "120"
