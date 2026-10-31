@@ -170,7 +170,9 @@ The controls are off until you set a password on the gaming PC:
 gpu-yield config control_password YOUR-PASSWORD
 ```
 
-The page asks for it once per browser and remembers it; *Lock controls on this device* forgets it. Without a password the page stays read-only. Use a password you don't use anywhere else: the page is plain HTTP, so it crosses your local network unencrypted.
+Use at least 8 characters, and a password you don't use anywhere else: the page is plain HTTP, so it crosses your local network unencrypted. The page asks for it once per browser and remembers it; *Lock controls on this device* forgets it. Without a password the page stays read-only.
+
+After 10 wrong passwords within a minute, from any device, the controls stay locked for the rest of that minute. Open the page by the PC's name (such as `gaming-pc` or `gaming-pc.local`) or its IP address; the controls refuse requests addressed to any other name, which blocks websites from reaching them through your browser.
 
 The controls cost the PC almost nothing. The page's server sits idle until a browser asks for something, and Ollama does the actual downloading and loading. Every change goes through the watcher, so a change made from the page can't collide with a game starting. Downloads and deletes need the AI running, so they're refused during a game with a message saying why. Model and context changes made during a game are saved and take effect when the AI comes back.
 
@@ -244,7 +246,7 @@ An invalid value is refused and the file is left as it was. You can also edit `~
 | `ignore_appids` | `[]` | Steam AppIds that should not stop the AI |
 | `detect_wine` | `true` | Treat Windows programs outside Steam that are using the GPU as games |
 | `auto_update` | `"off"` | `off`, `gpu-yield`, or `all` (gpu-yield and Ollama). See [Updating](#updating) |
-| `control_password` | none | Turns on the [controls on the status page](#controls-on-the-status-page). `gpu-yield config` shows it only as "(set)" |
+| `control_password` | none | Turns on the [controls on the status page](#controls-on-the-status-page); at least 8 characters. `gpu-yield config` shows it only as "(set)" |
 | `update_repo`, `update_branch` | this repo, `main` | Where updates come from, for forks |
 | `github_token` | none | Read-only token, only needed if `update_repo` is private |
 | `ollama_unit` | managed | Leave as is, unless you run Ollama yourself under another systemd user unit |

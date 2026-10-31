@@ -27,6 +27,7 @@ Logs:  journalctl --user -u gpu-yield -u gpu-yield-ollama -f
 """
 
 import argparse
+import collections
 import hmac
 import html
 import http.client
@@ -44,6 +45,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1148,6 +1150,7 @@ a { color:inherit; }
 const $ = id => document.getElementById(id);
 const KEY = "gpu-yield-password";
 let pw = null, snap = JSON.parse($("initial").textContent), models = null, busy = false;
+let ctxChoice = null, modelsKey = "", jobsKey = "";   // unapplied dropdown choice; last drawn lists
 try { pw = localStorage.getItem(KEY); } catch (e) {}
 
 function el(tag, attrs, ...kids) {
@@ -1202,12 +1205,21 @@ function renderControls() {
   $("pause").textContent = s.paused ? "Resume the AI" : "Pause the AI";
   $("pausehint").textContent = s.paused ? "Paused until you resume it." : "Keeps the AI off until resumed, even after a reboot.";
   $("pause").disabled = busy;
-  if (document.activeElement !== $("ctx")) $("ctx").value = String(s.context_length);
   if (![...$("ctx").options].some(o => o.value === String(s.context_length)))
     $("ctx").append(el("option", { value: String(s.context_length) }, String(s.context_length)));
-  if (document.activeElement !== $("ctx")) $("ctx").value = String(s.context_length);
+  if (ctxChoice !== null && ctxChoice === String(s.context_length)) ctxChoice = null;
+  $("ctx").value = ctxChoice !== null ? ctxChoice : String(s.context_length);   // keep a pending choice
   $("ctxapply").disabled = busy;
 
+  // Redraw the lists only when they change, so a button isn't replaced under a tap or focus.
+  const mk = JSON.stringify([models, s.model, busy]);
+  if (mk !== modelsKey) { modelsKey = mk; drawModels(s); }
+  $("disk").textContent = models && models.disk_free ? gb(models.disk_free) + " free for models" : "";
+  const jk = JSON.stringify(s.downloads || []);
+  if (jk !== jobsKey) { jobsKey = jk; drawJobs(s); }
+}
+
+function drawModels(s) {
   const list = $("models");
   if (!models) { list.replaceChildren(el("li", {}, el("span", { class: "muted" }, "Loading…"))); }
   else if (!models.models.length) {
@@ -1225,8 +1237,9 @@ function renderControls() {
         } }, "Delete"));
     }));
   }
-  $("disk").textContent = models && models.disk_free ? gb(models.disk_free) + " free for models" : "";
+}
 
+function drawJobs(s) {
   $("jobs").replaceChildren(...(s.downloads || []).map(j => {
     const pct = j.total ? Math.round(100 * j.completed / j.total) : null;
     const text = j.state === "running" ? (pct != null ? pct + "% of " + gb(j.total) : j.status || "starting")
@@ -1243,7 +1256,7 @@ async function act(action, body, pending) {
   busy = true; say(pending || "…"); renderControls();
   try {
     const r = await fetch("/api/" + action, { method: "POST",
-      headers: { "Content-Type": "application/json", "X-GPU-Yield-Password": pw || "" },
+      headers: { "Content-Type": "application/json", "X-GPU-Yield-Password": encodeURIComponent(pw || "") },
       body: JSON.stringify(body || {}) });
     const d = await r.json().catch(() => ({}));
     if (r.status === 403 && action !== "auth") { forget(); }
@@ -1278,6 +1291,7 @@ $("unlock").addEventListener("submit", async ev => {
 });
 $("lock").addEventListener("click", ev => { ev.preventDefault(); forget(); say("Locked on this device."); });
 $("pause").addEventListener("click", () => act("pause", { paused: !snap.paused }, snap.paused ? "Resuming…" : "Pausing…"));
+$("ctx").addEventListener("change", () => { ctxChoice = $("ctx").value; });
 $("ctxapply").addEventListener("click", () => act("context", { context_length: Number($("ctx").value) }, "Applying… the model reloads"));
 $("pull").addEventListener("submit", ev => {
   ev.preventDefault();
@@ -1299,7 +1313,9 @@ MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?")
 def normalize_model_name(text):
     """Accept an Ollama name, a Hugging Face repo, or either site's URL; return what
     `ollama pull` expects (hf.co/user/repo[:quant] for Hugging Face)."""
-    t = (text or "").strip()
+    if text is not None and not isinstance(text, str):
+        raise ValueError("the model name must be text")
+    t = (text or "").strip().split("?", 1)[0].split("#", 1)[0]
     t = re.sub(r"^(https?://)?(www\.)?(huggingface\.co|hf\.co)/", "hf.co/", t, flags=re.I)
     t = re.sub(r"^(https?://)?(www\.)?ollama\.com/(library/)?", "", t, flags=re.I)
     if t.startswith("hf.co/"):
@@ -1307,7 +1323,14 @@ def normalize_model_name(text):
         if len(parts) < 2 or not parts[0] or not parts[1]:
             raise ValueError("a Hugging Face model needs both the user and the repo, "
                              "like hf.co/user/repo")
-        t = "hf.co/" + parts[0] + "/" + parts[1]          # drop /tree/main, /blob/... etc.
+        name = "hf.co/" + parts[0] + "/" + parts[1]       # drop /tree/main, /blob/... etc.
+        # A link to one .gguf file names its quantization: keep it, or Ollama would
+        # download its default quantization instead of the file that was picked.
+        m = re.search(r"[-.]((?:I?Q\d\w*|F16|BF16|F32))\.gguf$", parts[-1], re.I) \
+            if len(parts) > 2 and ":" not in parts[1] else None
+        t = name + (":" + m.group(1) if m else "")
+    else:
+        t = re.sub(r"/tags/?$", "", t.rstrip("/"))         # an ollama.com model's tags page
     t = t.rstrip("/")
     if len(t) > 200 or not MODEL_NAME_RE.fullmatch(t):
         raise ValueError("that doesn't look like an Ollama or Hugging Face model name")
@@ -1361,6 +1384,8 @@ class StatusServer:
                 elif path == "/":
                     self._send(200, render_status_page(snap), "text/html; charset=utf-8")
                 elif path == "/api/models":
+                    if not owner.host_allowed(self.headers.get("Host", "")):
+                        return self._send(421, {"error": "unexpected host name"})
                     self._send(200, owner.watcher.api_models())
                 else:
                     self._send(404, {"error": "not found"})
@@ -1371,6 +1396,10 @@ class StatusServer:
                 path = self.path.split("?", 1)[0]
                 if not path.startswith("/api/"):
                     return self._send(404, {"error": "not found"})
+                # A website can make a browser send requests to this page under a name the
+                # website controls (DNS rebinding); real visitors use the PC's name or IP.
+                if not owner.host_allowed(self.headers.get("Host", "")):
+                    return self._send(421, {"error": "unexpected host name"})
                 # JSON only: a plain HTML form on another site can't send this content type
                 # (or the password header) without the browser asking first, and we don't
                 # answer that question.
@@ -1388,15 +1417,16 @@ class StatusServer:
                         raise ValueError
                 except ValueError:
                     return self._send(400, {"error": "bad JSON"})
-                code, reply = owner.watcher.api(path[len("/api/"):], data,
-                                                self.headers.get("X-GPU-Yield-Password", ""))
+                # The page percent-encodes the password so any characters survive HTTP headers.
+                password = urllib.parse.unquote(self.headers.get("X-GPU-Yield-Password", ""))
+                code, reply = owner.watcher.api(path[len("/api/"):], data, password)
                 self._send(code, reply)
 
             def do_OPTIONS(self):
                 self._send(405, {"error": "cross-site requests aren't allowed"})
 
         try:
-            server = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
+            server = PageServer(("0.0.0.0", self.port), Handler)
         except OSError as e:
             log(f"status page could not use port {self.port}: {e}")
             return False
@@ -1410,6 +1440,48 @@ class StatusServer:
             self.server.shutdown()
             self.server.server_close()
             self.server = None
+
+    @staticmethod
+    def host_allowed(host_header):
+        """The PC's own name (with or without a domain), an IP address, or localhost."""
+        host = host_header.strip().lower()
+        host = host[1:].split("]", 1)[0] if host.startswith("[") else host.rsplit(":", 1)[0] \
+            if host.count(":") == 1 else host
+        if not host:
+            return False
+        try:
+            ipaddress.ip_address(host)
+            return True
+        except ValueError:
+            pass
+        me = socket.gethostname().lower().split(".", 1)[0]
+        return host in ("localhost", me) or host.split(".", 1)[0] == me
+
+
+class PageServer(ThreadingHTTPServer):
+    """At most MAX_CLIENTS connections at a time, so a flood can't exhaust the PC."""
+    request_queue_size = 64
+    MAX_CLIENTS = 32
+
+    def __init__(self, *args, **kw):
+        self.slots = threading.BoundedSemaphore(self.MAX_CLIENTS)
+        super().__init__(*args, **kw)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
 
 def render_status_page(snapshot):
@@ -1450,6 +1522,9 @@ class Watcher:
         self.in_use = False
         self.actions = queue.Queue()     # changes requested from the page, applied by run()
         self.downloads = {}              # model name -> progress of a download
+        self.dl_lock = threading.Lock()
+        self.auth_lock = threading.Lock()
+        self.failures = collections.deque()   # times of recent wrong passwords
         self.models_cache = {"models": [], "at": 0.0}
         self.wine_since = None
         self.last_used = None
@@ -1654,14 +1729,28 @@ class Watcher:
 
     # --- controls from the status page. Handlers run on the page's threads; anything
     # that changes the config or Ollama is queued and applied by the main loop.
+    MAX_FAILURES = 10           # wrong passwords allowed per FAILURE_WINDOW, from anyone
+    FAILURE_WINDOW = 60
+
     def api(self, action, data, password):
         secret = self.cfg["control_password"]
         if not secret:
             return 403, {"error": "Controls are off. Turn them on with: "
                                   "gpu-yield config control_password YOUR-PASSWORD"}
-        if not hmac.compare_digest(str(password).encode(), secret.encode()):
-            time.sleep(1)                 # slows down guessing
-            return 403, {"error": "Wrong password"}
+        # One shared limit for all connections: per-request delays don't stop guessing
+        # when many connections guess at once.
+        with self.auth_lock:
+            now = time.monotonic()
+            while self.failures and now - self.failures[0] > self.FAILURE_WINDOW:
+                self.failures.popleft()
+            if len(self.failures) >= self.MAX_FAILURES:
+                wait = int(self.FAILURE_WINDOW - (now - self.failures[0])) + 1
+                return 429, {"error": f"Too many wrong passwords. Try again in {wait} s."}
+            if not hmac.compare_digest(str(password).encode(), secret.encode()):
+                self.failures.append(now)
+                if len(self.failures) == self.MAX_FAILURES:
+                    log("status page: too many wrong control passwords; locked for a minute")
+                return 403, {"error": "Wrong password"}
         handler = getattr(self, "_api_" + action.replace("-", "_"), None) \
             if re.fullmatch(r"[a-z_-]+", action) else None
         if handler is None:
@@ -1670,6 +1759,9 @@ class Watcher:
             return handler(data)
         except ValueError as e:
             return 400, {"error": str(e)}
+        except Exception as e:      # a bad request must get an answer, not a dropped connection
+            log(f"status page: {action} failed: {e!r}")
+            return 500, {"error": f"{action} failed: {e}"}
 
     def _api_auth(self, data):
         return 200, {"message": "Unlocked"}
@@ -1684,8 +1776,12 @@ class Watcher:
 
     def _api_model(self, data):
         name = normalize_model_name(data.get("name"))
-        installed = [m["name"] for m in self.api_models()["models"]]
-        if installed and not any(same_model(name, m) for m in installed):
+        listing = self.api_models()
+        installed = [m["name"] for m in listing["models"]]
+        if not installed and not listing["available"]:
+            return 409, {"error": "Can't check which models are downloaded while the AI is off. "
+                                  "Try again when it's running."}
+        if not any(same_model(name, m) for m in installed):
             raise ValueError(f"{name} isn't downloaded yet; download it first")
         name = next((m for m in installed if same_model(name, m)), name)
         self.actions.put(("model", name))
@@ -1693,10 +1789,10 @@ class Watcher:
         return 202, {"message": f"Switching to {name}. Set your AI apps to use {name} too.{when}"}
 
     def _api_context(self, data):
-        try:
-            n = int(data.get("context_length"))
-        except (TypeError, ValueError):
-            raise ValueError("context_length must be a number") from None
+        n = data.get("context_length")
+        if isinstance(n, bool) or not isinstance(n, (int, float)) or n != n or n in (float("inf"), float("-inf")):
+            raise ValueError("context_length must be a number")
+        n = int(n)
         if not 2048 <= n <= 1_048_576:
             raise ValueError("context_length must be between 2048 and 1048576")
         self.actions.put(("context", n))
@@ -1708,17 +1804,21 @@ class Watcher:
         if self.state != "ai" or not self.ollama.ready():
             return 409, {"error": "Downloads need the AI running. Try again when no game is "
                                   "running and the AI isn't paused."}
-        job = self.downloads.get(name)
-        if job and job["state"] == "running":
-            return 409, {"error": f"{name} is already downloading"}
-        self.downloads[name] = {"name": name, "state": "running", "status": "starting",
-                                "completed": 0, "total": 0, "error": "", "use": bool(data.get("use")),
-                                "cancel": False, "finished": None}
+        with self.dl_lock:
+            job = self.downloads.get(name)
+            if job and job["state"] == "running":
+                return 409, {"error": f"{name} is already downloading"}
+            if sum(j["state"] == "running" for j in self.downloads.values()) >= 3:
+                return 409, {"error": "Three downloads are already running; wait for one to finish"}
+            self.downloads[name] = {"name": name, "state": "running", "status": "starting",
+                                    "completed": 0, "total": 0, "error": "",
+                                    "use": bool(data.get("use")), "cancel": False, "finished": None}
         threading.Thread(target=self._pull, args=(name,), name="download", daemon=True).start()
         return 202, {"message": f"Downloading {name}"}
 
     def _api_cancel(self, data):
-        job = self.downloads.get(normalize_model_name(data.get("name")))
+        with self.dl_lock:
+            job = self.downloads.get(normalize_model_name(data.get("name")))
         if not job or job["state"] != "running":
             return 404, {"error": "no such download in progress"}
         job["cancel"] = True
@@ -1735,6 +1835,8 @@ class Watcher:
             self.ollama.request("/api/delete", {"model": name}, method="DELETE", timeout=30)
         except urllib.error.HTTPError as e:
             return 400, {"error": http_error_detail(e)}
+        except OSError:
+            return 409, {"error": "Ollama didn't answer (did a game just start?). Try again later."}
         self.models_cache["at"] = 0
         log(f"deleted {name} (from the status page)")
         return 200, {"message": f"Deleted {name}"}
@@ -1764,11 +1866,12 @@ class Watcher:
 
     def download_list(self):
         now = time.monotonic()
-        for name, job in list(self.downloads.items()):      # forget finished ones after 10 min
-            if job["finished"] and now - job["finished"] > 600:
-                self.downloads.pop(name, None)
-        return [{k: v for k, v in job.items() if k not in ("cancel", "finished")}
-                for job in self.downloads.values()]
+        with self.dl_lock:
+            for name, job in list(self.downloads.items()):    # forget finished ones after 10 min
+                if job["finished"] and now - job["finished"] > 600:
+                    self.downloads.pop(name, None)
+            return [{k: v for k, v in job.items() if k not in ("cancel", "finished")}
+                    for job in self.downloads.values()]
 
     def _pull(self, name):
         job = self.downloads[name]
@@ -1811,36 +1914,39 @@ class Watcher:
             job["finished"] = time.monotonic()
 
     def process_actions(self):
+        """Apply what the page asked for, at most one change per pass of the main loop:
+        several clicks collapse into their latest values, so the loop gets back to
+        checking for games quickly."""
+        latest = {}
         while True:
             try:
                 kind, value = self.actions.get_nowait()
             except queue.Empty:
-                return
+                break
+            latest[{"model": "model", "context": "context_length"}[kind]] = value
+        if latest:
             try:
-                if kind == "model":
-                    self.apply_settings({"model": value}, f"model switched to {value}")
-                elif kind == "context":
-                    self.apply_settings({"context_length": value}, f"context set to {value}")
+                self.apply_settings(latest)
             except Exception as e:
-                log(f"couldn't apply {kind} = {value}: {e!r}")
+                log(f"couldn't apply {latest} from the status page: {e!r}")
 
-    def apply_settings(self, values, why):
+    def apply_settings(self, values):
+        """Change only these settings, keeping everything else as the watcher runs it.
+        (Reloading the whole file would also pick up hand edits not yet applied.)"""
+        new = dict(self.cfg, **values)
+        problem = config_problem(new)
+        if problem:
+            log(f"status page: not applied: {problem}")
+            return
         if CONFIG_FILE.exists():
             set_config_values(values)
-        try:
-            cfg = load_config()
-        except SystemExit:
-            log(f"{why}: the config file has a problem; not applied")
-            return
-        if not CONFIG_FILE.exists():
-            cfg.update(values)
-        self.cfg = self.ollama.cfg = cfg
+        self.cfg = self.ollama.cfg = new
         self.notice = ""
         self.warned.clear()
-        ensure_ollama_unit(cfg)
-        log(why + " (from the status page)")
-        if self.state != "ai":
-            return                       # used when the AI comes back on
+        ensure_ollama_unit(new)
+        log(", ".join(f"{k} set to {v}" for k, v in values.items()) + " (from the status page)")
+        if self.state != "ai" or game_running(new):
+            return                       # applied when the AI next comes on
         if "context_length" in values:
             self.ollama.stop()           # the context default lives in Ollama's service
             self.go_on("restarting Ollama with the new context")
@@ -1999,7 +2105,10 @@ class Watcher:
                 if msg != self.last_error[0] or mono - self.last_error[1] > 300:
                     log(msg)    # same error every 2 s would flood the journal
                     self.last_error = (msg, mono)
-            self.write_status(mono)
+            try:
+                self.write_status(mono)
+            except Exception as e:
+                log(f"couldn't write status: {e!r}")
             self.stop_evt.wait(poll)
         self.standin.stop()
         if page:
@@ -2258,6 +2367,14 @@ def cmd_wake(args):
         "gpu-yield wol, and that it's enabled in the BIOS/UEFI.")
 
 
+def nm_connection(dev):
+    """NetworkManager connection UUID for a device ("" if unknown). UUIDs, unlike names,
+    need no escaping."""
+    if not shutil.which("nmcli"):
+        return ""
+    return run(["nmcli", "-g", "GENERAL.CON-UUID", "device", "show", dev]).stdout.strip()
+
+
 def wifi_phy(dev):
     return _read_text(Path(f"/sys/class/net/{dev}/phy80211/name")).strip() or None
 
@@ -2300,8 +2417,7 @@ def enable_wol(args):
     if not ask(f"Turn on Wake-on-LAN for {dev}, so your other computers can wake this PC? "
                "Needs sudo.", args):
         return
-    conn = run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", dev]).stdout.strip() \
-        if shutil.which("nmcli") else ""
+    conn = nm_connection(dev)
     saved = bool(conn) and sudo(["nmcli", "connection", "modify", conn,
                                  "802-3-ethernet.wake-on-lan", "magic"])
     now = shutil.which("ethtool") and sudo(["ethtool", "-s", dev, "wol", "g"])
@@ -2331,8 +2447,7 @@ def enable_wowlan(dev, mac, args):
     if not ask(f"{dev} is Wi-Fi, and its card supports Wake on Wireless LAN. Turn it on, so "
                "your other computers can wake this PC from sleep? Needs sudo.", args):
         return
-    conn = run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", dev]).stdout.strip() \
-        if shutil.which("nmcli") else ""
+    conn = nm_connection(dev)
     saved = bool(conn) and sudo(["nmcli", "connection", "modify", conn,
                                  "802-11-wireless.wake-on-wlan", "magic"])
     now = sudo(["iw", "phy", wifi_phy(dev), "wowlan", "enable", "magic-packet"])
@@ -2756,6 +2871,8 @@ def cmd_config(args):
         die(f"use: gpu-yield model {args.value}   (it downloads the model as well)")
     if key == "ollama_env" or (key not in DEFAULTS and not key.startswith("env.")):
         die(f"unknown setting {key!r}; run gpu-yield config to list them")
+    if key == "control_password" and args.value and len(args.value) < 8:
+        die("use at least 8 characters for the control password; nothing changed")
     before = CONFIG_FILE.read_text()
     if key.startswith("env."):
         set_env_value(key[4:], args.value)

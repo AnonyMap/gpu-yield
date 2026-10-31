@@ -3,7 +3,7 @@
 `gpu-yield update` shows the entries between your version and the new one.
 
 ## 1.7.0 (2026-10-31)
-- The status page has controls: switch models, change the context length, download models by Ollama name or Hugging Face repo (or either site's URL) with live progress and cancel, delete models, and pause or resume the AI. Turn them on with `gpu-yield config control_password YOUR-PASSWORD`; without a password the page stays read-only.
+- The status page has controls: switch models, change the context length, download models by Ollama name or Hugging Face repo (or either site's URL) with live progress and cancel, delete models, and pause or resume the AI. Turn them on with `gpu-yield config control_password YOUR-PASSWORD` (at least 8 characters); without a password the page stays read-only. Ten wrong passwords in a minute lock the controls for the rest of that minute, and requests addressed to a name other than the PC's are refused.
 - Wake on Wireless LAN: on Wi-Fi, `gpu-yield wol` checks whether the card can wake the PC and turns it on if so. `wake` also sends the wake-up signal directly to the PC's address, which some Wi-Fi routers need.
 - The status page updates live instead of reloading every 5 seconds.
 

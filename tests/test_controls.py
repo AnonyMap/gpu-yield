@@ -125,12 +125,59 @@ ok("without a control password, every control is refused and the page says how t
 
 gy.set_config_values({"control_password": "hunter2"})   # as `gpu-yield config` would
 w.cfg["control_password"] = "hunter2"                    # (that restarts the watcher; here we skip it)
-t0 = time.time()
 code, body, _ = call("POST", "/api/auth", {}, "wrong")
-assert code == 403 and body["error"] == "Wrong password" and time.time() - t0 >= 0.9
+assert code == 403 and body["error"] == "Wrong password"
 assert call("POST", "/api/auth", {}, "hunter2")[0] == 200
 assert call("POST", "/api/pause", {"paused": True})[0] == 403, "no password header"
-ok("wrong passwords are refused (slowly); the right one unlocks")
+ok("wrong passwords are refused; the right one unlocks")
+
+# Guessing: one shared limit, however many connections guess at once
+from concurrent.futures import ThreadPoolExecutor
+w.failures.clear()
+with ThreadPoolExecutor(20) as pool:
+    codes = list(pool.map(lambda i: call("POST", "/api/auth", {}, f"guess{i}")[0], range(40)))
+assert codes.count(403) == w.MAX_FAILURES and codes.count(429) == 40 - w.MAX_FAILURES, codes
+code, body, _ = call("POST", "/api/auth", {}, "hunter2")
+assert code == 429 and "Try again in" in body["error"], "even the right password waits out a lockout"
+w.failures.clear()
+assert call("POST", "/api/auth", {}, "hunter2")[0] == 200
+ok("password guessing: 10 wrong tries a minute in total, then everyone waits")
+
+# DNS rebinding: requests under a foreign host name are refused
+def call_host(path, host, body=None):
+    c = http.client.HTTPConnection("127.0.0.1", PAGE_PORT, timeout=10)
+    c.putrequest("POST" if body is not None else "GET", path, skip_host=True)
+    c.putheader("Host", host)
+    if body is not None:
+        data = json.dumps(body).encode()
+        c.putheader("Content-Type", "application/json"); c.putheader("Content-Length", str(len(data)))
+        c.putheader("X-GPU-Yield-Password", "hunter2"); c.endheaders(data)
+    else:
+        c.endheaders()
+    r = c.getresponse(); r.read(); c.close()
+    return r.status
+me = gy.socket.gethostname().split(".")[0]
+assert call_host("/api/auth", "evil.example:11435", {}) == 421
+assert call_host("/api/models", "evil.example") == 421
+assert call_host("/api/auth", f"{me}.home:{PAGE_PORT}", {}) == 200
+assert call_host("/api/auth", f"{me.upper()}", {}) == 200
+assert call_host("/api/auth", "192.168.1.23", {}) == 200 and call_host("/api/auth", "[fd00::5]:11435", {}) == 200
+assert call_host("/status", "evil.example") == 200, "the read-only status stays public"
+ok("requests under a host name that isn't this PC's are refused (DNS rebinding)")
+
+# Any password characters work (the page percent-encodes them)
+import urllib.parse
+gy.set_config_values({"control_password": "пароль-ключ"}); w.cfg["control_password"] = "пароль-ключ"
+assert call("POST", "/api/auth", {}, urllib.parse.quote("пароль-ключ"))[0] == 200
+gy.set_config_values({"control_password": "hunter2"}); w.cfg["control_password"] = "hunter2"
+ok("passwords with non-English characters work")
+
+# Bad input gets an answer, never a dropped connection
+for bad in ({"context_length": float("inf")}, {"context_length": "big"}, {"context_length": True}):
+    assert call("POST", "/api/context", json.dumps(bad).replace("Infinity", "1e999"), "hunter2")[0] == 400, bad
+assert call("POST", "/api/model", {"name": 5}, "hunter2")[0] == 400
+assert call("POST", "/api/pull", {"name": ["x"]}, "hunter2")[0] == 400
+ok("malformed requests get a clear 400")
 
 assert call("POST", "/api/auth", "{}", "hunter2", ctype="text/plain")[0] == 415
 assert call("OPTIONS", "/api/auth")[0] == 405
@@ -221,7 +268,35 @@ for bad in ("", "rm -rf /", "hf.co/onlyuser", "a" * 250, "../../etc", "model;ls"
         gy.normalize_model_name(bad); raise AssertionError(bad)
     except ValueError:
         pass
-ok("model names: Ollama names and URLs, Hugging Face repos and URLs; junk refused")
+assert gy.normalize_model_name("https://huggingface.co/u/r-GGUF/resolve/main/r-Q8_0.gguf") == "hf.co/u/r-GGUF:Q8_0"
+assert gy.normalize_model_name("hf.co/u/r/blob/main/r.IQ4_XS.gguf?download=true") == "hf.co/u/r:IQ4_XS"
+assert gy.normalize_model_name("https://ollama.com/library/qwen3/tags") == "qwen3"
+ok("model names: Ollama names and URLs, Hugging Face repos, URLs and single-file links; junk refused")
+
+# Several changes from the page collapse into one; a game at that moment skips the restart
+applied = []
+real_apply = w.apply_settings
+w.apply_settings = lambda values: applied.append(values)
+for n in (8192, 16384, 32768, 65536, 131072):
+    w.actions.put(("context", n))
+w.actions.put(("model", "qwen3.5:9b"))
+w.process_actions()
+assert applied == [{"context_length": 131072, "model": "qwen3.5:9b"}], applied
+w.apply_settings = real_apply
+starts = ollama.get("starts", 0)
+real_scan = gy.scan_games
+gy.scan_games = lambda cfg: {1: "Some Game (AppId 1)"}
+w.apply_settings({"context_length": 16384})
+gy.scan_games = real_scan
+assert ollama.get("starts", 0) == starts and gy.load_config()["context_length"] == 16384
+ok("page changes collapse into one restart, and none happens while a game is starting")
+
+# Only the changed setting is applied, not unapplied hand edits elsewhere in the file
+gy.set_config_values({"cooldown_seconds": 999})                      # a hand edit, not applied yet
+w.apply_settings({"context_length": 32768})
+assert w.cfg["cooldown_seconds"] != 999 and w.cfg["context_length"] == 32768
+gy.set_config_values({"cooldown_seconds": 45})
+ok("a change from the page doesn't pick up unapplied hand edits")
 
 # --- the page can't be broken out of by data
 page = gy.render_status_page({"host": "<b>pc</b>", "notice": "</script><script>alert(1)</script>"})
