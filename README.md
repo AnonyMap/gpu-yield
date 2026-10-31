@@ -46,8 +46,16 @@ ssh you@livingroom-pc gpu-yield update
 |---|---|
 | `gpu-yield update --check` | Shows the installed and latest versions of gpu-yield and Ollama |
 | `gpu-yield update` | Downloads the latest gpu-yield from this repo and installs it |
+| `gpu-yield update --file PATH` | Installs a local copy instead of the GitHub version (one downloaded from a chat, or your own edit). Older or same-numbered files are allowed, with a note |
 | `gpu-yield update --ollama` | Also updates Ollama, if a newer release is out |
 | `gpu-yield rollback` | Returns to the version before the last update; run it again to redo |
+
+To push a file from your desktop without going through GitHub:
+
+```bash
+scp gpu-yield you@livingroom-pc:~/gpu-yield-new
+ssh you@livingroom-pc gpu-yield update --file ~/gpu-yield-new
+```
 
 Before replacing anything, an update runs the new file's own self-test, and a version that fails it is refused, leaving the working one in place. After swapping in, the new version rewrites its service files and restarts the watcher, so the model reloads once. Updates come from the `main` branch of `AnonyMap/gpu-yield`; to use a fork, set `update_repo` in the config.
 

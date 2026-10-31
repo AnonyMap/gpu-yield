@@ -16,7 +16,8 @@ Commands:
   gpu-yield pause       keep the AI off until `resume` (survives reboots)
   gpu-yield resume
   gpu-yield doctor      check the whole setup
-  gpu-yield update      update from GitHub (--check to look, --ollama to update Ollama too)
+  gpu-yield update      update from GitHub (--check to look, --ollama to update Ollama too,
+                        --file PATH to install a local copy instead)
   gpu-yield rollback    go back to the version before the last update
   gpu-yield uninstall   remove services (add --purge to remove Ollama and config)
   gpu-yield run         the watcher itself; systemd runs this
@@ -48,7 +49,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -1167,9 +1168,31 @@ def ollama_versions(cfg):
     return installed, latest
 
 
+def update_from_file(path):
+    src = Path(path).expanduser()
+    if not src.is_file():
+        die(f"no such file: {src}")
+    if BIN_PATH.exists() and src.resolve() == BIN_PATH.resolve():
+        die(f"{src} is the installed copy; point --file at the new version instead")
+    source = src.read_bytes()
+    version = declared_version(source)
+    if not version:
+        die(f"{src} doesn't look like gpu-yield (no VERSION line); nothing changed")
+    if parse_version(version) < parse_version(VERSION):
+        log(f"note: {src} is version {version}, older than the installed {VERSION} (installing it anyway)")
+    elif parse_version(version) == parse_version(VERSION):
+        log(f"note: {src} has the same version number as the installed copy ({VERSION})")
+    log(f"installing gpu-yield {version} from {src}")
+    install_script(source, str(src))
+    log(f"gpu-yield is now {version}. Undo with: gpu-yield rollback")
+
+
 def cmd_update(args):
     if os.geteuid() == 0:
         die("run as your normal user, not with sudo")
+    if args.file:
+        update_from_file(args.file)
+        return
     cfg = load_config()
     repo, source = fetch_latest(cfg)
     latest = declared_version(source)
@@ -1248,6 +1271,7 @@ def main():
                            ("doctor", cmd_doctor, "check the setup")):
         sub.add_parser(name, help=text).set_defaults(func=fn)
     up = sub.add_parser("update", help="update gpu-yield from GitHub (and optionally Ollama)")
+    up.add_argument("--file", metavar="PATH", help="install from a local file instead of GitHub")
     up.add_argument("--check", action="store_true", help="only report what's available")
     up.add_argument("--ollama", action="store_true", help="also update Ollama")
     up.add_argument("--force", action="store_true", help="reinstall even if up to date")
