@@ -1,0 +1,248 @@
+"""1.7: controls on the status page (password, model switch, context, downloads, delete,
+pause), Hugging Face/Ollama name handling, and Wake on Wireless LAN detection."""
+import http.client
+import json
+import threading
+import time
+import types
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from _util import free_port, load, ok, wait
+
+gy = load()
+OLLAMA_PORT, PAGE_PORT = free_port(), free_port()
+ollama = {"models": [{"name": "gpt-oss:20b", "size": 13_000_000_000},
+                     {"name": "qwen3.5:9b", "size": 6_600_000_000}],
+          "loaded": [], "generated": [], "deleted": [], "pull_delay": 0.05}
+
+
+class FakeOllama(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *a):
+        pass
+
+    def _json(self, body, code=200):
+        d = json.dumps(body).encode()
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(d)))
+        self.end_headers()
+        self.wfile.write(d)
+
+    def _body(self):
+        return json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
+
+    def do_GET(self):
+        if self.path == "/api/version":
+            return self._json({"version": "fake"})
+        if self.path == "/api/tags":
+            return self._json({"models": ollama["models"]})
+        if self.path == "/api/ps":
+            return self._json({"models": ollama["loaded"]})
+        self._json({"error": "nope"}, 404)
+
+    def do_DELETE(self):
+        name = self._body()["model"]
+        ollama["deleted"].append(name)
+        ollama["models"] = [m for m in ollama["models"] if m["name"] != name]
+        self._json({})
+
+    def do_POST(self):
+        req = self._body()
+        if self.path == "/api/generate":
+            ollama["generated"].append((req["model"], req["options"]["num_ctx"]))
+            ollama["loaded"] = [{"name": req["model"], "size": 1, "size_vram": 1,
+                                 "context_length": req["options"]["num_ctx"]}]
+            return self._json({"done": True})
+        if self.path == "/api/pull":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            def chunk(obj):
+                d = (json.dumps(obj) + "\n").encode()
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(d), d))
+                self.wfile.flush()
+            try:
+                chunk({"status": "pulling manifest"})
+                for done in range(0, 101, 10):
+                    time.sleep(ollama["pull_delay"])
+                    chunk({"status": "pulling abc", "digest": "sha256:abc",
+                           "total": 1000, "completed": done * 10})
+                chunk({"status": "success"})
+                self.wfile.write(b"0\r\n\r\n")
+                ollama["models"].append({"name": req["model"], "size": 1000})
+            except (BrokenPipeError, ConnectionResetError):
+                pass                       # the client cancelled
+            return
+        self._json({"error": "nope"}, 404)
+
+
+srv = ThreadingHTTPServer(("127.0.0.1", OLLAMA_PORT), FakeOllama)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+
+class AlwaysUp(gy.Ollama):
+    def active(self): return True
+    def start(self): ollama.setdefault("starts", 0); ollama["starts"] += 1; return True
+    def stop(self): ollama.setdefault("stops", 0); ollama["stops"] += 1; return True
+
+
+gy.Ollama = AlwaysUp
+gy.ensure_ollama_unit = lambda cfg: False
+gy.CONFIG_DIR.mkdir(parents=True)
+gy.CONFIG_FILE.write_text(gy.CONFIG_TEMPLATE)
+gy.set_config_values({"model": "gpt-oss:20b", "port": OLLAMA_PORT, "status_port": PAGE_PORT,
+                      "poll_seconds": 0.5})
+w = gy.Watcher(gy.load_config())
+w.standin.start = lambda: True     # the fake Ollama keeps the port; test_watcher covers the stand-in
+w.standin.stop = lambda: None
+threading.Thread(target=w.run, daemon=True).start()
+wait(lambda: w.state == "ai" and w.warm_status.startswith("ready"), msg="initial load")
+
+
+def call(method, path, body=None, password=None, ctype="application/json"):
+    c = http.client.HTTPConnection("127.0.0.1", PAGE_PORT, timeout=10)
+    headers = {"Content-Type": ctype} if body is not None else {}
+    if password is not None:
+        headers["X-GPU-Yield-Password"] = password
+    c.request(method, path, body=json.dumps(body) if isinstance(body, dict) else body, headers=headers)
+    r = c.getresponse()
+    data = r.read()
+    c.close()
+    try:
+        data = json.loads(data)
+    except ValueError:
+        data = data.decode()
+    return r.status, data, dict(r.getheaders())
+
+
+# --- locked by default
+code, body, _ = call("POST", "/api/auth", {}, "anything")
+assert code == 403 and "control_password" in body["error"], body
+assert call("GET", "/status")[1]["controls"] is False
+ok("without a control password, every control is refused and the page says how to turn them on")
+
+gy.set_config_values({"control_password": "hunter2"})   # as `gpu-yield config` would
+w.cfg["control_password"] = "hunter2"                    # (that restarts the watcher; here we skip it)
+t0 = time.time()
+code, body, _ = call("POST", "/api/auth", {}, "wrong")
+assert code == 403 and body["error"] == "Wrong password" and time.time() - t0 >= 0.9
+assert call("POST", "/api/auth", {}, "hunter2")[0] == 200
+assert call("POST", "/api/pause", {"paused": True})[0] == 403, "no password header"
+ok("wrong passwords are refused (slowly); the right one unlocks")
+
+assert call("POST", "/api/auth", "{}", "hunter2", ctype="text/plain")[0] == 415
+assert call("OPTIONS", "/api/auth")[0] == 405
+_, _, h = call("GET", "/status")
+assert h.get("Access-Control-Allow-Origin") == "*"
+_, _, h = call("POST", "/api/auth", {}, "hunter2")
+assert "Access-Control-Allow-Origin" not in h
+assert call("POST", "/api/auth", "x" * 20000, "hunter2")[0] == 413
+assert call("POST", "/api/nope", {}, "hunter2")[0] == 404
+ok("cross-site protection: JSON only, no CORS on controls, size limit, unknown actions")
+
+code, body, _ = call("GET", "/api/models")
+assert [m["name"] for m in body["models"]] == ["gpt-oss:20b", "qwen3.5:9b"] and body["available"]
+code, page, _ = call("GET", "/")
+assert code == 200 and '"controls": true' in page and "gpt-oss:20b" in page
+ok("models list and page served")
+
+# --- pause / resume
+assert call("POST", "/api/pause", {"paused": True}, "hunter2")[0] == 200
+wait(lambda: w.state == "paused", msg="paused")
+assert w.snapshot()["paused"] is True
+assert call("POST", "/api/pause", {"paused": False}, "hunter2")[0] == 200
+wait(lambda: w.state == "ai" and w.warm_status.startswith("ready"), msg="resumed")
+ok("pause and resume from the page")
+
+# --- switch model
+code, body, _ = call("POST", "/api/model", {"name": "llama-not-here:1b"}, "hunter2")
+assert code == 400 and "isn't downloaded" in body["error"]
+code, body, _ = call("POST", "/api/model", {"name": "qwen3.5:9b"}, "hunter2")
+assert code == 202, body
+wait(lambda: ollama["generated"][-1][0] == "qwen3.5:9b" and w.warm_status.startswith("ready"), msg="switch")
+assert gy.load_config()["model"] == "qwen3.5:9b"
+ok("switching model saves it to the config and loads it, without restarting Ollama")
+
+# --- context
+stops = ollama.get("stops", 0)
+assert call("POST", "/api/context", {"context_length": 99}, "hunter2")[0] == 400
+assert call("POST", "/api/context", {"context_length": 32768}, "hunter2")[0] == 202
+wait(lambda: ollama["generated"][-1] == ("qwen3.5:9b", 32768) and w.warm_status.startswith("ready"), msg="ctx")
+assert gy.load_config()["context_length"] == 32768 and ollama["stops"] > stops
+ok("changing context saves it, restarts Ollama with it, and reloads the model")
+
+# --- download with progress, then use it
+code, body, _ = call("POST", "/api/pull", {"name": "https://huggingface.co/bartowski/Tiny-GGUF/tree/main",
+                                           "use": True}, "hunter2")
+assert code == 202, body
+seen = []
+wait(lambda: seen.append(json.loads(json.dumps(w.snapshot()["downloads"]))) or
+     any(d["state"] == "done" for d in seen[-1]), msg="download done")
+assert any(d and d[0]["state"] == "running" and 0 < d[0]["completed"] < d[0]["total"] for d in seen), \
+    "progress was never visible"
+assert seen[-1][0]["name"] == "hf.co/bartowski/Tiny-GGUF"
+wait(lambda: gy.load_config()["model"] == "hf.co/bartowski/Tiny-GGUF", msg="switched to download")
+ok("download from a pasted Hugging Face URL shows progress, then switches to it")
+
+ollama["pull_delay"] = 0.5
+assert call("POST", "/api/pull", {"name": "qwen3.5:4b"}, "hunter2")[0] == 202
+assert call("POST", "/api/pull", {"name": "qwen3.5:4b"}, "hunter2")[0] == 409
+time.sleep(0.8)
+assert call("POST", "/api/cancel", {"name": "qwen3.5:4b"}, "hunter2")[0] == 200
+wait(lambda: w.downloads["qwen3.5:4b"]["state"] == "cancelled", timeout=10, msg="cancel")
+assert not any(m["name"] == "qwen3.5:4b" for m in ollama["models"])
+ok("a download can be cancelled; starting the same one twice is refused")
+
+# --- delete
+code, body, _ = call("POST", "/api/delete", {"name": "hf.co/bartowski/Tiny-GGUF"}, "hunter2")
+assert code == 409 and "in use" in body["error"]
+assert call("POST", "/api/delete", {"name": "gpt-oss:20b"}, "hunter2")[0] == 200
+assert ollama["deleted"] == ["gpt-oss:20b"]
+ok("delete removes a model, but never the one in use")
+
+# --- downloads need Ollama running
+w.state = "gaming"
+code, body, _ = call("POST", "/api/pull", {"name": "qwen3.5:2b"}, "hunter2")
+assert code == 409 and "game" in body["error"]
+w.state = "ai"
+ok("downloads are refused while a game is running, with a reason")
+
+# --- names
+for given, want in (("qwen3.5:9b", "qwen3.5:9b"), ("https://ollama.com/library/qwen3.5:9b", "qwen3.5:9b"),
+                    ("ollama.com/someuser/model", "someuser/model"),
+                    ("hf.co/bartowski/X-GGUF:Q4_K_M", "hf.co/bartowski/X-GGUF:Q4_K_M"),
+                    ("https://huggingface.co/bartowski/X-GGUF", "hf.co/bartowski/X-GGUF"),
+                    ("huggingface.co/bartowski/X-GGUF/blob/main/x.gguf", "hf.co/bartowski/X-GGUF")):
+    assert gy.normalize_model_name(given) == want, (given, gy.normalize_model_name(given))
+for bad in ("", "rm -rf /", "hf.co/onlyuser", "a" * 250, "../../etc", "model;ls"):
+    try:
+        gy.normalize_model_name(bad); raise AssertionError(bad)
+    except ValueError:
+        pass
+ok("model names: Ollama names and URLs, Hugging Face repos and URLs; junk refused")
+
+# --- the page can't be broken out of by data
+page = gy.render_status_page({"host": "<b>pc</b>", "notice": "</script><script>alert(1)</script>"})
+assert "</script><script>alert(1)" not in page and "<title>gpu-yield on &lt;b&gt;pc&lt;/b&gt;</title>" in page
+ok("status data can't inject markup into the page")
+w.stop_evt.set()
+
+# --- Wake on Wireless LAN detection
+iw_info = "Wiphy phy0\n\tWoWLAN support:\n\t\t * wake up on disconnect\n\t\t * wake up on magic packet\n\tSupported commands:\n"
+outputs = {("iw", "phy", "phy0", "info"): iw_info, ("iw", "phy", "phy0", "wowlan", "show"): "WoWLAN is disabled.\n"}
+gy.run = lambda cmd, **kw: types.SimpleNamespace(returncode=0, stdout=outputs.get(tuple(cmd), ""), stderr="")
+gy.wifi_phy = lambda dev: "phy0"
+real_which = gy.shutil.which
+gy.shutil.which = lambda name: "/usr/sbin/" + name
+assert gy.wol_state("wlp3s0", wireless=True) == ("g", "d")
+outputs[("iw", "phy", "phy0", "wowlan", "show")] = "WoWLAN is enabled:\n * wake up on magic packet\n"
+assert gy.wol_state("wlp3s0", wireless=True) == ("g", "g")
+outputs[("iw", "phy", "phy0", "info")] = "Wiphy phy0\n\tSupported commands:\n\t\t * magic packet\n"
+assert gy.wol_state("wlp3s0", wireless=True)[0] == ""
+gy.shutil.which = lambda name: None
+assert gy.wol_state("wlp3s0", wireless=True) == (None, None)
+gy.shutil.which = real_which
+ok("Wake on Wireless LAN: reads whether the Wi-Fi card can wake the PC, and whether it's on")
+print("control tests passed")

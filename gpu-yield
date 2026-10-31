@@ -27,12 +27,14 @@ Logs:  journalctl --user -u gpu-yield -u gpu-yield-ollama -f
 """
 
 import argparse
+import hmac
 import html
 import http.client
 import ipaddress
 import json
 import os
 import platform
+import queue
 import re
 import shutil
 import signal
@@ -52,7 +54,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.6.1"
+VERSION = "1.7.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -105,9 +107,11 @@ DEFAULTS = {
     "update_branch": "main",
     "github_token": "",
     "auto_update": "off",
+    "control_password": "",
     "ollama_env": {},
 }
 
+SECRET_SETTINGS = ("github_token", "control_password")
 CHOICES = {"backend": ("auto", "rocm", "vulkan"), "auto_update": ("off", "gpu-yield", "all")}
 
 GITHUB_API = os.environ.get("GPU_YIELD_GITHUB_API", "https://api.github.com")
@@ -186,6 +190,11 @@ github_token = ""
 # AI for 15 minutes. Undo a bad one with:  gpu-yield rollback  (automatic updates then
 # skip that version until a newer one is out)
 auto_update = "off"
+
+# Password that unlocks the controls on the status page (switch model, change context,
+# download and delete models, pause). Empty means the page is read-only. It travels
+# unencrypted over your local network, so don't reuse an important password.
+control_password = ""
 
 # Extra environment variables for the managed Ollama, for example:
 #   OLLAMA_KV_CACHE_TYPE = "q8_0"   # roughly halves context memory, small quality cost
@@ -839,10 +848,10 @@ class Ollama:
             return False
         return True
 
-    def request(self, path, payload=None, timeout=5.0):
+    def request(self, path, payload=None, timeout=5.0, method=None):
         data = json.dumps(payload).encode() if payload is not None else None
         headers = {"Content-Type": "application/json"} if data else {}
-        req = urllib.request.Request(self.base + path, data=data, headers=headers)
+        req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as r:
             body = r.read()
         return json.loads(body) if body else {}
@@ -1025,45 +1034,295 @@ class StandIn:
 
 # ------------------------------------------------------------------------- status page
 
-STATUS_PAGE = """<!doctype html>
+STATUS_PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="5">
-<title>gpu-yield on {host}</title>
+<title>gpu-yield on __HOST__</title>
+<noscript><meta http-equiv="refresh" content="5"></noscript>
 <style>
-:root {{ --bg:#f6f6f4; --fg:#1d1d1b; --mut:#6b6b66; --card:#fff; --line:#e3e3df;
-        --ok:#1f8a4c; --wait:#b7791f; --off:#8a8a85; }}
-@media (prefers-color-scheme: dark) {{ :root {{ --bg:#141413; --fg:#ecece8; --mut:#9a9a94;
-        --card:#1e1e1c; --line:#2e2e2b; --ok:#3fbf73; --wait:#e0a83a; --off:#77776f; }} }}
-body {{ margin:0; background:var(--bg); color:var(--fg);
-       font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }}
-main {{ max-width:560px; margin:0 auto; padding:24px 16px; }}
-h1 {{ font-size:15px; font-weight:600; color:var(--mut); margin:0 0 12px; }}
-.card {{ background:var(--card); border:1px solid var(--line); border-radius:12px; padding:18px 20px; }}
-.state {{ display:flex; align-items:center; gap:10px; font-size:21px; font-weight:600; }}
-.dot {{ width:12px; height:12px; border-radius:50%; background:var(--{tone}); flex:none; }}
-dl {{ display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:16px 0 0; }}
-dt {{ color:var(--mut); }} dd {{ margin:0; overflow-wrap:anywhere; }}
-.note {{ margin-top:14px; padding:10px 12px; border-radius:8px; border:1px solid var(--line); }}
-footer {{ color:var(--mut); font-size:13px; margin-top:12px; }}
-a {{ color:inherit; }}
+:root { --bg:#f6f6f4; --fg:#1d1d1b; --mut:#6b6b66; --card:#fff; --line:#e3e3df; --field:#fff;
+        --ok:#1f8a4c; --wait:#b7791f; --off:#8a8a85; --bad:#b3261e; --acc:#1d1d1b; --acc-fg:#fff; }
+@media (prefers-color-scheme: dark) { :root { --bg:#141413; --fg:#ecece8; --mut:#9a9a94;
+        --card:#1e1e1c; --line:#2e2e2b; --field:#161615; --ok:#3fbf73; --wait:#e0a83a;
+        --off:#77776f; --bad:#f2766b; --acc:#ecece8; --acc-fg:#141413; } }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--fg);
+       font:16px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width:600px; margin:0 auto; padding:24px 16px 40px; }
+h1 { font-size:15px; font-weight:600; color:var(--mut); margin:0 0 12px; }
+h2 { font-size:17px; margin:0 0 12px; }
+h3 { font-size:13px; font-weight:600; text-transform:uppercase; letter-spacing:.04em;
+     color:var(--mut); margin:22px 0 8px; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:12px;
+        padding:18px 20px; margin-bottom:14px; }
+.state { display:flex; align-items:center; gap:10px; font-size:21px; font-weight:600; }
+.dot { width:12px; height:12px; border-radius:50%; flex:none; background:var(--off); }
+.dot.ok { background:var(--ok); } .dot.wait { background:var(--wait); }
+dl { display:grid; grid-template-columns:max-content 1fr; gap:6px 16px; margin:16px 0 0; }
+dt { color:var(--mut); } dd { margin:0; overflow-wrap:anywhere; }
+.note { margin-top:14px; padding:10px 12px; border-radius:8px; border:1px solid var(--line); }
+.muted { color:var(--mut); font-size:14px; }
+code { font-size:13px; background:var(--bg); padding:1px 5px; border-radius:4px; overflow-wrap:anywhere; }
+button, input, select { font:inherit; color:inherit; }
+button { border:1px solid var(--line); background:var(--field); border-radius:8px;
+         padding:6px 12px; cursor:pointer; min-height:36px; white-space:nowrap; }
+button.primary { background:var(--acc); color:var(--acc-fg); border-color:var(--acc); }
+button.danger { color:var(--bad); }
+button:disabled { opacity:.45; cursor:default; }
+input[type=text], input[type=password], select { border:1px solid var(--line); background:var(--field);
+         border-radius:8px; padding:7px 10px; min-height:38px; width:100%; }
+.line { display:flex; gap:8px; align-items:center; }
+.line > input, .line > select { flex:1; min-width:0; }
+.models { list-style:none; margin:0; padding:0; }
+.models li { display:flex; gap:8px; align-items:center; padding:8px 0; border-top:1px solid var(--line); }
+.models li:first-child { border-top:0; }
+.models .name { flex:1; min-width:0; overflow-wrap:anywhere; }
+.tag { font-size:12px; border:1px solid var(--line); border-radius:999px; padding:1px 8px;
+       color:var(--mut); white-space:nowrap; }
+.tag.on { color:var(--ok); border-color:var(--ok); }
+progress { width:100%; height:8px; accent-color:var(--ok); }
+.job { padding:8px 0; border-top:1px solid var(--line); }
+label.check { display:flex; gap:8px; align-items:center; font-size:14px; margin-top:8px; }
+#msg { min-height:1.5em; margin:12px 0 0; font-size:14px; }
+#msg.err { color:var(--bad); }
+footer { color:var(--mut); font-size:13px; }
+a { color:inherit; }
+[hidden] { display:none !important; }
 </style></head><body><main>
-<h1>gpu-yield on {host}</h1>
-<div class="card">
-<div class="state"><span class="dot"></span>{headline}</div>
-<dl>{rows}</dl>{note}
-</div>
-<footer>gpu-yield {version} · refreshes every 5 s · <a href="/status">JSON</a></footer>
-</main></body></html>
+<h1 id="title">gpu-yield on __HOST__</h1>
+
+<section class="card" aria-live="polite">
+  <div class="state"><span class="dot" id="dot"></span><span id="headline">Loading…</span></div>
+  <dl id="rows"></dl>
+  <div class="note" id="notice" hidden></div>
+  <noscript><p class="muted">Turn on JavaScript for live updates and controls, or see <a href="/status">the raw status</a>.</p></noscript>
+</section>
+
+<section class="card" id="controls">
+  <h2>Controls</h2>
+  <div id="off" hidden>
+    <p class="muted">Controls are off, so this page is read-only. To change models and settings
+    from here, set a password on the PC:</p>
+    <p><code>gpu-yield config control_password YOUR-PASSWORD</code></p>
+  </div>
+  <form id="unlock" hidden>
+    <p class="muted">Enter the control password to change models and settings.</p>
+    <div class="line"><input type="password" id="pw" autocomplete="current-password" aria-label="Control password">
+    <button class="primary" type="submit">Unlock</button></div>
+  </form>
+  <div id="panel" hidden>
+    <div class="line"><button id="pause" type="button"></button>
+      <span class="muted" id="pausehint"></span></div>
+
+    <h3>Models on this PC</h3>
+    <ul class="models" id="models"></ul>
+    <p class="muted" id="disk"></p>
+
+    <h3>Context length</h3>
+    <div class="line"><select id="ctx" aria-label="Context length">
+      <option value="8192">8K</option><option value="16384">16K</option>
+      <option value="32768">32K</option><option value="65536">64K</option>
+      <option value="131072">128K</option></select>
+      <button id="ctxapply" type="button">Apply</button></div>
+    <p class="muted">More context uses more memory. Set your AI apps to the same number.</p>
+
+    <h3>Download a model</h3>
+    <form id="pull"><div class="line">
+      <input type="text" id="pullname" placeholder="e.g. qwen3.5:9b"
+             aria-label="Model to download" autocapitalize="off" autocorrect="off" spellcheck="false">
+      <button class="primary" type="submit">Download</button></div>
+      <label class="check"><input type="checkbox" id="pulluse" checked> Use it when the download finishes</label>
+    </form>
+    <p class="muted">An Ollama name such as <code>qwen3.5:9b</code>, or a Hugging Face GGUF repo such as <code>hf.co/user/repo:Q4_K_M</code>. Pasting a link from either site works too.</p>
+    <div id="jobs"></div>
+    <p class="muted"><a href="#" id="lock">Lock controls on this device</a></p>
+  </div>
+  <p id="msg" role="status"></p>
+</section>
+
+<footer>gpu-yield <span id="ver"></span> · <a href="/status">JSON</a></footer>
+</main>
+<script id="initial" type="application/json">__SNAPSHOT__</script>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const KEY = "gpu-yield-password";
+let pw = null, snap = JSON.parse($("initial").textContent), models = null, busy = false;
+try { pw = localStorage.getItem(KEY); } catch (e) {}
+
+function el(tag, attrs, ...kids) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "onclick") n.addEventListener("click", v); else if (v !== false && v != null) n.setAttribute(k, v);
+  }
+  for (const k of kids) n.append(k);
+  return n;
+}
+function ago(t) {
+  const s = Math.max(0, Math.round(Date.now() / 1000 - t));
+  return s < 90 ? s + "s" : s < 5400 ? Math.round(s / 60) + "m" : Math.floor(s / 3600) + "h " + Math.round(s % 3600 / 60) + "m";
+}
+function gb(bytes) { return bytes < 1e9 ? Math.max(1, Math.round(bytes / 1e6)) + " MB" : (bytes / 1e9).toFixed(bytes >= 1e10 ? 0 : 1) + " GB"; }
+function say(text, err) { $("msg").textContent = text || ""; $("msg").className = err ? "err" : ""; }
+function same(a, b) {
+  const n = x => { x = (x || "").trim().toLowerCase(); return x.split("/").pop().includes(":") ? x : x + ":latest"; };
+  return n(a) === n(b);
+}
+
+function renderStatus(s) {
+  document.title = "gpu-yield on " + s.host;
+  $("title").textContent = "gpu-yield on " + s.host;
+  $("ver").textContent = s.version || "";
+  let tone = "off", head = s.state_text || s.state;
+  if (s.ai_available) { tone = "ok"; head = "AI ready"; }
+  else if (s.state === "ai") { tone = "wait"; head = "AI starting: " + (s.model_status || ""); }
+  else if (s.state === "cooldown") { tone = "wait"; head = "Game closed, AI back in about " + (s.cooldown_remaining || 0) + " s"; }
+  else if (s.state === "gaming") { head = "Game running, AI paused"; }
+  else if (s.state === "paused") { head = "Paused"; }
+  $("dot").className = "dot " + tone;
+  $("headline").textContent = head;
+  const rows = [];
+  if (s.games && s.games.length) rows.push(["Game", s.games.join(", ")]);
+  if (s.model) rows.push(["Model", s.model + " · " + s.context_length + " context"]);
+  else rows.push(["Model", "none chosen"]);
+  if (s.in_use) rows.push(["In use", "yes, right now"]);
+  else if (s.last_used) rows.push(["Last used", ago(s.last_used) + " ago"]);
+  if (s.since) rows.push(["Since", ago(s.since) + " ago"]);
+  $("rows").replaceChildren(...rows.flatMap(([k, v]) => [el("dt", {}, k), el("dd", {}, String(v))]));
+  $("notice").hidden = !s.notice;
+  $("notice").textContent = s.notice || "";
+}
+
+function renderControls() {
+  const s = snap;
+  $("off").hidden = !!s.controls;
+  $("unlock").hidden = !s.controls || !!pw;
+  $("panel").hidden = !s.controls || !pw;
+  if (!s.controls || !pw) return;
+  $("pause").textContent = s.paused ? "Resume the AI" : "Pause the AI";
+  $("pausehint").textContent = s.paused ? "Paused until you resume it." : "Keeps the AI off until resumed, even after a reboot.";
+  $("pause").disabled = busy;
+  if (document.activeElement !== $("ctx")) $("ctx").value = String(s.context_length);
+  if (![...$("ctx").options].some(o => o.value === String(s.context_length)))
+    $("ctx").append(el("option", { value: String(s.context_length) }, String(s.context_length)));
+  if (document.activeElement !== $("ctx")) $("ctx").value = String(s.context_length);
+  $("ctxapply").disabled = busy;
+
+  const list = $("models");
+  if (!models) { list.replaceChildren(el("li", {}, el("span", { class: "muted" }, "Loading…"))); }
+  else if (!models.models.length) {
+    list.replaceChildren(el("li", {}, el("span", { class: "muted" }, models.available ? "No models downloaded yet." : "Shown when the AI is running.")));
+  } else {
+    list.replaceChildren(...models.models.map(m => {
+      const inUse = same(m.name, s.model);
+      const tags = [el("span", { class: "tag" }, gb(m.size))];
+      if (models.vram_gb && m.size / 1e9 > models.vram_gb) tags.push(el("span", { class: "tag", title: "Bigger than this PC's video memory; part of it runs from system RAM" }, "> VRAM"));
+      if (inUse) tags.push(el("span", { class: "tag on" }, "in use"));
+      return el("li", {}, el("span", { class: "name" }, m.name), ...tags,
+        inUse ? "" : el("button", { type: "button", disabled: busy, onclick: () => act("model", { name: m.name }, "Switching to " + m.name + "…") }, "Use"),
+        inUse ? "" : el("button", { type: "button", class: "danger", disabled: busy, onclick: () => {
+          if (confirm("Delete " + m.name + " from this PC? (" + gb(m.size) + ")")) act("delete", { name: m.name }, "Deleting…");
+        } }, "Delete"));
+    }));
+  }
+  $("disk").textContent = models && models.disk_free ? gb(models.disk_free) + " free for models" : "";
+
+  $("jobs").replaceChildren(...(s.downloads || []).map(j => {
+    const pct = j.total ? Math.round(100 * j.completed / j.total) : null;
+    const text = j.state === "running" ? (pct != null ? pct + "% of " + gb(j.total) : j.status || "starting")
+      : j.state === "done" ? "downloaded" + (j.use ? ", switching to it" : "") : j.state === "cancelled" ? "cancelled" : "failed: " + (j.error || "");
+    return el("div", { class: "job" },
+      el("div", { class: "line" }, el("span", { class: "name", style: "flex:1;overflow-wrap:anywhere" }, j.name),
+        j.state === "running" ? el("button", { type: "button", onclick: () => act("cancel", { name: j.name }, "Cancelling…") }, "Cancel") : ""),
+      j.state === "running" ? el("progress", pct != null ? { max: 100, value: pct } : {}) : "",
+      el("div", { class: "muted" }, text));
+  }));
+}
+
+async function act(action, body, pending) {
+  busy = true; say(pending || "…"); renderControls();
+  try {
+    const r = await fetch("/api/" + action, { method: "POST",
+      headers: { "Content-Type": "application/json", "X-GPU-Yield-Password": pw || "" },
+      body: JSON.stringify(body || {}) });
+    const d = await r.json().catch(() => ({}));
+    if (r.status === 403 && action !== "auth") { forget(); }
+    if (!r.ok) { say(d.error || ("Error " + r.status), true); return false; }
+    say(d.message || "");
+    return true;
+  } catch (e) { say("Couldn't reach the PC: " + e.message, true); return false; }
+  finally { busy = false; await refresh(true); }
+}
+function forget() { pw = null; try { localStorage.removeItem(KEY); } catch (e) {} renderControls(); }
+
+async function refresh(withModels) {
+  try {
+    const r = await fetch("/status", { cache: "no-store" });
+    snap = await r.json();
+    renderStatus(snap);
+    if (pw && snap.controls && (withModels || !models)) {
+      const m = await fetch("/api/models", { cache: "no-store" });
+      models = await m.json();
+    }
+  } catch (e) { $("headline").textContent = "Can't reach the PC"; $("dot").className = "dot"; }
+  renderControls();
+}
+
+$("unlock").addEventListener("submit", async ev => {
+  ev.preventDefault();
+  pw = $("pw").value;
+  if (await act("auth", {}, "Checking…")) {
+    try { localStorage.setItem(KEY, pw); } catch (e) {}
+    $("pw").value = ""; say("Unlocked."); refresh(true);
+  } else { pw = null; renderControls(); }
+});
+$("lock").addEventListener("click", ev => { ev.preventDefault(); forget(); say("Locked on this device."); });
+$("pause").addEventListener("click", () => act("pause", { paused: !snap.paused }, snap.paused ? "Resuming…" : "Pausing…"));
+$("ctxapply").addEventListener("click", () => act("context", { context_length: Number($("ctx").value) }, "Applying… the model reloads"));
+$("pull").addEventListener("submit", ev => {
+  ev.preventDefault();
+  const name = $("pullname").value.trim();
+  if (!name) return;
+  act("pull", { name, use: $("pulluse").checked }, "Starting download…").then(ok => { if (ok) $("pullname").value = ""; });
+});
+
+renderStatus(snap); renderControls(); refresh(true);
+let tick = 0;
+setInterval(() => { tick++; refresh(tick % 5 === 0); }, 3000);
+</script>
+</body></html>
 """
+
+MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?")
+
+
+def normalize_model_name(text):
+    """Accept an Ollama name, a Hugging Face repo, or either site's URL; return what
+    `ollama pull` expects (hf.co/user/repo[:quant] for Hugging Face)."""
+    t = (text or "").strip()
+    t = re.sub(r"^(https?://)?(www\.)?(huggingface\.co|hf\.co)/", "hf.co/", t, flags=re.I)
+    t = re.sub(r"^(https?://)?(www\.)?ollama\.com/(library/)?", "", t, flags=re.I)
+    if t.startswith("hf.co/"):
+        parts = t[len("hf.co/"):].split("/")
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            raise ValueError("a Hugging Face model needs both the user and the repo, "
+                             "like hf.co/user/repo")
+        t = "hf.co/" + parts[0] + "/" + parts[1]          # drop /tree/main, /blob/... etc.
+    t = t.rstrip("/")
+    if len(t) > 200 or not MODEL_NAME_RE.fullmatch(t):
+        raise ValueError("that doesn't look like an Ollama or Hugging Face model name")
+    return t
 
 
 class StatusServer:
-    """Read-only status for other computers: GET / (page) and GET /status (JSON)."""
+    """The page other computers see: GET / (page), GET /status (JSON), GET /api/models,
+    and, when a control password is set, POST /api/<action> to change things."""
 
-    def __init__(self, port, snapshot):
+    MAX_BODY = 16_384
+
+    def __init__(self, port, watcher):
         self.port = port
-        self.snapshot = snapshot
+        self.watcher = watcher
         self.server = None
 
     def start(self):
@@ -1071,34 +1330,70 @@ class StatusServer:
 
         class Handler(BaseHTTPRequestHandler):
             server_version = APP
-            timeout = 5
+            timeout = 10
 
             def log_message(self, *args):
                 pass
 
-            def do_GET(self):
-                path = self.path.split("?", 1)[0]
-                try:
-                    snap = owner.snapshot()
-                except Exception as e:
-                    snap = {"state": "error", "error": str(e)}
-                if path in ("/status", "/status.json"):
-                    body, ctype = json.dumps(snap, indent=1).encode(), "application/json"
-                elif path == "/":
-                    body, ctype = render_status_page(snap).encode(), "text/html; charset=utf-8"
-                else:
-                    self.send_error(404)
-                    return
-                self.send_response(200)
+            def _send(self, code, body, ctype="application/json", public=False):
+                if isinstance(body, (dict, list)):
+                    body = json.dumps(body, indent=1).encode()
+                elif isinstance(body, str):
+                    body = body.encode()
+                self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Access-Control-Allow-Origin", "*")
+                if public:      # read-only data any page may fetch; never the controls
+                    self.send_header("Access-Control-Allow-Origin", "*")
                 self.end_headers()
                 if self.command != "HEAD":
                     self.wfile.write(body)
 
+            def do_GET(self):
+                path = self.path.split("?", 1)[0]
+                try:
+                    snap = owner.watcher.snapshot()
+                except Exception as e:
+                    snap = {"state": "error", "error": str(e)}
+                if path in ("/status", "/status.json"):
+                    self._send(200, snap, public=True)
+                elif path == "/":
+                    self._send(200, render_status_page(snap), "text/html; charset=utf-8")
+                elif path == "/api/models":
+                    self._send(200, owner.watcher.api_models())
+                else:
+                    self._send(404, {"error": "not found"})
+
             do_HEAD = do_GET
+
+            def do_POST(self):
+                path = self.path.split("?", 1)[0]
+                if not path.startswith("/api/"):
+                    return self._send(404, {"error": "not found"})
+                # JSON only: a plain HTML form on another site can't send this content type
+                # (or the password header) without the browser asking first, and we don't
+                # answer that question.
+                if not self.headers.get("Content-Type", "").startswith("application/json"):
+                    return self._send(415, {"error": "send JSON"})
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    length = -1
+                if not 0 <= length <= owner.MAX_BODY:
+                    return self._send(413, {"error": "request too large"})
+                try:
+                    data = json.loads(self.rfile.read(length) or b"{}")
+                    if not isinstance(data, dict):
+                        raise ValueError
+                except ValueError:
+                    return self._send(400, {"error": "bad JSON"})
+                code, reply = owner.watcher.api(path[len("/api/"):], data,
+                                                self.headers.get("X-GPU-Yield-Password", ""))
+                self._send(code, reply)
+
+            def do_OPTIONS(self):
+                self._send(405, {"error": "cross-site requests aren't allowed"})
 
         try:
             server = ThreadingHTTPServer(("0.0.0.0", self.port), Handler)
@@ -1117,34 +1412,10 @@ class StatusServer:
             self.server = None
 
 
-def render_status_page(s):
-    esc = html.escape
-    state = s.get("state")
-    if s.get("ai_available"):
-        tone, headline = "ok", "AI ready"
-    elif state == "ai":
-        tone, headline = "wait", "AI starting: " + str(s.get("model_status", ""))
-    elif state == "cooldown":
-        tone, headline = "wait", f"Game closed, AI back in about {s.get('cooldown_remaining', 0)} s"
-    elif state == "gaming":
-        tone, headline = "off", "Game running, AI paused"
-    else:
-        tone, headline = "off", STATE_TEXT.get(state, str(state))
-    rows = []
-    if s.get("games"):
-        rows.append(("Game", ", ".join(s["games"])))
-    if s.get("model"):
-        rows.append(("Model", f"{s['model']} · {s.get('context_length')} context"))
-    if s.get("in_use"):
-        rows.append(("In use", "yes, right now"))
-    elif s.get("last_used"):
-        rows.append(("Last used", ago(time.time() - s["last_used"]) + " ago"))
-    rows.append(("Since", ago(time.time() - s.get("since", time.time())) + " ago"))
-    note = f'<div class="note">{esc(s["notice"])}</div>' if s.get("notice") else ""
-    return STATUS_PAGE.format(
-        host=esc(s.get("host", "")), tone=tone, headline=esc(headline), note=note,
-        version=esc(s.get("version", "")),
-        rows="".join(f"<dt>{esc(k)}</dt><dd>{esc(str(v))}</dd>" for k, v in rows))
+def render_status_page(snapshot):
+    data = json.dumps(snapshot).replace("<", "\\u003c")     # can't close the <script> early
+    return STATUS_PAGE.replace("__HOST__", html.escape(str(snapshot.get("host", "")))) \
+                      .replace("__SNAPSHOT__", data)
 
 
 # ----------------------------------------------------------------------------- watcher
@@ -1177,6 +1448,9 @@ class Watcher:
         self.last_status_write = 0.0
         self.last_error = ("", 0.0)
         self.in_use = False
+        self.actions = queue.Queue()     # changes requested from the page, applied by run()
+        self.downloads = {}              # model name -> progress of a download
+        self.models_cache = {"models": [], "at": 0.0}
         self.wine_since = None
         self.last_used = None
         self.mac = nic_info()[1]
@@ -1378,6 +1652,201 @@ class Watcher:
             self.warned.add(key)
             log("note: " + msg)
 
+    # --- controls from the status page. Handlers run on the page's threads; anything
+    # that changes the config or Ollama is queued and applied by the main loop.
+    def api(self, action, data, password):
+        secret = self.cfg["control_password"]
+        if not secret:
+            return 403, {"error": "Controls are off. Turn them on with: "
+                                  "gpu-yield config control_password YOUR-PASSWORD"}
+        if not hmac.compare_digest(str(password).encode(), secret.encode()):
+            time.sleep(1)                 # slows down guessing
+            return 403, {"error": "Wrong password"}
+        handler = getattr(self, "_api_" + action.replace("-", "_"), None) \
+            if re.fullmatch(r"[a-z_-]+", action) else None
+        if handler is None:
+            return 404, {"error": f"unknown action {action!r}"}
+        try:
+            return handler(data)
+        except ValueError as e:
+            return 400, {"error": str(e)}
+
+    def _api_auth(self, data):
+        return 200, {"message": "Unlocked"}
+
+    def _api_pause(self, data):
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        if data.get("paused"):
+            PAUSE_FILE.touch()
+            return 200, {"message": "Paused. The AI stays off until you resume it."}
+        PAUSE_FILE.unlink(missing_ok=True)
+        return 200, {"message": "Resumed. The model loads in a moment if no game is running."}
+
+    def _api_model(self, data):
+        name = normalize_model_name(data.get("name"))
+        installed = [m["name"] for m in self.api_models()["models"]]
+        if installed and not any(same_model(name, m) for m in installed):
+            raise ValueError(f"{name} isn't downloaded yet; download it first")
+        name = next((m for m in installed if same_model(name, m)), name)
+        self.actions.put(("model", name))
+        when = "" if self.state == "ai" else " It loads when the AI is back on."
+        return 202, {"message": f"Switching to {name}. Set your AI apps to use {name} too.{when}"}
+
+    def _api_context(self, data):
+        try:
+            n = int(data.get("context_length"))
+        except (TypeError, ValueError):
+            raise ValueError("context_length must be a number") from None
+        if not 2048 <= n <= 1_048_576:
+            raise ValueError("context_length must be between 2048 and 1048576")
+        self.actions.put(("context", n))
+        return 202, {"message": f"Context set to {n}; the model reloads. "
+                              f"Set your AI apps to {n} too."}
+
+    def _api_pull(self, data):
+        name = normalize_model_name(data.get("name"))
+        if self.state != "ai" or not self.ollama.ready():
+            return 409, {"error": "Downloads need the AI running. Try again when no game is "
+                                  "running and the AI isn't paused."}
+        job = self.downloads.get(name)
+        if job and job["state"] == "running":
+            return 409, {"error": f"{name} is already downloading"}
+        self.downloads[name] = {"name": name, "state": "running", "status": "starting",
+                                "completed": 0, "total": 0, "error": "", "use": bool(data.get("use")),
+                                "cancel": False, "finished": None}
+        threading.Thread(target=self._pull, args=(name,), name="download", daemon=True).start()
+        return 202, {"message": f"Downloading {name}"}
+
+    def _api_cancel(self, data):
+        job = self.downloads.get(normalize_model_name(data.get("name")))
+        if not job or job["state"] != "running":
+            return 404, {"error": "no such download in progress"}
+        job["cancel"] = True
+        return 200, {"message": "Cancelling"}
+
+    def _api_delete(self, data):
+        name = normalize_model_name(data.get("name"))
+        if same_model(name, self.cfg["model"]):
+            return 409, {"error": "That's the model in use. Switch to another one first."}
+        if self.state != "ai" or not self.ollama.ready():
+            return 409, {"error": "Deleting needs the AI running. Try again when no game is "
+                                  "running and the AI isn't paused."}
+        try:
+            self.ollama.request("/api/delete", {"model": name}, method="DELETE", timeout=30)
+        except urllib.error.HTTPError as e:
+            return 400, {"error": http_error_detail(e)}
+        self.models_cache["at"] = 0
+        log(f"deleted {name} (from the status page)")
+        return 200, {"message": f"Deleted {name}"}
+
+    def api_models(self):
+        """Installed models (cached while Ollama is off), disk space and VRAM, for the page."""
+        available = False
+        if self.state == "ai" and time.monotonic() - self.models_cache["at"] > 5:
+            try:
+                tags = self.ollama.request("/api/tags", timeout=3).get("models", [])
+                self.models_cache = {"at": time.monotonic(), "models": sorted(
+                    ({"name": m.get("name") or m.get("model"), "size": m.get("size", 0)}
+                     for m in tags), key=lambda m: m["name"])}
+                available = True
+            except Exception:
+                pass
+        elif self.state == "ai":
+            available = True
+        try:
+            store = HOME / ".ollama/models"
+            free = shutil.disk_usage(store if store.exists() else HOME).free
+        except OSError:
+            free = None
+        vram = detect_memory()[1]
+        return {"models": self.models_cache["models"], "available": available,
+                "disk_free": free, "vram_gb": round(vram, 1) if vram else None}
+
+    def download_list(self):
+        now = time.monotonic()
+        for name, job in list(self.downloads.items()):      # forget finished ones after 10 min
+            if job["finished"] and now - job["finished"] > 600:
+                self.downloads.pop(name, None)
+        return [{k: v for k, v in job.items() if k not in ("cancel", "finished")}
+                for job in self.downloads.values()]
+
+    def _pull(self, name):
+        job = self.downloads[name]
+        layers = {}
+        try:
+            req = urllib.request.Request(self.ollama.base + "/api/pull",
+                                         data=json.dumps({"model": name, "stream": True}).encode(),
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=120) as r:
+                for line in r:
+                    if job["cancel"]:
+                        job["state"] = "cancelled"       # closing the stream stops Ollama's pull
+                        log(f"download of {name} cancelled")
+                        return
+                    if not line.strip():
+                        continue
+                    msg = json.loads(line)
+                    if msg.get("error"):
+                        raise RuntimeError(msg["error"])
+                    job["status"] = msg.get("status", job["status"])
+                    if msg.get("digest") and msg.get("total"):
+                        layers[msg["digest"]] = (msg.get("completed", 0), msg["total"])
+                        job["completed"] = sum(c for c, _ in layers.values())
+                        job["total"] = sum(tot for _, tot in layers.values())
+            job["state"] = "done"
+            self.models_cache["at"] = 0
+            log(f"downloaded {name} (from the status page)")
+            if job["use"]:
+                self.actions.put(("model", name))
+        except Exception as e:
+            job["state"] = "failed"
+            if self.state != "ai":
+                job["error"] = "a game started, which stops Ollama; download it again later"
+            elif isinstance(e, urllib.error.HTTPError):
+                job["error"] = http_error_detail(e)
+            else:
+                job["error"] = str(e) or e.__class__.__name__
+            log(f"download of {name} failed: {job['error']}")
+        finally:
+            job["finished"] = time.monotonic()
+
+    def process_actions(self):
+        while True:
+            try:
+                kind, value = self.actions.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                if kind == "model":
+                    self.apply_settings({"model": value}, f"model switched to {value}")
+                elif kind == "context":
+                    self.apply_settings({"context_length": value}, f"context set to {value}")
+            except Exception as e:
+                log(f"couldn't apply {kind} = {value}: {e!r}")
+
+    def apply_settings(self, values, why):
+        if CONFIG_FILE.exists():
+            set_config_values(values)
+        try:
+            cfg = load_config()
+        except SystemExit:
+            log(f"{why}: the config file has a problem; not applied")
+            return
+        if not CONFIG_FILE.exists():
+            cfg.update(values)
+        self.cfg = self.ollama.cfg = cfg
+        self.notice = ""
+        self.warned.clear()
+        ensure_ollama_unit(cfg)
+        log(why + " (from the status page)")
+        if self.state != "ai":
+            return                       # used when the AI comes back on
+        if "context_length" in values:
+            self.ollama.stop()           # the context default lives in Ollama's service
+            self.go_on("restarting Ollama with the new context")
+        else:
+            self.start_warm()
+
     def confirm_wine(self, games, now):
         """Steam games count at once. A Windows program outside Steam has to keep running
         for WINE_CONFIRM_SECONDS first, so a short Wine run doesn't cost a model reload."""
@@ -1483,6 +1952,9 @@ class Watcher:
             "mac": self.mac,
             "port": self.cfg["port"],
             "pid": os.getpid(),
+            "paused": PAUSE_FILE.exists(),
+            "controls": bool(self.cfg["control_password"]),
+            "downloads": self.download_list(),
         }
 
     def write_status(self, now):
@@ -1507,7 +1979,7 @@ class Watcher:
             f"context {self.cfg['context_length']}, cooldown {self.cfg['cooldown_seconds']}s)")
         page = None
         if self.cfg["status_port"]:
-            page = StatusServer(int(self.cfg["status_port"]), self.snapshot)
+            page = StatusServer(int(self.cfg["status_port"]), self)
             if page.start():
                 log(f"status page on http://{self.host}:{self.cfg['status_port']}/")
         poll = max(0.5, float(self.cfg["poll_seconds"]))
@@ -1520,6 +1992,7 @@ class Watcher:
                 games = self.confirm_wine(scan_games(self.cfg), mono)
                 self.step(games, PAUSE_FILE.exists(), slept, mono)
                 self.track_use()
+                self.process_actions()
                 self.maybe_auto_update(mono)
             except Exception as e:  # never let one bad loop kill the watcher
                 msg = f"watcher error: {e!r}"
@@ -1728,6 +2201,7 @@ def send_magic_packet(mac, ip=None):
     targets = {"255.255.255.255"}
     if ip:
         targets.add(ip.rsplit(".", 1)[0] + ".255")   # the usual /24 home network
+        targets.add(ip)    # direct too: some Wi-Fi routers drop broadcasts to sleeping clients
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
         for addr in targets:
@@ -1784,8 +2258,23 @@ def cmd_wake(args):
         "gpu-yield wol, and that it's enabled in the BIOS/UEFI.")
 
 
-def wol_state(dev):
-    """(supported modes, current mode) from ethtool, e.g. ("pumbg", "g"); Nones if unknown."""
+def wifi_phy(dev):
+    return _read_text(Path(f"/sys/class/net/{dev}/phy80211/name")).strip() or None
+
+
+def wol_state(dev, wireless=False):
+    """(supported, current) wake modes: "g" means wake on a magic packet. Wired cards are
+    read with ethtool ("pumbg", "g"); Wi-Fi cards with iw (Wake on Wireless LAN).
+    Nones if it can't be told."""
+    if wireless:
+        phy = wifi_phy(dev)
+        if not phy or not shutil.which("iw"):
+            return None, None
+        info = run(["iw", "phy", phy, "info"]).stdout
+        supported = "g" if re.search(r"WoWLAN support:(\n\s+\*.*)*?magic packet", info) else ""
+        shown = run(["iw", "phy", phy, "wowlan", "show"]).stdout
+        current = "g" if "magic packet" in shown else ("d" if shown else None)
+        return supported, current
     if not shutil.which("ethtool"):
         return None, None
     out = run(["ethtool", dev]).stdout
@@ -1800,8 +2289,7 @@ def enable_wol(args):
         warn("no network connection found")
         return
     if wireless:
-        log(f"  {dev} is Wi-Fi; Wake-on-LAN generally needs a wired connection. Skipped.")
-        return
+        return enable_wowlan(dev, mac, args)
     supported, current = wol_state(dev)
     if supported is not None and "g" not in supported:
         log(f"  {dev}'s network card doesn't support Wake-on-LAN")
@@ -1826,10 +2314,40 @@ def enable_wol(args):
         warn("couldn't turn on Wake-on-LAN")
 
 
+def enable_wowlan(dev, mac, args):
+    """Wake on Wireless LAN: some Wi-Fi cards can wake a sleeping PC on a magic packet."""
+    supported, current = wol_state(dev, wireless=True)
+    if supported is None:
+        log(f"  {dev} is Wi-Fi. Can't tell whether it can wake the PC (needs the `iw` tool). "
+            "Wired Wake-on-LAN is far more reliable; otherwise set Steam's sleep timer to Never.")
+        return
+    if not supported:
+        log(f"  {dev} is Wi-Fi and its card can't wake the PC. Use a wired connection for "
+            "Wake-on-LAN, or set Steam's sleep timer to Never so the AI stays reachable.")
+        return
+    if current == "g":
+        log(f"  Wake on Wireless LAN already on for {dev} ({mac})")
+        return
+    if not ask(f"{dev} is Wi-Fi, and its card supports Wake on Wireless LAN. Turn it on, so "
+               "your other computers can wake this PC from sleep? Needs sudo.", args):
+        return
+    conn = run(["nmcli", "-g", "GENERAL.CONNECTION", "device", "show", dev]).stdout.strip() \
+        if shutil.which("nmcli") else ""
+    saved = bool(conn) and sudo(["nmcli", "connection", "modify", conn,
+                                 "802-11-wireless.wake-on-wlan", "magic"])
+    now = sudo(["iw", "phy", wifi_phy(dev), "wowlan", "enable", "magic-packet"])
+    if saved or now:
+        log(f"  Wake on Wireless LAN on for {dev} ({mac})" + ("" if saved else " until the next reboot"))
+        log("  It wakes the PC from sleep, not when it's shut down, and only while the router "
+            "stays on. Some Wi-Fi drivers don't honor it; test with gpu-yield wake.")
+    else:
+        warn("couldn't turn on Wake on Wireless LAN")
+
+
 def cmd_wol(args):
     dev, mac, wireless = nic_info()
     print(f"Network:  {dev or 'none'}" + (" (Wi-Fi)" if wireless else "") + (f", MAC {mac}" if mac else ""))
-    supported, current = wol_state(dev) if dev else (None, None)
+    supported, current = wol_state(dev, wireless) if dev else (None, None)
     if current is not None:
         print(f"Wake-on:  {'on' if 'g' in current else 'off'} (supported: {supported or '?'})")
     args.yes = False
@@ -1949,11 +2467,14 @@ def cmd_doctor(args):
         note(f"status page: http://{ip or socket.gethostname()}:{cfg['status_port']}/")
     dev, mac, wireless = nic_info()
     if dev:
-        _, current = wol_state(dev)
-        state = "Wi-Fi, not available" if wireless else \
-            ("on" if current and "g" in current else "off (turn on: gpu-yield wol)") if current \
-            else "unknown (gpu-yield wol)"
-        note(f"Wake-on-LAN: {state}; {dev} {mac or ''}")
+        supported, current = wol_state(dev, wireless)
+        if wireless and supported == "":
+            state = "not supported by this Wi-Fi card"
+        elif current:
+            state = "on" if "g" in current else "off (turn on: gpu-yield wol)"
+        else:
+            state = "unknown (gpu-yield wol)"
+        note(f"{'Wake on Wireless LAN' if wireless else 'Wake-on-LAN'}: {state}; {dev} {mac or ''}")
     print("All good." if problems == 0 else f"{problems} thing(s) to fix.")
 
 
@@ -2211,7 +2732,7 @@ def cmd_config(args):
         for k in DEFAULTS:
             if k == "ollama_env":
                 continue
-            v = ('"(set)"' if cfg[k] else '""') if k == "github_token" else fmt_setting(cfg[k])
+            v = ('"(set)"' if cfg[k] else '""') if k in SECRET_SETTINGS else fmt_setting(cfg[k])
             if k == "backend" and cfg[k] == "auto":
                 v += f"  (currently {resolve_backend(cfg)})"
             print(f"  {k:<22} {v}" + ("" if cfg[k] == DEFAULTS[k] else "   *changed"))
@@ -2227,7 +2748,7 @@ def cmd_config(args):
         if key.startswith("env."):
             print(json.dumps(cfg["ollama_env"].get(key[4:], "")))
         elif key in DEFAULTS:
-            print(fmt_setting(cfg[key]))
+            print(('"(set)"' if cfg[key] else '""') if key in SECRET_SETTINGS else fmt_setting(cfg[key]))
         else:
             die(f"unknown setting {key!r}; run gpu-yield config to list them")
         return
@@ -2252,7 +2773,7 @@ def cmd_config(args):
         print("Nothing changed.")
         sys.exit(1)
     shown = json.dumps(cfg["ollama_env"].get(key[4:], "")) if key.startswith("env.") \
-        else fmt_setting(cfg[key])
+        else ('"(set)"' if cfg[key] else '""') if key in SECRET_SETTINGS else fmt_setting(cfg[key])
     print(f"{key} = {shown}")
     if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0:
         user_systemctl("restart", WATCHER_UNIT)
@@ -2263,6 +2784,9 @@ def cmd_config(args):
         print("The Ollama download depends on the backend; finish with: gpu-yield setup --reinstall")
     elif key in ("port", "status_port"):
         print("If the firewall is on, open the new port with: gpu-yield firewall")
+    elif key == "control_password":
+        print(f"Controls on the status page are {'on' if cfg[key] else 'off'}: "
+              f"http://{socket.gethostname()}:{cfg['status_port']}/")
 
 
 def hermes_snippet(cfg):

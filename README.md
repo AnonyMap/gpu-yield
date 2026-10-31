@@ -22,6 +22,7 @@ It's a single Python file with no dependencies, built for [Bazzite](https://bazz
 - [Choosing a model](#choosing-a-model)
 - [Connecting clients](#connecting-clients)
 - [Checking on it](#checking-on-it)
+- [Controls on the status page](#controls-on-the-status-page)
 - [From other computers](#from-other-computers)
 - [Sleep and Wake-on-LAN](#sleep-and-wake-on-lan)
 - [Game detection](#game-detection)
@@ -39,7 +40,7 @@ It's a single Python file with no dependencies, built for [Bazzite](https://bazz
 - **Linux with systemd**, where games are launched through Steam. Built and tested on Bazzite in Gaming Mode; other Fedora Atomic images and SteamOS-like setups should work the same way.
 - **Python 3.11 or newer** (included with Bazzite).
 - **An AMD GPU** for the managed Ollama install. gpu-yield picks ROCm or Vulkan for your card automatically. Other GPUs are untested.
-- **A wired network connection** if you want Wake-on-LAN.
+- **A wired network connection** for reliable Wake-on-LAN. Some Wi-Fi cards can wake the PC too ([Sleep and Wake-on-LAN](#sleep-and-wake-on-lan)).
 
 Nothing is layered onto the system image: everything installs into your home folder and runs as your user.
 
@@ -135,7 +136,7 @@ journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
 
 `status` shows games by name, for example `The Riftbreaker (AppId 1820000)`, including non-Steam shortcuts.
 
-**Status page.** Open `http://<gaming-pc>:11435` in any browser, including a phone. It shows whether the AI is ready, which game is running, when the AI was last used, and anything worth fixing, and refreshes every 5 seconds. The page is read-only.
+**Status page.** Open `http://<gaming-pc>:11435` in any browser, including a phone. It shows whether the AI is ready, which game is running, when the AI was last used, and anything worth fixing, and updates live. With a control password set, it can also change things ([Controls on the status page](#controls-on-the-status-page)).
 
 The same data is available as JSON at `/status`, for scripts or for an agent that wants to check before calling:
 
@@ -150,6 +151,30 @@ The same data is available as JSON at `/status`, for scripts or for an agent tha
 | `notice` | A problem worth fixing, such as a client loading a different context |
 | `cooldown_remaining`, `since` | Seconds until the model reloads after a game; when the current state began |
 | `host`, `version`, `port`, `mac` | The PC's name, gpu-yield version, AI port, and network card address (used by `wake`) |
+
+## Controls on the status page
+
+With a control password set, the status page can also manage the AI, from any browser on your network, including a phone:
+
+- **Switch models** among the ones downloaded on the PC. Each shows its size, and models bigger than the GPU's memory are marked.
+- **Change the context length** (8K to 128K). Ollama restarts with the new size and the model reloads.
+- **Download a model** by name, with live progress and a Cancel button, and optionally switch to it when it finishes. You can type or paste:
+  - an Ollama model name, such as `qwen3.5:9b`, or its ollama.com link
+  - a Hugging Face GGUF repo, such as `hf.co/user/repo` or `hf.co/user/repo:Q4_K_M` to choose the quantization, or its huggingface.co link
+- **Delete models** you no longer need, except the one in use. Free disk space is shown.
+- **Pause and resume** the AI.
+
+The controls are off until you set a password on the gaming PC:
+
+```bash
+gpu-yield config control_password YOUR-PASSWORD
+```
+
+The page asks for it once per browser and remembers it; *Lock controls on this device* forgets it. Without a password the page stays read-only. Use a password you don't use anywhere else: the page is plain HTTP, so it crosses your local network unencrypted.
+
+The controls cost the PC almost nothing. The page's server sits idle until a browser asks for something, and Ollama does the actual downloading and loading. Every change goes through the watcher, so a change made from the page can't collide with a game starting. Downloads and deletes need the AI running, so they're refused during a game with a message saying why. Model and context changes made during a game are saved and take effect when the AI comes back.
+
+After switching models or context, set your AI apps to match ([Connecting clients](#connecting-clients)).
 
 ## From other computers
 
@@ -171,7 +196,7 @@ For anything else, use SSH, for example `ssh gaming-pc.local gpu-yield update`. 
 
 If the gaming PC goes to sleep, nothing on the network can reach the AI. There are two ways to handle that.
 
-**Wake it when needed.** Run `gpu-yield wol` on the gaming PC once (setup offers this too). It turns on Wake-on-LAN for the wired network card, through NetworkManager so it survives reboots, and prints the card's address. Then, from another computer:
+**Wake it when needed.** Run `gpu-yield wol` on the gaming PC once (setup offers this too). It turns on Wake-on-LAN for the network card, through NetworkManager so it survives reboots, and prints the card's address. Then, from another computer:
 
 ```bash
 gpu-yield wake gaming-pc.local
@@ -179,7 +204,9 @@ gpu-yield wake gaming-pc.local
 
 This sends the wake-up signal and waits until the AI answers, for up to 2 minutes. `wake` needs to know the PC's network card address. It learns that automatically the first time you run `gpu-yield status --host` against the PC while it's awake. You can also pass the address directly, for example `gpu-yield wake 1c:2b:3a:4d:5e:6f`.
 
-Wake-on-LAN needs a wired connection. Some PCs also need it enabled in the BIOS/UEFI, often called *Wake on LAN*, *Power on by PCI-E* or *Resume by LAN*.
+Wake-on-LAN is most reliable over a wired connection. Some PCs also need it enabled in the BIOS/UEFI, often called *Wake on LAN*, *Power on by PCI-E* or *Resume by LAN*.
+
+**On Wi-Fi**, some cards support *Wake on Wireless LAN*. `gpu-yield wol` checks whether yours does (using the `iw` tool) and turns it on if so. It's less dependable than wired: it wakes the PC from sleep but not from shut down, needs the router to stay on, and some Wi-Fi drivers don't honor it. Try `gpu-yield wake` once to see whether it works on your PC. If the card doesn't support it, the dependable option is to stop the PC from sleeping, below.
 
 **Or don't let it sleep.** Set Steam's sleep timer to *Never* (Steam → Settings → Power). gpu-yield can't keep the PC awake itself: Linux lets a user override their own sleep blocks, and gpu-yield runs as the same user as Steam, so Steam's sleep would ignore a block from gpu-yield.
 
@@ -217,6 +244,7 @@ An invalid value is refused and the file is left as it was. You can also edit `~
 | `ignore_appids` | `[]` | Steam AppIds that should not stop the AI |
 | `detect_wine` | `true` | Treat Windows programs outside Steam that are using the GPU as games |
 | `auto_update` | `"off"` | `off`, `gpu-yield`, or `all` (gpu-yield and Ollama). See [Updating](#updating) |
+| `control_password` | none | Turns on the [controls on the status page](#controls-on-the-status-page). `gpu-yield config` shows it only as "(set)" |
 | `update_repo`, `update_branch` | this repo, `main` | Where updates come from, for forks |
 | `github_token` | none | Read-only token, only needed if `update_repo` is private |
 | `ollama_unit` | managed | Leave as is, unless you run Ollama yourself under another systemd user unit |
@@ -283,7 +311,7 @@ The watcher checks once a day and installs only while no game is running and the
 
 ## Limits and security
 
-- **Ollama has no authentication.** Anyone who can reach port 11434 can use the AI. Setup only opens it to your local subnet; don't forward it on your router. The status page is read-only and shows no conversation data.
+- **Ollama has no authentication.** Anyone who can reach port 11434 can use the AI. Setup only opens it to your local subnet; don't forward it on your router. The status page shows no conversation data, and is read-only unless you set a control password. That password crosses your network unencrypted, so don't reuse an important one.
 - **There's a short gap at each handoff.** The stand-in exists only while Ollama is stopped, so connections are refused for under a second whenever the AI stops or starts.
 - **Native Linux games outside Steam** need to be added to `extra_processes`.
 - **gpu-yield can't keep the PC from sleeping;** see [Sleep and Wake-on-LAN](#sleep-and-wake-on-lan).
@@ -293,9 +321,10 @@ The watcher checks once a day and installs only while no game is running and the
 
 The setup gpu-yield was built for:
 
-- **Gaming PC:** a living-room PC running Bazzite in Steam Gaming Mode, with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, on a wired connection. It runs `gpt-oss:20b` at a 64K context. `backend` resolves to ROCm (the RX 7800 XT is `gfx1101`).
+- **Gaming PC:** a living-room PC running Bazzite in Steam Gaming Mode, with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, connected over Wi-Fi. It runs `gpt-oss:20b` at a 64K context. `backend` resolves to ROCm (the RX 7800 XT is `gfx1101`).
 - **Clients:** Hermes Agent on a desktop on the same network, configured as in [Connecting clients](#connecting-clients), plus the status page on a phone.
-- **Day to day:** games are launched from Big Picture, and updates can be run from the desktop with `ssh <gaming-pc> gpu-yield update`.
+- **Day to day:** games are launched from Big Picture, and updates can be run from the desktop with `ssh <gaming-pc> gpu-yield update`. Models and context can be changed from the status page on any device.
+- **Sleep:** because the PC is on Wi-Fi, ordinary Wake-on-LAN doesn't apply. `gpu-yield wol` reports whether its Wi-Fi card supports Wake on Wireless LAN. If it doesn't, setting Steam's sleep timer to *Never* keeps the AI reachable.
 
 On a card with less memory, such as a desktop with an RX 6700 XT (12 GB) and 32 GB of RAM, the same install picks Vulkan automatically. `qwen3.5:9b` fits there entirely, while `gpt-oss:20b` runs with part of it in system RAM.
 
@@ -314,8 +343,9 @@ On a card with less memory, such as a desktop with an RX 6700 XT (12 GB) and 32 
 - `update`, `rollback`, automatic updates and Ollama updates, including failed and interrupted downloads
 - recovery from a crashed, hung or emptied Ollama, and from a broken config
 - the status page, `status --host`, `wake`, the `config` command, and backend choice
+- the status page's controls: password lock, model switching, context changes, downloads with progress and cancel, deletes, and pause, including driving the page in a real browser
 
-Wake-on-LAN itself (`nmcli`, `ethtool`, the BIOS) can't be simulated; check it with `gpu-yield wol` and a real `gpu-yield wake`. After installing on new hardware, run `gpu-yield doctor`, then start a game and check `gpu-yield status`.
+Wake-on-LAN and Wake on Wireless LAN themselves (`nmcli`, `ethtool`, `iw`, the BIOS) can't be simulated; check it with `gpu-yield wol` and a real `gpu-yield wake`. After installing on new hardware, run `gpu-yield doctor`, then start a game and check `gpu-yield status`.
 
 The tests run on GitHub for every change. To run them yourself you need only Python 3.11+, plus `zstd` for the Ollama install tests. They run in a throwaway home folder and don't touch a real install:
 

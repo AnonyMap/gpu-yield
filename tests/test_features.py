@@ -101,7 +101,7 @@ class FakeWatcher:
                 "model": "gpt-oss:20b", "context_length": 65536, "model_status": "ready",
                 "mac": "1c:2b:3a:4d:5e:6f", "version": gy.VERSION, "games": []}
 port = free_port()
-page = gy.StatusServer(port, FakeWatcher().snapshot)
+page = gy.StatusServer(port, FakeWatcher())
 assert page.start()
 target = f"127.0.0.1:{port}"
 gy.cmd_status(types.SimpleNamespace(host=target))

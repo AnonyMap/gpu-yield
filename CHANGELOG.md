@@ -2,6 +2,11 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.7.0 (2026-10-31)
+- The status page has controls: switch models, change the context length, download models by Ollama name or Hugging Face repo (or either site's URL) with live progress and cancel, delete models, and pause or resume the AI. Turn them on with `gpu-yield config control_password YOUR-PASSWORD`; without a password the page stays read-only.
+- Wake on Wireless LAN: on Wi-Fi, `gpu-yield wol` checks whether the card can wake the PC and turns it on if so. `wake` also sends the wake-up signal directly to the PC's address, which some Wi-Fi routers need.
+- The status page updates live instead of reloading every 5 seconds.
+
 ## 1.6.1 (2026-10-31)
 - Fixed: the AI stopped for about a minute whenever Wine ran briefly for something that wasn't a game, such as Proton's `xalia.exe` helper or a Steam background task. A Windows program outside Steam now counts as a game only if it is using the GPU and keeps running for 5 seconds. Steam games are still detected instantly. If you turned `detect_wine` off because of this, you can turn it back on: `gpu-yield config detect_wine true`.
 
