@@ -2,6 +2,25 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.9.1 (2026-10-31)
+Fixes from three independent reviews:
+- Setup and `gpu-yield model` check settings before saving them. A bad value, such as `setup --context 64`, used to stay in the config and keep the AI off after the next restart. `model` refuses the fixed app name before downloading anything.
+- A failed `setup --reinstall` no longer leaves the AI off until the next reboot.
+- Port and context settings must be whole numbers: `port 11434.0` used to break the AI. A value out of range (such as `poll_seconds 0.01`) is refused instead of being saved.
+- `gpu-yield config` can change a list written over several lines in the file, and keeps the file readable only by you.
+- Automatic updates wait for status-page downloads and speed tests to finish, and "once a day" now counts time the PC spends asleep.
+- `gpu-yield update` gives a message instead of a Python error when the connection drops mid-download.
+- Status page: a website could reach the controls through your browser using a name like `<your-pc>.example.com`. Only the PC's own local names are accepted now.
+- Status page: a few deliberately slow connections could keep it unreachable. Each request now has 15 seconds, and one device can have at most 6 connections open.
+- Status page: answers over IPv6 too.
+- Status page: a model chosen to switch to, or downloading with "use it" ticked, can no longer be deleted in the moment before the switch happens.
+- Status page: the model list says why if it can't load, instead of showing "Loading…" forever. The "> VRAM" tag compares sizes in the same units. Times no longer show as "1h 60m".
+- `wake` keeps waiting while a PC boots, instead of stopping at the first answer from a PC whose gpu-yield hasn't started yet.
+- The fixed app name could get stuck on an old model if a game started at the moment it was being moved. Now it can't.
+- An Ollama that takes more than a minute to start (after an update, or slow GPU setup) is no longer restarted over and over.
+- A Windows game starting during the cooldown after another game counts at once, so the model doesn't start loading while it launches.
+- Turning the status page off while gpu-yield was starting up could be missed.
+
 ## 1.9.0 (2026-10-31)
 - The status page can be turned off: `gpu-yield config status_page false` (and `true` to bring it back). It takes effect within a few seconds without restarting the AI. `status --host` and `wake` from another PC say when they reach a PC whose page is off, instead of treating it as asleep.
 

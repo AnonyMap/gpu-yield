@@ -283,7 +283,8 @@ def warm_with(tags, alias="gpu-yield", copy_error=None):
 gy.ALIAS_FILE.unlink(missing_ok=True)
 base = [{"name": "gpt-oss:20b", "digest": "d1"}]
 wx = warm_with(base)
-assert ("warm", "gpu-yield") in wx.ollama.calls and gy.alias_record() == {"name": "gpu-yield", "digest": "d1"}
+rec = gy.alias_record()
+assert ("warm", "gpu-yield") in wx.ollama.calls and (rec["name"], rec["digest"], rec["digests"]) == ("gpu-yield", "d1", ["d1"])
 wx = warm_with(wx.ollama.tags)                    # ours already: re-pointed freely
 assert wx.loaded_name == "gpu-yield" and not wx.alias_problem
 gy.ALIAS_FILE.unlink()

@@ -185,7 +185,7 @@ gpu-yield config control_password YOUR-PASSWORD
 
 Use at least 8 characters, and a password you don't use anywhere else: the page is plain HTTP, so it crosses your local network unencrypted. The page asks for it once per browser and remembers it; *Lock controls on this device* forgets it. Without a password the page stays read-only.
 
-After 10 wrong passwords within a minute, from any device, the controls stay locked for the rest of that minute. Open the page by the PC's name (such as `gaming-pc` or `gaming-pc.local`) or its IP address; the controls refuse requests addressed to any other name, which blocks websites from reaching them through your browser.
+After 10 wrong passwords within a minute, from any device, the controls stay locked for the rest of that minute. Open the page by the PC's name, alone or with a local-network ending (`gaming-pc`, `gaming-pc.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, or your router's own domain), or by its IP address. The controls refuse requests addressed to any other name, which blocks websites from reaching them through your browser.
 
 The controls cost the PC almost nothing. The page's server sits idle until a browser asks for something, and Ollama does the actual downloading and loading. Every change goes through the watcher, so a change made from the page can't collide with a game starting. Downloads and deletes need the AI running, so they're refused during a game with a message saying why. Model and context changes made during a game are saved and take effect when the AI comes back.
 
@@ -243,7 +243,7 @@ gpu-yield config extra_processes "a,b"    # lists take commas
 gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0   # an Ollama environment variable ("" removes it)
 ```
 
-An invalid value is refused and the file is left as it was. You can also edit `~/.config/gpu-yield/config.toml` directly; the file explains each setting. Apply hand edits with `systemctl --user restart gpu-yield`.
+An invalid value is refused and the file is left as it was. The file is kept readable only by you, since it can hold the control password and a GitHub token. You can also edit `~/.config/gpu-yield/config.toml` directly; the file explains each setting. Apply hand edits with `systemctl --user restart gpu-yield`.
 
 | Setting | Default | What it does |
 |---|---|---|
@@ -286,7 +286,7 @@ gpu-yield rollback         # back to the version before the last update; run aga
 gpu-yield config auto_update gpu-yield   # or "all" to include Ollama
 ```
 
-The watcher checks once a day and installs only while no game is running and the AI hasn't been used for 15 minutes, so an update never interrupts a game or a conversation. It checks for a game again right before installing. After a `rollback`, automatic updates skip the version you left until a newer one comes out or you run `gpu-yield update` yourself. The log is in `journalctl --user -u gpu-yield-autoupdate`.
+The watcher checks once a day (time asleep counts) and installs only while no game is running, the AI hasn't been used for 15 minutes, and no download or speed test from the status page is in progress, so an update never interrupts a game or a conversation. It checks for a game again right before installing. After a `rollback`, automatic updates skip the version you left until a newer one comes out or you run `gpu-yield update` yourself. The log is in `journalctl --user -u gpu-yield-autoupdate`.
 
 **What protects an update:**
 

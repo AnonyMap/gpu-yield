@@ -56,7 +56,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.9.0"
+VERSION = "1.9.1"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -252,6 +252,7 @@ def page_port(cfg):
     return int(cfg["status_port"]) if cfg["status_page"] else 0
 
 
+WHOLE_NUMBERS = ("context_length", "port", "status_port")   # used in URLs and Ollama's env
 LIVE_SETTINGS = ("status_page", "status_port")   # applied without restarting the watcher
 
 
@@ -276,6 +277,9 @@ def config_problem(cfg):
     for key, (lo, hi) in limits.items():
         if not lo <= cfg[key] <= hi:
             return f"{key} must be between {lo} and {hi}, not {cfg[key]}"
+    for key in WHOLE_NUMBERS:
+        if isinstance(cfg[key], float) and not cfg[key].is_integer():
+            return f"{key} must be a whole number, not {cfg[key]}"
     if page_port(cfg) == cfg["port"]:
         return "status_port must differ from port"
     if cfg["alias"] and not (MODEL_NAME_RE.fullmatch(cfg["alias"]) and len(cfg["alias"]) <= 100):
@@ -341,9 +345,49 @@ def load_config():
     problem = config_problem(cfg)
     if problem:
         die(f"{CONFIG_FILE}: {problem}")
+    for key in WHOLE_NUMBERS:
+        cfg[key] = int(cfg[key])          # `port = 11434.0` in the file is still a port
     cfg["ignore_appids"] = [str(a) for a in cfg["ignore_appids"]]
     cfg["ollama_env"] = {str(k): str(v) for k, v in cfg["ollama_env"].items()}
     return cfg
+
+
+def write_private(path, text):
+    """Replace a file atomically, readable only by you (it can hold passwords and tokens)."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def _value_end(lines, i):
+    """Index of the last line of the value that starts on line i: a list or inline table
+    written over several lines ends where its brackets close."""
+    depth, quote = 0, None
+    for j in range(i, len(lines)):
+        text = lines[j].split("=", 1)[1] if j == i else lines[j]
+        k = 0
+        while k < len(text):
+            c = text[k]
+            if quote:
+                if c == "\\" and quote == '"':
+                    k += 1
+                elif c == quote:
+                    quote = None
+            elif c in "\"'":
+                quote = c
+            elif c == "#":
+                break
+            elif c in "[{":
+                depth += 1
+            elif c in "]}":
+                depth -= 1
+            k += 1
+        if depth <= 0:
+            return j
+    return i          # unbalanced: leave the rest alone and let the check report it
 
 
 def set_config_values(values):
@@ -363,14 +407,14 @@ def set_config_values(values):
         for i, line in enumerate(lines[:first_table]):
             name = line.split("=", 1)[0].strip().strip("\"'")
             if "=" in line and name == key and not line.lstrip().startswith("#"):
-                lines[i] = f"{key} = {rendered}"
+                end = _value_end(lines, i)
+                lines[i:end + 1] = [f"{key} = {rendered}"]
+                first_table -= end - i
                 break
         else:
             lines.insert(first_table, f"{key} = {rendered}")
             first_table += 1
-    tmp = CONFIG_FILE.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n")
-    os.replace(tmp, CONFIG_FILE)
+    write_private(CONFIG_FILE, "\n".join(lines) + "\n")
 
 
 def set_env_value(name, value):
@@ -397,9 +441,32 @@ def set_env_value(name, value):
     else:
         if value != "":
             lines.insert(end, rendered)
-    tmp = CONFIG_FILE.with_suffix(".tmp")
-    tmp.write_text("\n".join(lines) + "\n")
-    os.replace(tmp, CONFIG_FILE)
+    write_private(CONFIG_FILE, "\n".join(lines) + "\n")
+
+
+def change_settings(values=None, env=None):
+    """Write settings, then check the whole file the way the watcher will read it. On any
+    problem the file is put back exactly as it was and this stops with the reason, so a
+    bad value never sits in the file waiting for the next restart."""
+    before = CONFIG_FILE.read_text()
+    try:
+        if env:
+            set_env_value(*env)
+        if values:
+            set_config_values(values)
+        cfg = load_config()                      # stops with the reason if it's broken
+        # load_config forgives old values (it clamps or converts them); a value being set
+        # now must be valid as written.
+        with open(CONFIG_FILE, "rb") as f:
+            raw = tomllib.load(f)
+        problem = config_problem(dict(cfg, **{k: raw[k] for k in values or {} if k in raw}))
+        if problem:
+            die(problem)
+        return cfg
+    except SystemExit:
+        write_private(CONFIG_FILE, before)
+        print("Nothing changed.", file=sys.stderr)
+        raise
 
 
 def parse_setting(key, text):
@@ -414,12 +481,14 @@ def parse_setting(key, text):
         raise ValueError(f"{key} must be true or false")
     if isinstance(default, int):
         try:
-            return int(text)
+            number = float(text)
         except ValueError:
-            try:
-                return float(text)
-            except ValueError:
-                raise ValueError(f"{key} must be a number") from None
+            raise ValueError(f"{key} must be a number") from None
+        if number.is_integer() and "." not in text.strip() or key in WHOLE_NUMBERS:
+            if not number.is_integer():
+                raise ValueError(f"{key} must be a whole number")
+            return int(number)
+        return number
     if isinstance(default, list):
         return [x.strip() for x in text.split(",") if x.strip()]
     return text
@@ -1089,12 +1158,25 @@ def alias_record():
         return {}
 
 
-def save_alias_record(name, digest):
+def save_alias_record(name, digest, *also):
+    """`also`: other digests the copy may have, while it's being repointed (a copy that
+    fails halfway must not leave the name looking like someone else's model)."""
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        ALIAS_FILE.write_text(json.dumps({"name": name, "digest": digest}))
+        ALIAS_FILE.write_text(json.dumps({"name": name, "digest": digest,
+                                          "digests": [d for d in (digest, *also) if d]}))
     except OSError:
         pass
+
+
+def alias_owns(rec, digest):
+    """Is a model with this digest the fixed-name copy gpu-yield made?"""
+    return bool(digest) and digest in set(rec.get("digests") or []) | {rec.get("digest")}
+
+
+def tag_name(m):
+    """A model's name in Ollama's /api/tags list (some versions only fill in "model")."""
+    return m.get("name") or m.get("model") or ""
 
 
 def same_model(a, b):
@@ -1351,7 +1433,7 @@ a { color:inherit; }
 "use strict";
 const $ = id => document.getElementById(id);
 const KEY = "gpu-yield-password";
-let pw = null, snap = JSON.parse($("initial").textContent), models = null, busy = false;
+let pw = null, snap = JSON.parse($("initial").textContent), models = null, modelsError = "", busy = false;
 let ctxChoice = null, modelsKey = "", jobsKey = "", eventsKey = "", speedKey = "", tick = 0, allEvents = false, lastSpeed = null;   // unapplied dropdown choice; last drawn lists
 try { pw = localStorage.getItem(KEY); } catch (e) {}
 
@@ -1365,7 +1447,8 @@ function el(tag, attrs, ...kids) {
 }
 function ago(t) {
   const s = Math.max(0, Math.round(Date.now() / 1000 - t));
-  return s < 90 ? s + "s" : s < 5400 ? Math.round(s / 60) + "m" : Math.floor(s / 3600) + "h " + Math.round(s % 3600 / 60) + "m";
+  const m = Math.floor(s / 60);
+  return s < 90 ? s + "s" : s < 5400 ? Math.round(s / 60) + "m" : Math.floor(m / 60) + "h " + m % 60 + "m";
 }
 function gb1(bytes) { return (bytes / 1073741824).toFixed(1); }   // GiB, as cards and RAM are sold
 function gb(bytes) { return bytes < 1e9 ? Math.max(1, Math.round(bytes / 1e6)) + " MB" : (bytes / 1e9).toFixed(bytes >= 1e10 ? 0 : 1) + " GB"; }
@@ -1431,7 +1514,7 @@ function renderControls() {
   $("ctxapply").disabled = busy;
 
   // Redraw the lists only when they change, so a button isn't replaced under a tap or focus.
-  const mk = JSON.stringify([models, s.model, busy]);
+  const mk = JSON.stringify([models, modelsError, s.model, busy]);
   if (mk !== modelsKey) { modelsKey = mk; drawModels(s); }
   $("disk").textContent = models && models.disk_free ? gb(models.disk_free) + " free on the drive that holds " + models.models_dir : "";
   const jk = JSON.stringify(s.downloads || []);
@@ -1466,14 +1549,14 @@ function drawSpeeds(s) {
 
 function drawModels(s) {
   const list = $("models");
-  if (!models) { list.replaceChildren(el("li", {}, el("span", { class: "muted" }, "Loading…"))); }
+  if (!models) { list.replaceChildren(el("li", {}, el("span", { class: "muted" }, modelsError || "Loading…"))); }
   else if (!models.models.length) {
     list.replaceChildren(el("li", {}, el("span", { class: "muted" }, models.available ? "No models downloaded yet." : "Shown when the AI is running.")));
   } else {
     list.replaceChildren(...models.models.map(m => {
       const inUse = same(m.name, s.model);
       const tags = [el("span", { class: "tag" }, gb(m.size))];
-      if (models.vram_gb && m.size / 1e9 > models.vram_gb) tags.push(el("span", { class: "tag", title: "Bigger than this PC's video memory; part of it runs from system RAM" }, "> VRAM"));
+      if (models.vram_gb && m.size / 1073741824 > models.vram_gb) tags.push(el("span", { class: "tag", title: "Bigger than this PC's video memory; part of it runs from system RAM" }, "> VRAM"));
       if (inUse) tags.push(el("span", { class: "tag on" }, "in use"));
       return el("li", {}, el("span", { class: "name" }, m.name), ...tags,
         inUse ? "" : el("button", { type: "button", disabled: busy, onclick: () => act("model", { name: m.name }, "Switching to " + m.name + "…") }, "Use"),
@@ -1524,7 +1607,9 @@ async function refresh(withModels) {
     renderStatus(snap);
     if (pw && snap.controls && (withModels || !models)) {
       const m = await fetch("/api/models", { cache: "no-store" });
-      models = await m.json();
+      const d = await m.json();
+      models = m.ok ? d : null;
+      modelsError = m.ok ? "" : "Couldn't list the models: " + (d.error || "error " + m.status);
     }
   } catch (e) { $("headline").textContent = "Can't reach the PC"; $("dot").className = "dot"; }
   renderControls();
@@ -1677,10 +1762,13 @@ class StatusServer:
                 self._send(405, {"error": "cross-site requests aren't allowed"})
 
         try:
-            server = PageServer(("0.0.0.0", self.port), Handler)
-        except OSError as e:
-            log(f"status page could not use port {self.port}: {e}")
-            return False
+            server = PageServer6(("::", self.port), Handler)
+        except OSError:                      # IPv6 turned off on this PC: IPv4 only
+            try:
+                server = PageServer(("0.0.0.0", self.port), Handler)
+            except OSError as e:
+                log(f"status page could not use port {self.port}: {e}")
+                return False
         server.daemon_threads = True
         self.server = server
         threading.Thread(target=server.serve_forever, name="status-page", daemon=True).start()
@@ -1705,34 +1793,99 @@ class StatusServer:
             return True
         except ValueError:
             pass
-        me = socket.gethostname().lower().split(".", 1)[0]
-        return host in ("localhost", me) or host.split(".", 1)[0] == me
+        host = host.rstrip(".")
+        full = socket.gethostname().lower()
+        me = full.split(".", 1)[0]
+        if host in ("localhost", me, full):
+            return True
+        # Not "<name>.anything": a website could point <name>.its-own-domain.com at this
+        # PC (DNS rebinding). Only domains that can't be bought or that your network uses.
+        name, _, domain = host.partition(".")
+        return name == me and (domain in LOCAL_DOMAINS or domain in search_domains())
+
+
+LOCAL_DOMAINS = {"local", "lan", "home", "home.arpa", "localdomain", "internal", "localhost"}
+
+
+def search_domains():
+    """Your network's own domains (from DHCP, via /etc/resolv.conf), e.g. "fritz.box"."""
+    out = set()
+    for line in _read_text(Path("/etc/resolv.conf")).splitlines():
+        parts = line.split()
+        if parts and parts[0] in ("search", "domain"):
+            out.update(d.lower().rstrip(".") for d in parts[1:])
+    return out
 
 
 class PageServer(ThreadingHTTPServer):
-    """At most MAX_CLIENTS connections at a time, so a flood can't exhaust the PC."""
+    """At most MAX_CLIENTS connections at a time and PER_CLIENT from one address, each cut
+    off after DEADLINE seconds however slowly it trickles in, so neither a flood nor a few
+    deliberately slow connections can take the page away from everyone else."""
     request_queue_size = 64
     MAX_CLIENTS = 32
+    PER_CLIENT = 6
+    DEADLINE = 15
 
     def __init__(self, *args, **kw):
         self.slots = threading.BoundedSemaphore(self.MAX_CLIENTS)
+        self.per_ip = collections.Counter()
+        self.ip_lock = threading.Lock()
         super().__init__(*args, **kw)
 
     def process_request(self, request, client_address):
-        if not self.slots.acquire(blocking=False):
+        ip = client_address[0]
+        with self.ip_lock:
+            crowded = self.per_ip[ip] >= self.PER_CLIENT
+            if not crowded:
+                self.per_ip[ip] += 1
+        if crowded or not self.slots.acquire(blocking=False):
+            if not crowded:
+                self._leave(ip)
             self.shutdown_request(request)
             return
         try:
             super().process_request(request, client_address)
         except Exception:
             self.slots.release()
+            self._leave(ip)
             raise
 
+    def _leave(self, ip):
+        with self.ip_lock:
+            self.per_ip[ip] -= 1
+            if self.per_ip[ip] <= 0:
+                del self.per_ip[ip]
+
     def process_request_thread(self, request, client_address):
+        def cut():
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+        timer = threading.Timer(self.DEADLINE, cut)
+        timer.daemon = True
+        timer.start()
         try:
             super().process_request_thread(request, client_address)
         finally:
+            timer.cancel()
             self.slots.release()
+            self._leave(client_address[0])
+
+
+    def handle_error(self, request, client_address):
+        if isinstance(sys.exc_info()[1], OSError):   # a visitor hung up or was cut off
+            return
+        super().handle_error(request, client_address)
+
+
+class PageServer6(PageServer):
+    """The same, on IPv6 and IPv4 at once."""
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        super().server_bind()
 
 
 def render_status_page(snapshot):
@@ -1779,6 +1932,7 @@ class Watcher:
         self.speed_mtime = None
         self.alias_problem = ""
         self.actions = queue.Queue()     # changes requested from the page, applied by run()
+        self.switching_to = None         # model being switched to right now
         self.downloads = {}              # model name -> progress of a download
         self.dl_lock = threading.Lock()
         self.auth_lock = threading.Lock()
@@ -1787,7 +1941,7 @@ class Watcher:
         self.wine_since = None
         self.last_used = None
         self.mac = nic_info()[1]
-        self.next_update_check = time.monotonic() + 15 * 60   # first check 15 min after start
+        self.next_update_check = time.clock_gettime(time.CLOCK_BOOTTIME) + 15 * 60   # first check 15 min after start
         self.updating = False
 
     # --- transitions
@@ -1866,11 +2020,12 @@ class Watcher:
             if alias:
                 # Point the fixed name at this model and load it under that name, so apps
                 # using it get the loaded model with no reload. Copies share the files.
-                if not any(same_model(m.get("name") or m.get("model", ""), model) for m in tags):
+                if not any(same_model(tag_name(m), model) for m in tags):
                     raise urllib.error.HTTPError(self.ollama.base, 404, "not found", None, None)
-                existing = next((m for m in tags
-                                 if same_model(m.get("name") or m.get("model", ""), alias)), None)
-                if existing and existing.get("digest") != alias_record().get("digest"):
+                existing = next((m for m in tags if same_model(tag_name(m), alias)), None)
+                rec = alias_record()
+                if existing and not (same_model(rec.get("name", ""), alias)
+                                     and alias_owns(rec, existing.get("digest"))):
                     # A model with this name that gpu-yield didn't make: never overwrite it.
                     self.alias_problem = (f"a model named {alias} already exists, so gpu-yield "
                                           f"won't overwrite it. Choose another fixed name: "
@@ -1878,11 +2033,14 @@ class Watcher:
                     self.event(self.alias_problem, "error")
                 else:
                     try:
+                        # A copy has its source's digest. Record it first, keeping the old
+                        # one too, so an interruption at any point leaves the name ours.
+                        source = next(m for m in tags if same_model(tag_name(m), model))
+                        save_alias_record(alias, source.get("digest"),
+                                          *(existing.get("digest"),) if existing else ())
                         self.ollama.request("/api/copy", {"source": model, "destination": alias},
                                             timeout=60)
-                        made = next((m for m in self.ollama.request("/api/tags", timeout=10)
-                                     .get("models", []) if same_model(m.get("name", ""), alias)), {})
-                        save_alias_record(alias, made.get("digest"))
+                        save_alias_record(alias, source.get("digest"))
                         target = alias
                     except urllib.error.HTTPError as e:
                         if e.code == 404:
@@ -1964,14 +2122,17 @@ class Watcher:
         if now - self.last_health < 15:
             return
         self.last_health = now
-        settling = now - self.last_restart < 60
+        # A fresh start gets as long as the warmup waits for it (90 s) before silence counts.
+        settling = now - self.last_restart < 120
         if not self.ollama.active():
             if now - self.last_restart >= 30:
                 self.go_on("Ollama is not running; restarting it")
             return
         if not self.ollama.ready():
+            if settling:
+                return
             self.ping_failures += 1
-            if self.ping_failures >= 3 and not settling:
+            if self.ping_failures >= 3:
                 self.ollama.stop()
                 self.go_on("Ollama stopped answering for 45s; restarting it")
             return
@@ -2042,8 +2203,8 @@ class Watcher:
         old = rec.get("name")
         if not old or (current and same_model(old, current)):
             return
-        entry = next((m for m in tags if same_model(m.get("name") or m.get("model", ""), old)), None)
-        if entry and entry.get("digest") == rec.get("digest"):
+        entry = next((m for m in tags if same_model(tag_name(m), old)), None)
+        if entry and alias_owns(rec, entry.get("digest")):
             try:
                 self.ollama.request("/api/delete", {"model": old}, method="DELETE", timeout=30)
                 self.event(f"removed the old fixed name {old}")
@@ -2210,6 +2371,13 @@ class Watcher:
         if self.cfg["alias"] and same_model(name, self.cfg["alias"]):
             return 409, {"error": f"{name} is the fixed name for your apps, not a separate "
                                   "model; it takes no extra space"}
+        with self.actions.mutex:
+            about_to_use = [v for k, v in self.actions.queue if k == "model"] + [self.switching_to]
+        about_to_use += [j["name"] for j in list(self.downloads.values())
+                         if j["use"] and j["state"] == "running"]
+        if any(m and same_model(name, m) for m in about_to_use):
+            return 409, {"error": f"{name} is about to become the model in use. "
+                                  "Switch to another one first."}
         if self.state != "ai" or not self.ollama.ready():
             return 409, {"error": "Deleting needs the AI running. Try again when no game is "
                                   "running and the AI isn't paused."}
@@ -2300,17 +2468,18 @@ class Watcher:
         several clicks collapse into their latest values, so the loop gets back to
         checking for games quickly."""
         latest = {}
-        while True:
-            try:
-                kind, value = self.actions.get_nowait()
-            except queue.Empty:
-                break
-            latest[{"model": "model", "context": "context_length"}[kind]] = value
+        with self.actions.mutex:         # taken together with switching_to: see _api_delete
+            for kind, value in self.actions.queue:
+                latest[{"model": "model", "context": "context_length"}[kind]] = value
+            self.actions.queue.clear()
+            self.switching_to = latest.get("model")
         if latest:
             try:
                 self.apply_settings(latest)
             except Exception as e:
                 self.event(f"couldn't apply {latest} from the status page: {e!r}")
+            finally:
+                self.switching_to = None
 
     def apply_settings(self, values):
         """Change only these settings, keeping everything else as the watcher runs it.
@@ -2342,7 +2511,7 @@ class Watcher:
         if not wine:
             self.wine_since = None
             return games
-        if self.state == "gaming":
+        if self.state in ("gaming", "cooldown"):   # Ollama is already off: no need to wait
             return games
         if self.wine_since is None:
             self.wine_since = now
@@ -2350,13 +2519,20 @@ class Watcher:
             return games
         return {pid: label for pid, label in games.items() if pid not in wine}
 
-    def maybe_auto_update(self, now):
-        """Once a day (if enabled), install updates while nothing is going on."""
+    def busy(self):
+        """Something the update's restart would cut off: a download, a speed test, a load."""
+        return self.warming or self.speed["state"] == "running" or \
+            any(j["state"] == "running" for j in list(self.downloads.values()))
+
+    def maybe_auto_update(self, _now=None):
+        """Once a day (if enabled), install updates while nothing is going on. Timed on the
+        boot clock, which keeps counting while the PC sleeps: "a day" means a day."""
+        now = time.clock_gettime(time.CLOCK_BOOTTIME)
         mode = self.cfg["auto_update"]
         if mode == "off" or self.updating or now < self.next_update_check:
             return
         idle = self.last_used is None or time.time() - self.last_used > 15 * 60
-        if self.state != "ai" or self.in_use or not idle:
+        if self.state != "ai" or self.in_use or not idle or self.busy():
             self.next_update_check = now + 30 * 60     # busy: look again in half an hour
             return
         self.next_update_check = now + 24 * 3600
@@ -2387,8 +2563,8 @@ class Watcher:
             if not todo:
                 return
             # The checks above took a while; make sure nothing started in the meantime.
-            if self.state != "ai" or self.in_use or game_running(self.cfg):
-                self.next_update_check = time.monotonic() + 30 * 60
+            if self.state != "ai" or self.in_use or self.busy() or game_running(self.cfg):
+                self.next_update_check = time.clock_gettime(time.CLOCK_BOOTTIME) + 30 * 60
                 return
             # The update restarts this watcher, so it has to run outside the watcher's
             # own service: a transient unit of its own.
@@ -2478,7 +2654,8 @@ class Watcher:
         self.event(f"gpu-yield {VERSION} watching for games (model {self.cfg['model']}, "
             f"context {self.cfg['context_length']}, cooldown {self.cfg['cooldown_seconds']}s)")
         self.sync_page()
-        config_seen = self.config_mtime()
+        config_seen = None    # check once on the first pass: the file may have changed
+                              # while this watcher was starting
         poll = max(0.5, float(self.cfg["poll_seconds"]))
         mono0, boot0 = time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
         while not self.stop_evt.is_set():
@@ -2713,7 +2890,9 @@ def split_host(target):
 
 def host_key(host, port):
     """How a PC is stored in the wake cache: just the name unless the port is unusual."""
-    return host if port == DEFAULTS["status_port"] else f"{host}:{port}"
+    if port == DEFAULTS["status_port"]:
+        return host
+    return f"[{host}]:{port}" if ":" in host else f"{host}:{port}"
 
 
 def fetch_remote_status(host, port, timeout=4):
@@ -2810,21 +2989,24 @@ def cmd_wake(args):
         return
     print("Waiting for it to come up", end="", flush=True)
     end = time.time() + 120
+    answered = False          # refused = network up, but gpu-yield not started (yet)
     while time.time() < end:
         time.sleep(3)
         print(".", end="", flush=True)
         try:
             st = fetch_remote_status(host, port, timeout=2)
         except OSError as e:
-            if refused(e):
-                print(" awake (its status page is off, so the AI's state isn't known).")
-                return
+            answered = answered or refused(e)
             continue
         except ValueError:
             continue
         print(f" awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
         return
     print()
+    if answered:
+        print(f"{host} is awake, but its status page never answered: it's turned off there, "
+              "or gpu-yield isn't running.")
+        return
     die(f"no answer from {host} after 2 minutes. On that PC, check Wake-on-LAN with "
         "gpu-yield wol, and that it's enabled in the BIOS/UEFI.")
 
@@ -3316,6 +3498,9 @@ def cmd_model(args):
         if not name:
             print("No change.")
             return
+    if cfg["alias"] and same_model(cfg["alias"], name):
+        die(f"{name} is the fixed name gpu-yield gives the loaded model for your apps; choose "
+            f"the real model, or change that name first: gpu-yield config alias OTHER-NAME")
     o = Ollama(cfg)
     if not o.ready():
         st = read_status() or {}
@@ -3323,9 +3508,8 @@ def cmd_model(args):
             "Try again when no game is running and gpu-yield isn't paused.")
     if not pull_and_load(cfg, name):
         sys.exit(1)
-    set_config_values({"model": name})
+    alias = change_settings({"model": name})["alias"]
     user_systemctl("restart", WATCHER_UNIT)   # the watcher picks up the new model
-    alias = load_config()["alias"]
     print(f"\nNow using {name}." + (f" Apps set to use {alias} follow automatically."
                                     if alias else f" Set your AI apps to use {name} too."))
     if old and old != name:
@@ -3375,22 +3559,14 @@ def cmd_config(args):
         die(f"unknown setting {key!r}; run gpu-yield config to list them")
     if key == "control_password" and args.value and len(args.value) < 8:
         die("use at least 8 characters for the control password; nothing changed")
-    before = CONFIG_FILE.read_text()
     if key.startswith("env."):
-        set_env_value(key[4:], args.value)
+        cfg = change_settings(env=(key[4:], args.value))
     else:
         try:
-            set_config_values({key: parse_setting(key, args.value)})
+            value = parse_setting(key, args.value)
         except ValueError as e:
             die(f"{e}; nothing changed")
-    try:
-        cfg = load_config()
-    except SystemExit:
-        tmp = CONFIG_FILE.with_suffix(".tmp")
-        tmp.write_text(before)
-        os.replace(tmp, CONFIG_FILE)
-        print("Nothing changed.")
-        sys.exit(1)
+        cfg = change_settings({key: value})
     shown = json.dumps(cfg["ollama_env"].get(key[4:], "")) if key.startswith("env.") \
         else ('"(set)"' if cfg[key] else '""') if key in SECRET_SETTINGS else fmt_setting(cfg[key])
     print(f"{key} = {shown}")
@@ -3439,18 +3615,15 @@ def cmd_setup(args):
     log("1/8 Config")
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     if not CONFIG_FILE.exists():
-        CONFIG_FILE.write_text(CONFIG_TEMPLATE)
+        write_private(CONFIG_FILE, CONFIG_TEMPLATE)
         log(f"  wrote {CONFIG_FILE}")
     overrides = {k: v for k, v in (("model", args.model), ("context_length", args.context),
                                    ("backend", args.backend)) if v is not None}
-    if overrides:
-        set_config_values(overrides)
-    cfg = load_config()
+    cfg = change_settings(overrides) if overrides else load_config()
     if not cfg["model"]:
         choice = choose_model(args)
         if choice:
-            set_config_values({"model": choice})
-            cfg = load_config()
+            cfg = change_settings({"model": choice})
     managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
     log(f"  model {cfg['model'] or 'none yet'}, context {cfg['context_length']}, "
         f"backend {resolve_backend(cfg)}" + (" (auto)" if cfg["backend"] == "auto" else ""))
@@ -3459,14 +3632,20 @@ def cmd_setup(args):
     check_conflicts(args)
 
     log("3/8 Ollama")
-    if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0:
+    was_running = user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0
+    if was_running:
         user_systemctl("stop", WATCHER_UNIT)
-    if not managed:
-        log(f"  using your own unit {cfg['ollama_unit']}")
-    elif OLLAMA_BIN.exists() and not args.reinstall:
-        log(f"  already installed at {OLLAMA_DIR} (--reinstall to update)")
-    else:
-        install_ollama(resolve_backend(cfg))
+    try:
+        if not managed:
+            log(f"  using your own unit {cfg['ollama_unit']}")
+        elif OLLAMA_BIN.exists() and not args.reinstall:
+            log(f"  already installed at {OLLAMA_DIR} (--reinstall to update)")
+        else:
+            install_ollama(resolve_backend(cfg))
+    except BaseException:
+        if was_running:              # a failed reinstall keeps the old Ollama; keep the AI too
+            user_systemctl("start", WATCHER_UNIT)
+        raise
 
     log("4/8 Services")
     BIN_DIR.mkdir(parents=True, exist_ok=True)
@@ -3527,8 +3706,8 @@ def cmd_uninstall(args):
         o = Ollama(cfg)
         try:
             entry = next((m for m in o.request("/api/tags", timeout=5).get("models", [])
-                          if same_model(m.get("name", ""), rec["name"])), None)
-            if entry and entry.get("digest") == rec.get("digest"):
+                          if same_model(tag_name(m), rec["name"])), None)
+            if entry and alias_owns(rec, entry.get("digest")):
                 o.request("/api/delete", {"model": rec["name"]}, method="DELETE", timeout=30)
                 print(f"Removed the fixed name {rec['name']} from Ollama.")
         except Exception:
@@ -3597,6 +3776,8 @@ def fetch_latest(cfg):
         die(f"GitHub error {e.code}: {http_error_detail(e)}")
     except urllib.error.URLError as e:
         die(f"could not reach GitHub: {e.reason}")
+    except (OSError, http.client.HTTPException) as e:   # connection dropped mid-download
+        die(f"the download from GitHub was cut off ({e!r}); try again")
     return repo, data
 
 
@@ -3733,6 +3914,8 @@ def cmd_update(args):
     if os.geteuid() == 0:
         die("run as your normal user, not with sudo")
     if args.file:
+        if args.check or args.ollama:
+            die("--file installs that file; it can't be combined with --check or --ollama")
         update_from_file(args.file)
         return
     cfg = load_config()
@@ -3775,6 +3958,10 @@ def cmd_update(args):
     if args.ollama:
         if not managed:
             log("Ollama is managed outside gpu-yield; update it the way you installed it")
+        elif not o_installed and not args.force:
+            log("Ollama isn't installed; install it with: gpu-yield setup --reinstall")
+        elif not o_latest and not args.force:
+            log(f"couldn't check for a newer Ollama (you have {o_installed}); try again later")
         elif not o_newer and not args.force:
             log(f"Ollama {o_installed} is up to date")
         elif args.if_idle and game_running(cfg):
