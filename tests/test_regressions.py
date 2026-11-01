@@ -110,7 +110,9 @@ assert not allowed(f"{me}.attacker.example") and not allowed(f"{me}.local.attack
 gy._read_text, real_read = (lambda p: "search fritz.box\n" if str(p) == "/etc/resolv.conf" else real_read(p)), gy._read_text
 assert allowed(f"{me}.fritz.box:11435")
 gy._read_text = real_read
-ok("status page: only this PC's own names count (no <name>.attacker.example)")
+hint = gy.StatusServer(11435, None).host_hint()
+assert f"{me}.local:11435" in hint
+ok("status page: only this PC's own names count (no <name>.attacker.example), with a hint")
 
 # --- status page: slow clients are cut off, and one address can't take every slot
 class W:
@@ -153,7 +155,13 @@ assert code == 409 and "about to become" in body["error"]
 w.actions.queue.clear()
 w.downloads = {"c:1": {"name": "c:1", "state": "running", "use": True}}
 assert w._api_delete({"name": "c:1"})[0] == 409
-ok("can't delete a model that's queued to be used, or downloading to be used")
+w.downloads = {}
+w.api_models = lambda: {"models": [{"name": "b:1"}], "available": True}
+w.deleting.add("b:1")
+assert w._api_model({"name": "b:1"})[0] == 409, "switched to a model being deleted"
+w.deleting.clear()
+assert w._api_model({"name": "b:1"})[0] == 202 and w._api_delete({"name": "b:1"})[0] == 409
+ok("can't delete a model that's queued to be used, or downloading to be used, or vice versa")
 
 # --- wake keeps waiting while the PC boots (refused before the service starts)
 gy.load_hosts = lambda: {"pc": {"mac": "1c:2b:3a:4d:5e:6f"}}

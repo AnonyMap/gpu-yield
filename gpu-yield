@@ -1721,7 +1721,7 @@ class StatusServer:
                     self._send(200, render_status_page(snap), "text/html; charset=utf-8")
                 elif path == "/api/models":
                     if not owner.host_allowed(self.headers.get("Host", "")):
-                        return self._send(421, {"error": "unexpected host name"})
+                        return self._send(421, {"error": owner.host_hint()})
                     self._send(200, owner.watcher.api_models())
                 else:
                     self._send(404, {"error": "not found"})
@@ -1735,7 +1735,7 @@ class StatusServer:
                 # A website can make a browser send requests to this page under a name the
                 # website controls (DNS rebinding); real visitors use the PC's name or IP.
                 if not owner.host_allowed(self.headers.get("Host", "")):
-                    return self._send(421, {"error": "unexpected host name"})
+                    return self._send(421, {"error": owner.host_hint()})
                 # JSON only: a plain HTML form on another site can't send this content type
                 # (or the password header) without the browser asking first, and we don't
                 # answer that question.
@@ -1755,20 +1755,20 @@ class StatusServer:
                     return self._send(400, {"error": "bad JSON"})
                 # The page percent-encodes the password so any characters survive HTTP headers.
                 password = urllib.parse.unquote(self.headers.get("X-GPU-Yield-Password", ""))
+                self.server.request_read(self.request)
                 code, reply = owner.watcher.api(path[len("/api/"):], data, password)
                 self._send(code, reply)
 
             def do_OPTIONS(self):
                 self._send(405, {"error": "cross-site requests aren't allowed"})
 
+        # IPv4 only, like Ollama's port: `gpu-yield firewall` limits IPv4 to your network,
+        # but IPv6 addresses are often reachable from the internet with no NAT in between.
         try:
-            server = PageServer6(("::", self.port), Handler)
-        except OSError:                      # IPv6 turned off on this PC: IPv4 only
-            try:
-                server = PageServer(("0.0.0.0", self.port), Handler)
-            except OSError as e:
-                log(f"status page could not use port {self.port}: {e}")
-                return False
+            server = PageServer(("0.0.0.0", self.port), Handler)
+        except OSError as e:
+            log(f"status page could not use port {self.port}: {e}")
+            return False
         server.daemon_threads = True
         self.server = server
         threading.Thread(target=server.serve_forever, name="status-page", daemon=True).start()
@@ -1779,6 +1779,13 @@ class StatusServer:
             self.server.shutdown()
             self.server.server_close()
             self.server = None
+
+    def host_hint(self):
+        ip, _ = lan_address()
+        me = socket.gethostname().split(".", 1)[0]
+        where = f" (http://{ip}:{self.port}/)" if ip else ""
+        return (f"the controls only work when this page is opened as http://{me}.local:{self.port}/ "
+                f"or by the PC's IP address{where}, since another name could belong to a website")
 
     @staticmethod
     def host_allowed(host_header):
@@ -1830,6 +1837,7 @@ class PageServer(ThreadingHTTPServer):
         self.slots = threading.BoundedSemaphore(self.MAX_CLIENTS)
         self.per_ip = collections.Counter()
         self.ip_lock = threading.Lock()
+        self.timers = {}
         super().__init__(*args, **kw)
 
     def process_request(self, request, client_address):
@@ -1850,6 +1858,13 @@ class PageServer(ThreadingHTTPServer):
             self._leave(ip)
             raise
 
+    def request_read(self, request):
+        """The whole request is in: the deadline was for reading it, not for the work it
+        asks for (deleting a model can take Ollama longer)."""
+        timer = self.timers.get(request)
+        if timer:
+            timer.cancel()
+
     def _leave(self, ip):
         with self.ip_lock:
             self.per_ip[ip] -= 1
@@ -1864,11 +1879,13 @@ class PageServer(ThreadingHTTPServer):
                 pass
         timer = threading.Timer(self.DEADLINE, cut)
         timer.daemon = True
+        self.timers[request] = timer
         timer.start()
         try:
             super().process_request_thread(request, client_address)
         finally:
             timer.cancel()
+            self.timers.pop(request, None)
             self.slots.release()
             self._leave(client_address[0])
 
@@ -1878,14 +1895,6 @@ class PageServer(ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
-
-class PageServer6(PageServer):
-    """The same, on IPv6 and IPv4 at once."""
-    address_family = socket.AF_INET6
-
-    def server_bind(self):
-        self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
-        super().server_bind()
 
 
 def render_status_page(snapshot):
@@ -1933,6 +1942,10 @@ class Watcher:
         self.alias_problem = ""
         self.actions = queue.Queue()     # changes requested from the page, applied by run()
         self.switching_to = None         # model being switched to right now
+        # Held while deciding which model will be in use, and while a delete checks that
+        # its model isn't one of them. Never held across a slow call.
+        self.model_lock = threading.Lock()
+        self.deleting = set()
         self.downloads = {}              # model name -> progress of a download
         self.dl_lock = threading.Lock()
         self.auth_lock = threading.Lock()
@@ -2276,7 +2289,10 @@ class Watcher:
         if not any(same_model(name, m) for m in installed):
             raise ValueError(f"{name} isn't downloaded yet; download it first")
         name = next((m for m in installed if same_model(name, m)), name)
-        self.actions.put(("model", name))
+        with self.model_lock:
+            if any(same_model(name, d) for d in self.deleting):
+                return 409, {"error": f"{name} is being deleted"}
+            self.actions.put(("model", name))
         when = "" if self.state == "ai" else " It loads when the AI is back on."
         apps = f"Apps using {self.cfg['alias']} follow automatically." if self.cfg["alias"] \
             else f"Set your AI apps to use {name} too."
@@ -2366,27 +2382,35 @@ class Watcher:
 
     def _api_delete(self, data):
         name = normalize_model_name(data.get("name"))
-        if same_model(name, self.cfg["model"]):
-            return 409, {"error": "That's the model in use. Switch to another one first."}
         if self.cfg["alias"] and same_model(name, self.cfg["alias"]):
             return 409, {"error": f"{name} is the fixed name for your apps, not a separate "
                                   "model; it takes no extra space"}
-        with self.actions.mutex:
-            about_to_use = [v for k, v in self.actions.queue if k == "model"] + [self.switching_to]
-        about_to_use += [j["name"] for j in list(self.downloads.values())
-                         if j["use"] and j["state"] == "running"]
-        if any(m and same_model(name, m) for m in about_to_use):
-            return 409, {"error": f"{name} is about to become the model in use. "
-                                  "Switch to another one first."}
         if self.state != "ai" or not self.ollama.ready():
             return 409, {"error": "Deleting needs the AI running. Try again when no game is "
                                   "running and the AI isn't paused."}
+        # Everything that can make a model the one in use takes model_lock, so checked
+        # together under it nothing can slip in between the check and the delete.
+        with self.model_lock:
+            with self.actions.mutex:
+                queued = [v for k, v in self.actions.queue if k == "model"]
+            in_use = [self.cfg["model"], self.switching_to, *queued,
+                      *(j["name"] for j in list(self.downloads.values())
+                        if j["use"] and j["state"] == "running")]
+            if same_model(name, self.cfg["model"]):
+                return 409, {"error": "That's the model in use. Switch to another one first."}
+            if any(m and same_model(name, m) for m in in_use):
+                return 409, {"error": f"{name} is about to become the model in use. "
+                                      "Switch to another one first."}
+            self.deleting.add(name)
         try:
             self.ollama.request("/api/delete", {"model": name}, method="DELETE", timeout=30)
         except urllib.error.HTTPError as e:
             return 400, {"error": http_error_detail(e)}
         except OSError:
             return 409, {"error": "Ollama didn't answer (did a game just start?). Try again later."}
+        finally:
+            with self.model_lock:
+                self.deleting.discard(name)
         self.models_cache["at"] = 0
         self.event(f"deleted {name} (from the status page)")
         return 200, {"message": f"Deleted {name}"}
@@ -2446,11 +2470,12 @@ class Watcher:
                         layers[msg["digest"]] = (msg.get("completed", 0), msg["total"])
                         job["completed"] = sum(c for c, _ in layers.values())
                         job["total"] = sum(tot for _, tot in layers.values())
-            job["state"] = "done"
+            with self.model_lock:        # queued before it stops counting as "running"
+                if job["use"]:
+                    self.actions.put(("model", name))
+                job["state"] = "done"
             self.models_cache["at"] = 0
             self.event(f"downloaded {name} (from the status page)")
-            if job["use"]:
-                self.actions.put(("model", name))
         except Exception as e:
             job["state"] = "failed"
             if self.state != "ai":
@@ -2468,10 +2493,13 @@ class Watcher:
         several clicks collapse into their latest values, so the loop gets back to
         checking for games quickly."""
         latest = {}
-        with self.actions.mutex:         # taken together with switching_to: see _api_delete
-            for kind, value in self.actions.queue:
+        with self.model_lock:            # see _api_delete
+            while True:
+                try:
+                    kind, value = self.actions.get_nowait()
+                except queue.Empty:
+                    break
                 latest[{"model": "model", "context": "context_length"}[kind]] = value
-            self.actions.queue.clear()
             self.switching_to = latest.get("model")
         if latest:
             try:
@@ -2479,7 +2507,8 @@ class Watcher:
             except Exception as e:
                 self.event(f"couldn't apply {latest} from the status page: {e!r}")
             finally:
-                self.switching_to = None
+                with self.model_lock:
+                    self.switching_to = None
 
     def apply_settings(self, values):
         """Change only these settings, keeping everything else as the watcher runs it.

@@ -203,7 +203,7 @@ gpu-yield status --host gaming-pc.local   # that PC's status
 gpu-yield wake gaming-pc.local            # wake it up and wait until the AI answers
 ```
 
-`--host` accepts a name, an IP address, `name:port`, an IPv6 address in brackets, or the status page URL pasted as-is.
+`--host` accepts a name, an IP address, `name:port`, or the status page URL pasted as-is. The page listens on IPv4 only, because `gpu-yield firewall` limits IPv4 to your local network, while IPv6 addresses are often reachable from the internet.
 
 For anything else, use SSH, for example `ssh gaming-pc.local gpu-yield update`. Setting up an SSH key (`ssh-copy-id`) saves typing a password each time.
 

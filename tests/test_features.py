@@ -139,7 +139,7 @@ gy.run = lambda cmd, **kw: started.append(cmd) or types.SimpleNamespace(returnco
 newer = gy.VERSION.rsplit(".", 1)[0] + "." + str(int(gy.VERSION.rsplit(".", 1)[1]) + 1)
 gy.fetch_latest = lambda cfg: ("me/gy", f'VERSION = "{newer}"\n'.encode())
 w = gy.Watcher(dict(gy.DEFAULTS, auto_update="gpu-yield", port=1))
-w.state, now = "ai", time.monotonic()
+w.state, now = "ai", time.clock_gettime(time.CLOCK_BOOTTIME)
 
 def attempt(**state):
     for k, v in state.items():

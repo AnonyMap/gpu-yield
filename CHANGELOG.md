@@ -12,7 +12,6 @@ Fixes from three independent reviews:
 - `gpu-yield update` gives a message instead of a Python error when the connection drops mid-download.
 - Status page: a website could reach the controls through your browser using a name like `<your-pc>.example.com`. Only the PC's own local names are accepted now.
 - Status page: a few deliberately slow connections could keep it unreachable. Each request now has 15 seconds, and one device can have at most 6 connections open.
-- Status page: answers over IPv6 too.
 - Status page: a model chosen to switch to, or downloading with "use it" ticked, can no longer be deleted in the moment before the switch happens.
 - Status page: the model list says why if it can't load, instead of showing "Loading…" forever. The "> VRAM" tag compares sizes in the same units. Times no longer show as "1h 60m".
 - `wake` keeps waiting while a PC boots, instead of stopping at the first answer from a PC whose gpu-yield hasn't started yet.
