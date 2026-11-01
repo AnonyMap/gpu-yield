@@ -140,6 +140,8 @@ gpu-yield doctor     # end-to-end check with fixes for anything wrong
 journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
 ```
 
+**If the model won't load because the GPU is out of memory**, run `gpu-yield restart` (or *Restart the AI* on the status page). It unloads the model, stops Ollama, waits until the driver reports the memory free again, and loads the model again. It also lists any other program still holding GPU memory, such as `gamescope-wl 900 MB, someapp 2.1 GB`. Steam's own interface (`gamescope`) normally holds a few hundred MB to about 2 GB. Anything big beyond that is what's crowding the model out, and a restart can't free it: close that program, or choose a smaller context. gpu-yield also does one restart by itself when a load runs out of memory, and if that doesn't help, it says what's holding the memory instead of retrying. `gpu-yield doctor` lists the programs using GPU memory at any time.
+
 `status` shows games by name, for example `The Riftbreaker (AppId 1820000)`, including non-Steam shortcuts.
 
 **Status page.** Open `http://<gaming-pc>:11435` in any browser, including a phone. It shows whether the AI is ready, which game is running, when the AI was last used, and anything worth fixing, and updates live. With a control password set, it can also change things ([Controls on the status page](#controls-on-the-status-page)).
@@ -175,6 +177,7 @@ With a control password set, the status page can also manage the AI, from any br
   - a Hugging Face GGUF repo, such as `hf.co/user/repo` or `hf.co/user/repo:Q4_K_M` to choose the quantization, or its huggingface.co link
 - **Delete models** you no longer need, except the one in use. The page shows the free space on the drive that holds the models (`~/.ollama/models`, or `OLLAMA_MODELS` if you've moved it); other drives in the PC aren't counted, since Ollama doesn't use them.
 - **Pause and resume** the AI.
+- **Restart the AI:** unload the model, free the GPU memory and load it again, with a note of anything else holding GPU memory.
 - **Run a speed test** of the loaded model, and compare it with earlier tests of other models.
 
 The controls are off until you set a password on the gaming PC:
@@ -302,6 +305,7 @@ The watcher checks once a day (time asleep counts) and installs only while no ga
 | `gpu-yield status [--host HOST]` | Current state, here or on another PC |
 | `gpu-yield doctor` | Check the whole setup and suggest fixes |
 | `gpu-yield pause` / `gpu-yield resume` | Keep the AI off until resumed; a pause survives reboots |
+| `gpu-yield restart` | Unload the model, free GPU memory, and load it again, showing what else holds GPU memory |
 | `gpu-yield model [NAME]` | Choose or change the model |
 | `gpu-yield config [KEY [VALUE]]` | Show or change settings |
 | `gpu-yield update [--check] [--ollama] [--file PATH] [--force]` | Update gpu-yield, and optionally Ollama |
