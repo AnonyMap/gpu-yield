@@ -114,6 +114,13 @@ gy.cmd_wake(types.SimpleNamespace(target=target, no_wait=True))
 assert sent == [], "should not wake a PC that's already awake"
 page.stop()
 gy.cmd_wake(types.SimpleNamespace(target=target, no_wait=True))
+assert sent == [], "a refused connection means the PC is awake with its page off"
+real_fetch = gy.fetch_remote_status
+def asleep(*a, **k):                     # a sleeping PC doesn't answer at all
+    raise gy.urllib.error.URLError(TimeoutError("timed out"))
+gy.fetch_remote_status = asleep
+gy.cmd_wake(types.SimpleNamespace(target=target, no_wait=True))
+gy.fetch_remote_status = real_fetch
 assert sent == [("1c:2b:3a:4d:5e:6f", "127.0.0.1")]
 gy.cmd_wake(types.SimpleNamespace(target="AA:BB:CC:DD:EE:FF", no_wait=True))
 assert sent[-1][0] == "AA:BB:CC:DD:EE:FF"
@@ -124,7 +131,7 @@ try:
     raise AssertionError("expected a helpful error")
 except SystemExit:
     pass
-ok("wake: skips an awake PC, uses the remembered MAC when asleep, accepts a MAC directly")
+ok("wake: skips an awake PC (even with its page off), uses the remembered MAC when asleep, accepts a MAC directly")
 
 # --- automatic updates: only when idle, never during games, through systemd-run
 started = []
@@ -230,7 +237,7 @@ probe = ("import os, runpy, sys; del os.getuid; del os.geteuid; "
          "sys.argv = ['gpu-yield', 'status', '--host', '127.0.0.1:1']; "
          f"runpy.run_path({str(gy.__file__)!r}, run_name='__main__')")
 r = subprocess.run([sys.executable, "-B", "-c", probe], capture_output=True, text=True, timeout=30)
-assert r.returncode == 1 and "can't reach 127.0.0.1:1" in r.stderr and "Traceback" not in r.stderr, r.stderr
+assert r.returncode == 1 and "nothing answers on port 1" in r.stderr and "status_page true" in r.stderr and "Traceback" not in r.stderr, r.stderr
 ok("status --host runs on a system without os.getuid (Windows)")
 
 # ---------------------------------------------------------------- 1.8 review fixes
@@ -345,4 +352,11 @@ assert code == 409 and body.get("busy")
 wx.ollama.request = lambda *a, **k: {"prompt_eval_count": 1, "prompt_eval_duration": 1, "eval_count": 1, "eval_duration": 1}
 assert wx.api("speed", {"force": True}, "hunter22")[0] == 202
 ok("speed test: command-line results appear on the page; asks first while the AI is in use")
+# status page switch
+assert gy.config_problem(dict(gy.DEFAULTS, status_page="no")).startswith("status_page must be true or false")
+assert gy.page_port(dict(gy.DEFAULTS)) == 11435 and gy.page_port(dict(gy.DEFAULTS, status_page=False)) == 0
+assert gy.page_port(dict(gy.DEFAULTS, status_port=0)) == 0          # the old way still works
+assert gy.config_problem(dict(gy.DEFAULTS, status_page=False, status_port=11434)) is None
+assert "status_page = true" in gy.CONFIG_TEMPLATE and "status_page" in gy.LIVE_SETTINGS
+ok("status_page setting: validated, and status_port = 0 still turns the page off")
 print("feature tests passed")

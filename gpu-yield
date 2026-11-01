@@ -56,7 +56,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.8.0"
+VERSION = "1.9.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -97,6 +97,7 @@ DEFAULTS = {
     "context_length": 65536,
     "backend": "auto",
     "port": 11434,
+    "status_page": True,
     "status_port": 11435,
     "cooldown_seconds": 45,
     "poll_seconds": 2,
@@ -153,7 +154,9 @@ backend = "auto"
 port = 11434
 
 # Status page for other computers: http://<this-pc>:11435 (JSON at /status).
-# Read-only. 0 turns it off.
+# Read-only unless control_password is set. status_page = false turns it off
+# (status --host and wake from other PCs need it on).
+status_page = true
 status_port = 11435
 
 # Seconds to wait after a game closes before reloading the model. Stops reload
@@ -244,6 +247,14 @@ def ago(seconds):
     return f"{seconds // 3600}h {seconds % 3600 // 60}m"
 
 
+def page_port(cfg):
+    """Port the status page listens on, or 0 when it's turned off."""
+    return int(cfg["status_port"]) if cfg["status_page"] else 0
+
+
+LIVE_SETTINGS = ("status_page", "status_port")   # applied without restarting the watcher
+
+
 def config_problem(cfg):
     """A human-readable reason the config is invalid, or None."""
     for key, default in DEFAULTS.items():
@@ -265,7 +276,7 @@ def config_problem(cfg):
     for key, (lo, hi) in limits.items():
         if not lo <= cfg[key] <= hi:
             return f"{key} must be between {lo} and {hi}, not {cfg[key]}"
-    if cfg["status_port"] == cfg["port"]:
+    if page_port(cfg) == cfg["port"]:
         return "status_port must differ from port"
     if cfg["alias"] and not (MODEL_NAME_RE.fullmatch(cfg["alias"]) and len(cfg["alias"]) <= 100):
         return f"alias must be a simple model name like \"gpu-yield\", not {cfg['alias']!r}"
@@ -1739,6 +1750,7 @@ class Watcher:
         self.cfg = cfg
         self.ollama = Ollama(cfg)
         self.standin = StandIn(cfg["port"])
+        self.page = None                  # the status page's server, while it's on
         self.host = socket.gethostname()
         self.stop_evt = threading.Event()
         self.state = None
@@ -2465,11 +2477,8 @@ class Watcher:
                            and isinstance(e.get("text"), str))
         self.event(f"gpu-yield {VERSION} watching for games (model {self.cfg['model']}, "
             f"context {self.cfg['context_length']}, cooldown {self.cfg['cooldown_seconds']}s)")
-        page = None
-        if self.cfg["status_port"]:
-            page = StatusServer(int(self.cfg["status_port"]), self)
-            if page.start():
-                log(f"status page on http://{self.host}:{self.cfg['status_port']}/")
+        self.sync_page()
+        config_seen = self.config_mtime()
         poll = max(0.5, float(self.cfg["poll_seconds"]))
         mono0, boot0 = time.monotonic(), time.clock_gettime(time.CLOCK_BOOTTIME)
         while not self.stop_evt.is_set():
@@ -2482,6 +2491,7 @@ class Watcher:
                 self.track_use()
                 self.process_actions()
                 self.maybe_auto_update(mono)
+                config_seen = self.reload_live_settings(config_seen)
             except Exception as e:  # never let one bad loop kill the watcher
                 msg = f"watcher error: {e!r}"
                 if msg != self.last_error[0] or mono - self.last_error[1] > 300:
@@ -2493,9 +2503,51 @@ class Watcher:
                 self.event(f"couldn't write status: {e!r}")
             self.stop_evt.wait(poll)
         self.standin.stop()
-        if page:
-            page.stop()
+        if self.page:
+            self.page.stop()
+            self.page = None
         self.event("watcher stopped")
+
+    def sync_page(self):
+        """Start, stop or move the status page to match the config."""
+        port = page_port(self.cfg)
+        if self.page and self.page.port == port:
+            return
+        if self.page:
+            self.page.stop()
+            self.page = None
+            if not port:
+                self.event("status page turned off")
+        if port:
+            page = StatusServer(port, self)
+            if page.start():
+                self.page = page
+                log(f"status page on http://{self.host}:{port}/")
+
+    @staticmethod
+    def config_mtime():
+        try:
+            return CONFIG_FILE.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def reload_live_settings(self, seen):
+        """Settings that don't need a restart (turning the status page on or off) take
+        effect within one poll of the config file changing; the AI keeps running."""
+        mtime = self.config_mtime()
+        if mtime == seen:
+            return seen
+        try:
+            new = load_config()
+        except SystemExit:        # a broken file is reported when the watcher next starts
+            return mtime
+        changed = {k: new[k] for k in LIVE_SETTINGS if new[k] != self.cfg[k]}
+        if changed:
+            self.cfg.update(changed)
+            self.sync_page()
+            if self.page:
+                self.event(f"status page on at port {self.page.port}")
+        return mtime
 
 
 # ---------------------------------------------------------------------------- commands
@@ -2578,6 +2630,10 @@ def cmd_status(args):
         except ValueError:
             die(f"{host}:{port} answered, but it isn't a gpu-yield status page")
         except OSError as e:
+            if refused(e):
+                die(f"{host} is on, but nothing answers on port {port}: gpu-yield isn't running "
+                    "there, or its status page is turned off (on that PC: "
+                    "gpu-yield config status_page true)")
             die(f"can't reach {host}:{port} ({getattr(e, 'reason', e)}). If it's asleep, "
                 f"wake it with: gpu-yield wake {host_key(host, port)}")
         remember_host(host, port, st)
@@ -2668,6 +2724,11 @@ def fetch_remote_status(host, port, timeout=4):
         return json.loads(r.read())
 
 
+def refused(e):
+    """The PC answered but nothing listens on the port: it's awake, the page is just off."""
+    return isinstance(getattr(e, "reason", e), ConnectionRefusedError)
+
+
 def load_hosts():
     try:
         return json.loads(HOSTS_FILE.read_text())
@@ -2731,7 +2792,11 @@ def cmd_wake(args):
         remember_host(host, port, st)
         print(f"{host} is already awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
         return
-    except (OSError, ValueError):
+    except OSError as e:
+        if refused(e):
+            print(f"{host} is already awake (its status page is off or gpu-yield isn't running).")
+            return
+    except ValueError:
         pass
     info = hosts.get(host_key(host, port), {})
     if not info.get("mac"):
@@ -2750,7 +2815,12 @@ def cmd_wake(args):
         print(".", end="", flush=True)
         try:
             st = fetch_remote_status(host, port, timeout=2)
-        except (OSError, ValueError):
+        except OSError as e:
+            if refused(e):
+                print(" awake (its status page is off, so the AI's state isn't known).")
+                return
+            continue
+        except ValueError:
             continue
         print(f" awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
         return
@@ -3002,12 +3072,14 @@ def cmd_doctor(args):
 
     ip, net = lan_address()
     if run(["systemctl", "is-active", "--quiet", "firewalld"]).returncode == 0:
-        ports = " and ".join(str(p) for p in (cfg["port"], cfg["status_port"]) if p)
+        ports = " and ".join(str(p) for p in (cfg["port"], page_port(cfg)) if p)
         note(f"firewalld is active; ports {ports} must be open to {net or 'your LAN'} "
              "(gpu-yield firewall does this)")
     note(f"Hermes base_url: http://{ip or '<this-pc-ip>'}:{cfg['port']}/v1")
-    if cfg["status_port"]:
+    if page_port(cfg):
         note(f"status page: http://{ip or socket.gethostname()}:{cfg['status_port']}/")
+    else:
+        note("status page: off (turn on with: gpu-yield config status_page true)")
     dev, mac, wireless = nic_info()
     if dev:
         supported, current = wol_state(dev, wireless)
@@ -3132,7 +3204,7 @@ def open_firewall(cfg, args):
     if not net:
         warn("could not work out your LAN subnet; open the ports manually if Hermes can't connect")
         return
-    ports = [cfg["port"]] + ([cfg["status_port"]] if cfg["status_port"] else [])
+    ports = [cfg["port"]] + ([page_port(cfg)] if page_port(cfg) else [])
     names = " and ".join(str(p) for p in ports)
     if not ask(f"Allow port{'s' if len(ports) > 1 else ''} {names} from your local network "
                f"({net}) only? Needs sudo.", args):
@@ -3322,18 +3394,26 @@ def cmd_config(args):
     shown = json.dumps(cfg["ollama_env"].get(key[4:], "")) if key.startswith("env.") \
         else ('"(set)"' if cfg[key] else '""') if key in SECRET_SETTINGS else fmt_setting(cfg[key])
     print(f"{key} = {shown}")
-    if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0:
+    running = user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode == 0
+    if running and key in LIVE_SETTINGS:
+        print("Applied within a few seconds; the AI keeps running.")
+    elif running:
         user_systemctl("restart", WATCHER_UNIT)
         print("Applied (watcher restarted; the model reloads in a moment).")
     if key == "context_length":
         print(f"Set context_length and ollama_num_ctx to {cfg[key]} in Hermes's config too.")
     elif key == "backend":
         print("The Ollama download depends on the backend; finish with: gpu-yield setup --reinstall")
+    elif key == "status_page":
+        print(f"Status page: http://{socket.gethostname()}:{cfg['status_port']}/" if page_port(cfg)
+              else "Status page off. gpu-yield status still works on this PC; status --host "
+                   "and wake from other PCs need the page.")
     elif key in ("port", "status_port"):
         print("If the firewall is on, open the new port with: gpu-yield firewall")
     elif key == "control_password":
-        print(f"Controls on the status page are {'on' if cfg[key] else 'off'}: "
-              f"http://{socket.gethostname()}:{cfg['status_port']}/")
+        print(f"Controls on the status page are {'on' if cfg[key] else 'off'}"
+              + (f": http://{socket.gethostname()}:{cfg['status_port']}/" if page_port(cfg)
+                 else ", but the page itself is off (gpu-yield config status_page true)"))
 
 
 def hermes_snippet(cfg):
@@ -3426,8 +3506,9 @@ def cmd_setup(args):
 
     log("8/8 Done\n")
     print(hermes_snippet(cfg))
+    page = f"http://{socket.gethostname()}:{cfg['status_port']}/" if page_port(cfg) else "off"
     print(f"""
-Status page: http://{socket.gethostname()}:{cfg['status_port']}/
+Status page: {page}
 
 Useful commands:
   gpu-yield status      gpu-yield doctor      gpu-yield config

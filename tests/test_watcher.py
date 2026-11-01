@@ -187,6 +187,34 @@ wait(lambda: w.warm_status.startswith("ready"), msg="after suspend")
 assert [e[0] for e in events if e[0] != "copy"][-3:] == ["stop", "start", "generate"]
 ok("restarts Ollama after waking from sleep")
 
+# --- turning the status page off and on, live: no watcher restart, the AI keeps running
+gy.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+def write_cfg(page):
+    gy.CONFIG_FILE.write_text(f'model = "gpt-oss:20b"\nport = {PORT}\nstatus_port = {STATUS_PORT}\n'
+                              f'status_page = {"true" if page else "false"}\n')
+def page_up():
+    try:
+        return page("/status")[0] == 200
+    except OSError:
+        return False
+write_cfg(True)
+time.sleep(0.5)
+assert page_up()
+n = starts()
+write_cfg(False)
+wait(lambda: not page_up(), msg="page off")
+try:
+    gy.fetch_remote_status("127.0.0.1", STATUS_PORT, timeout=2)
+    raise AssertionError("page still answering")
+except OSError as e:
+    assert gy.refused(e), e
+assert w.state == "ai" and starts() == n and get("/api/version")[0] == 200
+assert any(e["text"] == "status page turned off" for e in w.snapshot()["events"])
+write_cfg(True)
+wait(page_up, msg="page back on")
+assert starts() == n
+ok("status_page = false turns the page off within a poll, and back on, without touching the AI")
+
 # --- health checks (call directly instead of waiting 15 s each)
 def check():
     w.last_health = 0

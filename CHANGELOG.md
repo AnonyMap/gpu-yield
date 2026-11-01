@@ -2,6 +2,9 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.9.0 (2026-10-31)
+- The status page can be turned off: `gpu-yield config status_page false` (and `true` to bring it back). It takes effect within a few seconds without restarting the AI. `status --host` and `wake` from another PC say when they reach a PC whose page is off, instead of treating it as asleep.
+
 ## 1.8.0 (2026-10-31)
 - A fixed model name for your apps: set your app's model to `gpu-yield` and it always gets whichever model is loaded, so switching models no longer means editing the app's settings. It's an Ollama copy of the model, so it takes no extra download or disk space. Change or turn it off with the `alias` setting. It never overwrites a model gpu-yield didn't create.
 - Real memory readings: the status page, `status` and `doctor` show actual GPU memory and RAM use from the driver, including system RAM the driver has mapped for the GPU, instead of relying on Ollama's estimate.

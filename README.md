@@ -144,6 +144,8 @@ journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
 
 **Status page.** Open `http://<gaming-pc>:11435` in any browser, including a phone. It shows whether the AI is ready, which game is running, when the AI was last used, and anything worth fixing, and updates live. With a control password set, it can also change things ([Controls on the status page](#controls-on-the-status-page)).
 
+Don't want it? `gpu-yield config status_page false` turns it off within a few seconds, without interrupting the AI; `true` brings it back. `gpu-yield status` still works on the PC itself, but `status --host` and `wake` from other computers need the page.
+
 The same data is available as JSON at `/status`, for scripts or for an agent that wants to check before calling:
 
 | Field | Meaning |
@@ -249,7 +251,8 @@ An invalid value is refused and the file is left as it was. You can also edit `~
 | `context_length` | `65536` | Context window in tokens. Keep your clients set to the same number |
 | `backend` | `"auto"` | `auto`, `rocm` or `vulkan`. `auto` picks ROCm on cards ROCm supports (RX 7000 series, RX 6800/6900, RX 9000, Radeon VII, Ryzen AI Max) and Vulkan on the rest (such as the RX 6700 XT or 6600). A change takes effect after `gpu-yield setup --reinstall` |
 | `port` | `11434` | Port the AI listens on |
-| `status_port` | `11435` | Port of the status page; `0` turns it off |
+| `status_page` | `true` | Serve the status page. `false` turns it off; takes effect without restarting the AI |
+| `status_port` | `11435` | Port of the status page |
 | `cooldown_seconds` | `45` | Wait after a game closes before reloading the model |
 | `poll_seconds` | `2` | How often to check for games (0.5 to 60) |
 | `restart_after_suspend` | `true` | Restart Ollama after the PC wakes from sleep |
