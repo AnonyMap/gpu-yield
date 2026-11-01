@@ -1079,25 +1079,44 @@ _UNITS = {None: 1, "KiB": 2**10, "MiB": 2**20, "GiB": 2**30}
 
 
 def fdinfo_vram(info):
-    """(GPU client id or None, bytes of VRAM) from one /proc/PID/fdinfo/FD, or None."""
+    """(GPU client id or None, bytes of VRAM, PCI device or None) from one
+    /proc/PID/fdinfo/FD, or None if it isn't a GPU file with VRAM accounting."""
     for pattern in _FDINFO_VRAM:
         m = pattern.search(info)
         if m:
             cid = re.search(r"^drm-client-id:\s*(\d+)", info, re.M)
-            return (cid.group(1) if cid else None), int(m.group(1)) * _UNITS[m.group(2)]
+            pdev = re.search(r"^drm-pdev:\s*(\S+)", info, re.M)
+            return ((cid.group(1) if cid else None), int(m.group(1)) * _UNITS[m.group(2)],
+                    pdev.group(1) if pdev else None)
     return None
 
 
-def vram_holders(min_bytes=64 * 2**20, proc="/proc"):
+def main_gpu_pdev():
+    """PCI address of the card with the most VRAM (the one memory_readings reports), so
+    an integrated GPU's memory isn't added in."""
+    best = (0, None)
+    for dev in DRM_DIR.glob("card*/device"):
+        try:
+            total = int(_read_text(dev / "mem_info_vram_total"))
+        except ValueError:
+            continue
+        if total > best[0]:
+            best = (total, dev.resolve().name)
+    return best[1]
+
+
+def vram_holders(min_bytes=64 * 2**20, proc="/proc", pdev=None):
     """Programs holding video memory, biggest first: [(pid, name, bytes)], from the
     driver's own per-program accounting. Only programs this user may look at, which on
     a gaming PC includes Steam, its interface and its games. Costs a scan of /proc, so
     it runs on request, never in the 2 s loop."""
     out = []
+    pdev = pdev or main_gpu_pdev()
     try:
-        entries = [e.name for e in os.scandir(proc) if e.name.isdigit()]
+        entries = sorted((e.name for e in os.scandir(proc) if e.name.isdigit()), key=int)
     except OSError:
         return out
+    seen = set()          # a GPU client passed to a child process is listed under the first
     for pid in entries:
         clients = {}
         try:
@@ -1111,8 +1130,12 @@ def vram_holders(min_bytes=64 * 2**20, proc="/proc"):
             except OSError:
                 continue
             found = fdinfo_vram(_read_text(Path(f"{proc}/{pid}/fdinfo/{fd}")))
-            if found:      # several open files can share one GPU client: count it once
-                clients[found[0] or fd] = found[1]
+            if not found or (pdev and found[2] and found[2] != pdev):
+                continue
+            key = (found[2], found[0]) if found[0] else (pid, fd)
+            if key not in seen:      # several open files can share one GPU client
+                seen.add(key)
+                clients[key] = found[1]
         total = sum(clients.values())
         if total >= min_bytes:
             name = _read_text(Path(f"{proc}/{pid}/comm")).strip() or "?"
@@ -1148,8 +1171,11 @@ def wait_vram_settled(timeout=10.0, stop=None):
     return last
 
 
-OOM_RE = re.compile(r"out of memory|outofdevicememory|failed to allocate|cudaMalloc failed|"
-                    r"hipMalloc failed|unable to allocate", re.I)
+# Ollama's own list of out-of-memory messages (llm/status.go), plus the GPU libraries'.
+OOM_RE = re.compile(r"out[- _]of[- _](device[- _])?memory|outofdevicememory|erroroutofmemory|"
+                    r"failed to allocate|allocation failed|unable to allocate|insufficient memory|"
+                    r"not enough memory|failed to reserve graph|requires more system memory|"
+                    r"(cuda|hip)Malloc failed", re.I)
 
 
 def memory_line(m):
@@ -1589,7 +1615,7 @@ function renderControls() {
   $("pause").textContent = s.paused ? "Resume the AI" : "Pause the AI";
   $("pausehint").textContent = s.paused ? "Paused until you resume it." : "Keeps the AI off until resumed, even after a reboot.";
   $("pause").disabled = busy;
-  $("restart").disabled = busy || s.state !== "ai" || /^restarting/.test(s.model_status || "");
+  $("restart").disabled = busy || s.state !== "ai" || s.restarting || /^(restarting|starting|loading)/.test(s.model_status || "");
   if (![...$("ctx").options].some(o => o.value === String(s.context_length)))
     $("ctx").append(el("option", { value: String(s.context_length) }, String(s.context_length)));
   if (ctxChoice !== null && ctxChoice === String(s.context_length)) ctxChoice = null;
@@ -2045,6 +2071,8 @@ class Watcher:
         self.restart_signal = False      # set by SIGUSR1 (gpu-yield restart); no lock in a handler
         self.oom_retried = False         # one automatic restart per out-of-memory streak
         self.vram_report = ""            # what was left on the GPU after the last restart
+        self.restart_active = False      # from a restart's start until its load ends
+        self.restart_count = 0           # lets `gpu-yield restart` see its restart begin
 
     # --- transitions
     def set_state(self, state):
@@ -2055,6 +2083,9 @@ class Watcher:
         prev = self.state
         self.set_state(state)
         self.warm_gen += 1          # any warmup still in flight is now irrelevant
+        self.restart_active = False
+        self.oom_retried = False    # memory changes while it's off: a fresh try next time
+        self.vram_report = ""
         self.warm_status = "not loaded"
         self.update_message(time.monotonic())
         self.event(why)
@@ -2084,26 +2115,47 @@ class Watcher:
         self.start_warm()
 
     def request_restart(self, why):
+        """False if a restart is already pending or under way (one is enough)."""
         with self.restart_lock:
+            if self.restart_request or self.restart_active:
+                return False
             self.restart_request = why
+            return True
+
+    def restarting(self):
+        return bool(self.restart_request or self.restart_signal or self.restart_active)
+
+    def transfers_running(self):
+        """A download or speed test that a restart would cut off."""
+        return self.speed["state"] == "running" or \
+            any(j["state"] == "running" for j in list(self.downloads.values()))
 
     def take_restart(self):
-        if self.restart_signal:
+        """The pending restart's reason, if one should start now. Requests wait while a
+        download or speed test runs, and are dropped while a restart is under way."""
+        if self.restart_active:
             self.restart_signal = False
-            return "restart requested (gpu-yield restart)"
+            with self.restart_lock:
+                self.restart_request = None
+            return None
+        if not (self.restart_signal or self.restart_request) or self.transfers_running():
+            return None
+        signalled, self.restart_signal = self.restart_signal, False
         with self.restart_lock:
             why, self.restart_request = self.restart_request, None
-        return why
+        return why or ("restart requested (gpu-yield restart)" if signalled else None)
 
     def restart_ai(self, why):
         """Unload everything, wait until the GPU memory has really come back, say what
         else is holding some, then load the model again. Holds up the main loop for up
         to ~10 s, and checks for a game before starting Ollama again."""
+        self.restart_count += 1
         if self.state != "ai":
             self.event(f"{why}: nothing to restart, the AI is off right now; "
                        "it loads fresh when it comes back")
             return
         self.event(why)
+        self.restart_active = True
         self.oom_retried = True          # memory is as clear as a restart can make it
         self.warm_gen += 1               # abandon a load in progress
         self.warm_status = "restarting: freeing GPU memory"
@@ -2112,13 +2164,15 @@ class Watcher:
         self.ollama.stop()
         after = wait_vram_settled(10, self.stop_evt)
         self.report_vram(before, after)
-        if self.stop_evt.is_set():
-            return
-        if self.confirm_wine(scan_games(self.cfg), time.monotonic()) or PAUSE_FILE.exists():
+        if self.stop_evt.is_set() or self.confirm_wine(scan_games(self.cfg), time.monotonic()) \
+                or PAUSE_FILE.exists():
+            self.restart_active = False
             return                       # the next pass turns this into "gaming"/"paused"
         self.go_on("starting Ollama again with the GPU memory cleared")
+        if not self.warming:             # no model, or Ollama wouldn't start: nothing to wait for
+            self.restart_active = False
 
-    def report_vram(self, before, after):
+    def report_vram(self, before, after, quiet=False):
         if after is None:
             self.vram_report = ""
             return
@@ -2126,7 +2180,8 @@ class Watcher:
         freed = f"freed {size_text(before - after)}; " if before and before > after else ""
         self.vram_report = (f"{size_text(after)} of GPU memory still in use"
                             + (f" ({holders_text(others)})" if others else ""))
-        self.event(f"{freed}{self.vram_report}")
+        if not quiet:
+            self.event(f"{freed}{self.vram_report}")
 
     def out_of_memory(self, gen, model, detail):
         if gen != self.warm_gen:
@@ -2139,6 +2194,7 @@ class Watcher:
             self.request_restart("automatic restart after running out of GPU memory")
             return
         ctx = int(self.cfg["context_length"])
+        self.report_vram(None, (memory_readings() or {}).get("vram_used"), quiet=True)
         where = f" {self.vram_report}." if self.vram_report else ""
         self._fail(gen, f"failed: not enough GPU memory for {model} at context {ctx}.{where} "
                         f"Close whatever is using it, or try a smaller context: "
@@ -2147,6 +2203,7 @@ class Watcher:
     def start_warm(self):
         self.warm_gen += 1
         self.warm_failed_at = None
+        self.warming = True
         threading.Thread(target=self._warm, args=(self.warm_gen,), name="warmup",
                          daemon=True).start()
 
@@ -2157,6 +2214,7 @@ class Watcher:
         finally:
             if gen == self.warm_gen:
                 self.warming = False
+                self.restart_active = False   # a restart ends when its load does
 
     def _fail(self, gen, status, retry=300):
         if gen == self.warm_gen:
@@ -2277,6 +2335,7 @@ class Watcher:
             self.go_on("resumed; starting Ollama")
         elif self.state == "ai":
             if slept and self.cfg["restart_after_suspend"]:
+                self.oom_retried, self.vram_report = False, ""
                 self.ollama.stop()
                 self.go_on("woke from sleep; restarting Ollama")
             else:
@@ -2435,7 +2494,11 @@ class Watcher:
         if self.state != "ai":
             return 409, {"error": "The AI is off right now (a game is running or it's paused); "
                                   "it loads fresh when it comes back."}
-        self.request_restart("restart requested from the status page")
+        if self.transfers_running():
+            return 409, {"error": "A download or speed test is running; restarting would cut it "
+                                  "off. Try again when it's done."}
+        if not self.request_restart("restart requested from the status page"):
+            return 409, {"error": "Already restarting."}
         return 202, {"message": "Restarting: unloading the model, freeing GPU memory and "
                                 "loading it again. Recent events show what's left on the GPU."}
 
@@ -2818,6 +2881,8 @@ class Watcher:
             "events": list(self.events)[:20],
             "speed": self.speed,
             "speed_results": self.current_speed_results()[:8],
+            "restarting": self.restarting(),
+            "restart_count": self.restart_count,
         }
 
     def write_status(self, now):
@@ -3353,18 +3418,30 @@ def cmd_restart(args):
     st = read_status()
     if user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode or not st:
         die(f"gpu-yield isn't running (start it: systemctl --user start {WATCHER_UNIT})")
+    running = str(st.get("version") or "0")
+    if parse_version(running) < parse_version("1.10.0"):
+        # Older watchers don't handle the signal; it would stop them instead.
+        die(f"the running watcher is version {running}, which can't restart the AI on its own. "
+            f"Load this version first: systemctl --user restart {WATCHER_UNIT}")
     if st.get("state") != "ai":
         print(f"The AI is off right now ({STATE_TEXT.get(st.get('state'), st.get('state'))}); "
               "it loads fresh when it comes back. Nothing to restart.")
         return
+    if st.get("restarting"):
+        print("Already restarting; follow it with: gpu-yield status")
+        return
+    busy = [d.get("name") for d in st.get("downloads") or [] if d.get("state") == "running"]
+    if busy or (st.get("speed") or {}).get("state") == "running":
+        die("a " + (f"download ({', '.join(map(str, busy))})" if busy else "speed test")
+            + " is running; restarting would cut it off. Try again when it's done.")
+    main = user_systemctl("show", "-p", "MainPID", "--value", WATCHER_UNIT).stdout.strip()
     pid = st.get("pid")
-    if not isinstance(pid, int) or b"gpu-yield" not in _read_cmdline(str(pid), full=True):
-        die("couldn't find the running watcher; try: systemctl --user restart gpu-yield")
-    t0 = time.time()
+    if not main.isdigit() or int(main) != pid:
+        die(f"couldn't confirm which process is the watcher; try: systemctl --user restart {WATCHER_UNIT}")
+    count, t0 = st.get("restart_count", 0), time.time()
     os.kill(pid, signal.SIGUSR1)
     print("Restarting: unloading the model and freeing GPU memory...")
-    shown, started = set(), False
-    end = time.time() + 240
+    shown, end = set(), time.time() + 240
     while time.time() < end:
         time.sleep(1)
         st = read_status() or {}
@@ -3372,19 +3449,21 @@ def cmd_restart(args):
             key = (e.get("at"), e.get("text"))
             if isinstance(e.get("at"), (int, float)) and e["at"] >= t0 and key not in shown:
                 shown.add(key)
-                started = True
                 print("  " + str(e.get("text")))
+        if st.get("pid") != pid or (time.time() - t0) % 10 < 1 and \
+                user_systemctl("is-active", "--quiet", WATCHER_UNIT).returncode:
+            die("the watcher stopped while restarting; see: journalctl --user -u gpu-yield")
+        if st.get("restart_count", 0) <= count or st.get("restarting"):
+            continue                       # not picked up yet, or still going
         status = str(st.get("model_status", ""))
-        if not started:
-            continue
         if st.get("state") != "ai":
             print(f"Stopped waiting: {STATE_TEXT.get(st.get('state'), st.get('state'))}.")
             return
         if status.startswith("ready"):
             print("Done: " + status)
             return
-        if status.startswith("failed"):
-            sys.exit(1)
+        print(status)
+        sys.exit(0 if status.startswith("no model") else 1)
     die("still not loaded after 4 minutes; see: gpu-yield status")
 
 

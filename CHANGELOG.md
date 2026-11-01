@@ -3,7 +3,7 @@
 `gpu-yield update` shows the entries between your version and the new one.
 
 ## 1.10.0 (2026-10-31)
-- Restart the AI: `gpu-yield restart` or the status page's *Restart the AI* button unloads the model, stops Ollama, waits until the GPU memory is actually free again, and reloads the model. It lists any other program still holding GPU memory, which is what a restart can't fix.
+- Restart the AI: `gpu-yield restart` or the status page's *Restart the AI* button unloads the model, stops Ollama, waits until the GPU memory is actually free again, and reloads the model. It lists any other program still holding GPU memory, which is what a restart can't fix. It waits for a download or speed test to finish rather than cutting it off.
 - When a model fails to load because the GPU ran out of memory, gpu-yield restarts Ollama by itself once and tries again. If it still doesn't fit, it says which programs hold the memory and suggests a smaller context, instead of retrying the same failure.
 - `gpu-yield doctor` lists the programs using GPU memory.
 
