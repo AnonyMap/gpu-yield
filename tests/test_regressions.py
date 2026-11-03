@@ -167,7 +167,8 @@ ok("can't delete a model that's queued to be used, or downloading to be used, or
 gy.load_hosts = lambda: {"pc": {"mac": "1c:2b:3a:4d:5e:6f"}}
 gy.send_magic_packet = lambda *a: None
 probes = iter([urllib.error.URLError(TimeoutError()), urllib.error.URLError(ConnectionRefusedError()),
-               urllib.error.URLError(ConnectionRefusedError()), {"state": "ai"}])
+               urllib.error.URLError(ConnectionRefusedError()), {"state": "ai", "model_status": "loading"},
+               {"state": "ai", "ai_available": True, "model_status": "ready (m)"}])
 def probe(*a, **k):
     p = next(probes)
     if isinstance(p, Exception):

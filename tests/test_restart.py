@@ -177,7 +177,7 @@ assert w.api("restart", {}, "hunter2222")[0] == 202
 assert w.api("restart", {}, "hunter2222") == (409, {"error": "Already restarting."})
 w.restart_signal = True
 assert w.take_restart() == "restart requested from the status page" and not w.restart_signal
-w.restart_active = True
+w.restart_busy = True
 w.restart_signal = True
 assert w.take_restart() is None and not w.restart_signal, "a second request during a restart runs nothing"
 ok("restarts wait for downloads and speed tests, and duplicates while one runs are dropped")

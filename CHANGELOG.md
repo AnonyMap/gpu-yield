@@ -2,8 +2,37 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.11.0 (2026-11-02)
+Fixes from a security audit, a bug review and a performance review.
+
+Security:
+- The stand-in that answers on Ollama's port during games could be made to use up the PC's memory by any device on the network. It now throws request bodies away as they arrive, and limits connections per device and how long each may take.
+- Wrong control passwords lock out only the device guessing, for a minute, then two, four and so on up to an hour. Before, one device could keep everyone locked out.
+- `gpu-yield config control_password -` asks for the password without showing it, or makes up a strong one, so it stays out of shell history and process lists. Error messages never print a password or token from the config.
+- Websites can no longer read `/status` from your browser (it names the PC and its network card), and the page can't be shown inside another site.
+- `status --host` and `wake` check what another PC sends back: size, shape and network card address, and they strip escape codes that could retitle your terminal, write to your clipboard or fake output.
+- A request with an unexpected host name no longer runs a program on the PC each time.
+
+Fixes:
+- When gpu-yield started or resumed during a Windows game (Heroic, Lutris), it began loading the model for 5 seconds before noticing the game. Windows games now count at once whenever the AI isn't already running, or when they've been running a while.
+- `setup --model NAME` saves the new model only once it has downloaded; a typo or failed download keeps the working one. Model names typed at setup are checked like everywhere else.
+- Choosing the ROCm backend without its separate download kept Ollama on the CPU until a reinstall. Ollama stays on Vulkan until then, setup downloads ROCm when it's missing, and `doctor` says so.
+- A config file error now also stops your own Ollama unit (if you use one), not just gpu-yield's.
+- The automatic restart after running out of GPU memory could be skipped if the model or context was changed during a restart.
+- `wake` waits until the AI is ready, not just the PC, and its exit code says whether it is.
+- `status --host` and `wake` give a message instead of a Python error when something other than gpu-yield answers.
+- `gpu-yield config` accepts values containing emoji.
+
+Performance (about 70% less CPU time while a game runs):
+- The status page and stand-in sleep until a connection arrives instead of waking twice a second.
+- The status file is only rewritten when something besides memory readings changed.
+- While a game runs, the watcher checks every 5 seconds instead of 2; a game ending only starts the cooldown anyway. Game starts are still caught within 2 seconds.
+- Processes without a command line (kernel threads) are skipped after the first look.
+- The watcher runs at a lower CPU priority than games.
+- The status page stops polling while its browser tab is hidden.
+
 ## 1.10.0 (2026-10-31)
-- Restart the AI: `gpu-yield restart` or the status page's *Restart the AI* button unloads the model, stops Ollama, waits until the GPU memory is actually free again, and reloads the model. It lists any other program still holding GPU memory, which is what a restart can't fix. It waits for a download or speed test to finish rather than cutting it off.
+- Restart the AI: `gpu-yield restart` or the status page's *Restart the AI* button unloads the model, stops Ollama, waits until the GPU memory is actually free again, and reloads the model. It lists any other program still holding GPU memory, which is what a restart can't fix. It won't start while a download or speed test is running; the automatic one waits for it to finish.
 - When a model fails to load because the GPU ran out of memory, gpu-yield restarts Ollama by itself once and tries again. If it still doesn't fit, it says which programs hold the memory and suggests a smaller context, instead of retrying the same failure.
 - `gpu-yield doctor` lists the programs using GPU memory.
 

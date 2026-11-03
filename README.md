@@ -104,7 +104,7 @@ Most of these are *mixture-of-experts* models, which degrade gracefully when the
 
 `gpu-yield doctor` shows how much of the loaded model is on the GPU and says whether that's expected. If it reports the model running entirely on the CPU, the GPU backend isn't working; doctor suggests the fix.
 
-To make context use less memory, at a small quality cost: `gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0`.
+To make context use less memory, at a small quality cost: `gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0`. It only works when Ollama uses flash attention, and helps most with dense models. gpt-oss already keeps its context small, so it gains little there.
 
 ## Connecting clients
 
@@ -148,7 +148,7 @@ journalctl --user -u gpu-yield -u gpu-yield-ollama -f    # live log
 
 Don't want it? `gpu-yield config status_page false` turns it off within a few seconds, without interrupting the AI; `true` brings it back. `gpu-yield status` still works on the PC itself, but `status --host` and `wake` from other computers need the page.
 
-The same data is available as JSON at `/status`, for scripts or for an agent that wants to check before calling:
+The same data is available as JSON at `/status`, for scripts or for an agent that wants to check before calling. Websites can't read it from your browser, since it names the PC and its network card:
 
 | Field | Meaning |
 |---|---|
@@ -183,12 +183,12 @@ With a control password set, the status page can also manage the AI, from any br
 The controls are off until you set a password on the gaming PC:
 
 ```bash
-gpu-yield config control_password YOUR-PASSWORD
+gpu-yield config control_password -
 ```
 
-Use at least 8 characters, and a password you don't use anywhere else: the page is plain HTTP, so it crosses your local network unencrypted. The page asks for it once per browser and remembers it; *Lock controls on this device* forgets it. Without a password the page stays read-only.
+It asks for the password without showing it, so it stays out of your shell history. Press Enter at the prompt and it makes up a strong one and shows it once. Use at least 8 characters, and a password you don't use anywhere else: the page is plain HTTP, so it crosses your local network unencrypted. The page asks for it once per browser and remembers it; *Lock controls on this device* forgets it. Without a password the page stays read-only.
 
-After 10 wrong passwords within a minute, from any device, the controls stay locked for the rest of that minute. Open the page by the PC's name, alone or with a local-network ending (`gaming-pc`, `gaming-pc.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, or your router's own domain), or by its IP address. The controls refuse requests addressed to any other name, which blocks websites from reaching them through your browser.
+After 10 wrong passwords, the device they came from is locked out for a minute, then two, four, and so on up to an hour if it keeps guessing. Other devices aren't affected, so a guessing device can't lock you out of your own page. Open the page by the PC's name, alone or with a local-network ending (`gaming-pc`, `gaming-pc.local`, `.lan`, `.home`, `.home.arpa`, `.internal`, or your router's own domain), or by its IP address. The controls refuse requests addressed to any other name, which blocks websites from reaching them through your browser.
 
 The controls cost the PC almost nothing. The page's server sits idle until a browser asks for something, and Ollama does the actual downloading and loading. Every change goes through the watcher, so a change made from the page can't collide with a game starting. Downloads and deletes need the AI running, so they're refused during a game with a message saying why. Model and context changes made during a game are saved and take effect when the AI comes back.
 
@@ -220,7 +220,7 @@ If the gaming PC goes to sleep, nothing on the network can reach the AI. There a
 gpu-yield wake gaming-pc.local
 ```
 
-This sends the wake-up signal and waits until the AI answers, for up to 2 minutes. `wake` needs to know the PC's network card address. It learns that automatically the first time you run `gpu-yield status --host` against the PC while it's awake. You can also pass the address directly, for example `gpu-yield wake 1c:2b:3a:4d:5e:6f`.
+This sends the wake-up signal and waits up to 2 minutes for the PC, then up to 3 more for the model to load. It exits with 0 once the AI is ready, and 1 if the PC is up but the AI isn't available (a game is running or it's paused), so `gpu-yield wake gaming-pc.local && my-script` only runs the script when the AI can answer. `wake` needs to know the PC's network card address. It learns that automatically the first time you run `gpu-yield status --host` against the PC while it's awake. You can also pass the address directly, for example `gpu-yield wake 1c:2b:3a:4d:5e:6f`.
 
 Wake-on-LAN is most reliable over a wired connection. Some PCs also need it enabled in the BIOS/UEFI, often called *Wake on LAN*, *Power on by PCI-E* or *Resume by LAN*.
 

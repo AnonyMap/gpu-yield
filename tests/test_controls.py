@@ -145,17 +145,28 @@ assert call("POST", "/api/auth", {}, "hunter2")[0] == 200
 assert call("POST", "/api/pause", {"paused": True})[0] == 403, "no password header"
 ok("wrong passwords are refused; the right one unlocks")
 
-# Guessing: one shared limit, however many connections guess at once
+# Guessing: a limit per device, however many connections it guesses on at once (up to
+# the 6 a browser opens per site; more from one device are refused outright)
 from concurrent.futures import ThreadPoolExecutor
 w.failures.clear()
-with ThreadPoolExecutor(20) as pool:
+with ThreadPoolExecutor(5) as pool:
     codes = list(pool.map(lambda i: call("POST", "/api/auth", {}, f"guess{i}")[0], range(40)))
 assert codes.count(403) == w.MAX_FAILURES and codes.count(429) == 40 - w.MAX_FAILURES, codes
 code, body, _ = call("POST", "/api/auth", {}, "hunter2")
 assert code == 429 and "Try again in" in body["error"], "even the right password waits out a lockout"
 w.failures.clear()
 assert call("POST", "/api/auth", {}, "hunter2")[0] == 200
-ok("password guessing: 10 wrong tries a minute in total, then everyone waits")
+for i in range(gy.Watcher.MAX_FAILURES):
+    w.api("auth", {}, f"guess{i}", client="10.0.0.66")
+assert w.api("auth", {}, "hunter2", client="10.0.0.66")[0] == 429
+assert w.api("auth", {}, "hunter2", client="10.0.0.5")[0] == 200, "another device isn't locked out"
+first = w.failures["10.0.0.66"]["until"]
+w.failures["10.0.0.66"]["until"] = 0
+for i in range(gy.Watcher.MAX_FAILURES):
+    w.api("auth", {}, f"again{i}", client="10.0.0.66")
+assert w.failures["10.0.0.66"]["locks"] == 2, "a repeat offender waits twice as long"
+w.failures.clear()
+ok("password guessing: 10 wrong tries lock that device out (doubling each time), not everyone")
 
 # DNS rebinding: requests under a foreign host name are refused
 def call_host(path, host, body=None):

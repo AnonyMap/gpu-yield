@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.10.0"
+VERSION = "1.11.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -403,7 +403,7 @@ def set_config_values(values):
         if isinstance(value, bool):
             rendered = str(value).lower()
         elif isinstance(value, (str, list)):
-            rendered = json.dumps(value)        # JSON strings/arrays are valid TOML
+            rendered = json.dumps(value, ensure_ascii=False)   # JSON strings/arrays are TOML
         else:
             rendered = str(value)
         for i, line in enumerate(lines[:first_table]):
@@ -431,7 +431,8 @@ def set_env_value(name, value):
         header = len(lines) - 1
     end = next((i for i in range(header + 1, len(lines)) if lines[i].strip().startswith("[")),
                len(lines))
-    rendered = f"{json.dumps(name) if not re.fullmatch(r'[A-Za-z0-9_-]+', name) else name} = {json.dumps(value)}"
+    rendered = (f"{json.dumps(name, ensure_ascii=False) if not re.fullmatch(r'[A-Za-z0-9_-]+', name) else name}"
+                f" = {json.dumps(value, ensure_ascii=False)}")
     for i in range(header + 1, end):
         if "=" in lines[i] and lines[i].split("=", 1)[0].strip().strip("\"'") == name \
                 and not lines[i].lstrip().startswith("#"):
@@ -559,6 +560,19 @@ def lan_address():
 
 # ----------------------------------------------------------------------- game detection
 
+def process_age(pid):
+    """Seconds since a process started, or 0 if unknown."""
+    try:
+        start = int(_read_text(Path(f"/proc/{pid}/stat")).rsplit(")", 1)[1].split()[19])
+        uptime = float(_read_text(Path("/proc/uptime")).split()[0])
+        return uptime - start / os.sysconf("SC_CLK_TCK")
+    except (ValueError, IndexError):
+        return 0.0
+
+
+_NO_CMDLINE = set()   # (pid, inode) of kernel threads and zombies: their cmdline stays empty
+
+
 def scan_games(cfg):
     """Return {pid: label} for every running game.
 
@@ -577,15 +591,18 @@ def scan_games(cfg):
     detect_wine = cfg["detect_wine"]
     steam_present = False
     wine_pids, exes = [], []
-    try:
-        pids = os.listdir("/proc")
+    try:          # scandir gives each /proc entry's inode for free: a reused pid gets a new one
+        entries = [(e.name, e.inode()) for e in os.scandir("/proc") if e.name.isdigit()]
     except OSError:
         return found
-    for pid in pids:
-        if not pid.isdigit():
+    empty = set()
+    for pid, inode in entries:
+        if (pid, inode) in _NO_CMDLINE:
+            empty.add((pid, inode))
             continue
         raw = _read_cmdline(pid)
         if not raw:
+            empty.add((pid, inode))    # half of /proc on a typical desktop: skip from now on
             continue
         base = _basename(raw.partition(b"\0")[0])
         if base == b"reaper" and b"\0SteamLaunch\0" in raw:
@@ -604,6 +621,8 @@ def scan_games(cfg):
                 wine_pids.append(int(pid))
             elif base[-4:].lower() == b".exe" and not _is_wine_helper(base):
                 exes.append((pid, base.decode(errors="replace")))
+    _NO_CMDLINE.clear()
+    _NO_CMDLINE.update(empty)          # only those still present: the set can't grow
     if wine_pids and not steam_present:
         # Wine also runs briefly for things that aren't games: Steam's install scripts,
         # redistributable installers, Proton's own helpers. A game draws with the GPU, so
@@ -847,6 +866,17 @@ def gpu_targets():
     return targets
 
 
+def backend_installed(cfg):
+    """False if the managed Ollama install lacks the libraries the chosen backend needs
+    (ROCm comes in a separate download); True or None (can't tell) otherwise."""
+    if resolve_backend(cfg) != "rocm" or cfg["ollama_unit"] != MANAGED_OLLAMA_UNIT:
+        return True
+    lib = OLLAMA_DIR / "lib/ollama"
+    if not lib.is_dir():
+        return None
+    return (lib / "rocm").is_dir() or any(lib.rglob("libggml-hip*"))
+
+
 def resolve_backend(cfg):
     if cfg["backend"] != "auto":
         return cfg["backend"]
@@ -867,7 +897,9 @@ def ollama_unit_text(cfg):
         "OLLAMA_NUM_PARALLEL": "1",              # parallel slots multiply context memory
         "OLLAMA_MAX_LOADED_MODELS": "1",
     }
-    if resolve_backend(cfg) == "vulkan":
+    # Until the ROCm download is installed (gpu-yield setup --reinstall), keep using Vulkan
+    # rather than silently falling back to the CPU.
+    if resolve_backend(cfg) == "vulkan" or backend_installed(cfg) is False:
         env["OLLAMA_VULKAN"] = "1"
     env.update(cfg["ollama_env"])
     env_lines = "\n".join(f'Environment="{systemd_quote(k)}={systemd_quote(v)}"'
@@ -899,6 +931,9 @@ Description=gpu-yield: run Ollama while the GPU is idle, stop it for games
 ExecStart={sys.executable if sys.executable.startswith('/usr/') else '/usr/bin/python3'} {BIN_PATH} run
 Restart=always
 RestartSec=5
+# The game comes first for CPU time, and the kernel may batch the watcher's wakeups.
+Nice=10
+TimerSlackNSec=50ms
 
 [Install]
 WantedBy=default.target
@@ -989,7 +1024,7 @@ class Ollama:
 
     def loaded(self):
         try:
-            return self.request("/api/ps").get("models", [])
+            return self.request("/api/ps", timeout=3).get("models", [])
         except Exception:
             return None
 
@@ -1386,7 +1421,7 @@ class StandIn:
             try:
                 # The page's server class: a cap on connections overall and per client, and
                 # a deadline for each, so nothing on the network can tie up the PC mid-game.
-                server = PageServer(("0.0.0.0", self.port), Handler)
+                server = StandInServer(("0.0.0.0", self.port), Handler)
                 break
             except OSError as e:
                 last = e
@@ -1757,7 +1792,9 @@ $("speedbtn").addEventListener("click", () => act("speed", {}, "Starting the spe
 $("evmore").addEventListener("click", () => { allEvents = !allEvents; renderStatus(snap); });
 
 renderStatus(snap); renderControls(); refresh(true);
-setInterval(() => { tick++; refresh(tick % 5 === 0); }, 3000);
+// Nothing to show in a hidden tab, so a phone or laptop left on the page costs the PC nothing.
+setInterval(() => { if (document.hidden) return; tick++; refresh(tick % 5 === 0); }, 3000);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refresh(true); });
 </script>
 </body></html>
 """
@@ -1832,10 +1869,12 @@ class StatusServer:
 
             def do_GET(self):
                 path = self.path.split("?", 1)[0]
-                try:
-                    snap = owner.watcher.snapshot()
-                except Exception as e:
-                    snap = {"state": "error", "error": str(e)}
+                snap = None
+                if path in ("/status", "/status.json", "/"):
+                    try:
+                        snap = owner.watcher.snapshot()
+                    except Exception as e:
+                        snap = {"state": "error", "error": str(e)}
                 if path in ("/status", "/status.json"):
                     self._send(200, snap)
                 elif path == "/":
@@ -1951,7 +1990,30 @@ def search_domains():
     return out
 
 
-class PageServer(ThreadingHTTPServer):
+class QuietServer(ThreadingHTTPServer):
+    """Sleeps until a connection arrives. The stock serve_forever wakes twice a second to
+    check whether it should stop, which costs wakeups during a game for nothing."""
+
+    def serve_forever(self, poll_interval=None):
+        self._done, self._stopping = threading.Event(), False
+        try:
+            while not self._stopping:
+                self.handle_request()          # blocks: self.timeout is None
+        finally:
+            self._done.set()
+
+    def shutdown(self):
+        self._stopping = True
+        try:                                   # wake the loop with a connection of our own
+            socket.create_connection(("127.0.0.1", self.server_address[1]), timeout=1).close()
+        except OSError:
+            pass
+        done = getattr(self, "_done", None)
+        if done:
+            done.wait(5)
+
+
+class PageServer(QuietServer):
     """At most MAX_CLIENTS connections at a time and PER_CLIENT from one address, each cut
     off after DEADLINE seconds however slowly it trickles in, so neither a flood nor a few
     deliberately slow connections can take the page away from everyone else."""
@@ -2023,6 +2085,12 @@ class PageServer(ThreadingHTTPServer):
         super().handle_error(request, client_address)
 
 
+class StandInServer(PageServer):
+    """The stand-in's limits: apps like Hermes may open more connections than a browser."""
+    MAX_CLIENTS = 64
+    PER_CLIENT = 16
+
+
 
 def render_status_page(snapshot):
     data = json.dumps(snapshot).replace("<", "\\u003c")     # can't close the <script> early
@@ -2088,7 +2156,8 @@ class Watcher:
         self.restart_signal = False      # set by SIGUSR1 (gpu-yield restart); no lock in a handler
         self.oom_retried = False         # one automatic restart per out-of-memory streak
         self.vram_report = ""            # what was left on the GPU after the last restart
-        self.restart_active = False      # from a restart's start until its load ends
+        self.restart_busy = False        # inside restart_ai
+        self.restart_gen = None          # the load a restart started (its warm_gen)
         self.restart_count = 0           # lets `gpu-yield restart` see its restart begin
 
     # --- transitions
@@ -2100,7 +2169,6 @@ class Watcher:
         prev = self.state
         self.set_state(state)
         self.warm_gen += 1          # any warmup still in flight is now irrelevant
-        self.restart_active = False
         self.oom_retried = False    # memory changes while it's off: a fresh try next time
         self.vram_report = ""
         self.warm_status = "not loaded"
@@ -2131,16 +2199,22 @@ class Watcher:
             return
         self.start_warm()
 
+    def restart_in_progress(self):
+        """Inside restart_ai, or its load is still the current one and still running. Any
+        other load (a model or context change, a game in between) ends it."""
+        return self.restart_busy or (self.restart_gen is not None
+                                     and self.restart_gen == self.warm_gen and self.warming)
+
     def request_restart(self, why):
         """False if a restart is already pending or under way (one is enough)."""
         with self.restart_lock:
-            if self.restart_request or self.restart_active:
+            if self.restart_request or self.restart_in_progress():
                 return False
             self.restart_request = why
             return True
 
     def restarting(self):
-        return bool(self.restart_request or self.restart_signal or self.restart_active)
+        return bool(self.restart_request or self.restart_signal or self.restart_in_progress())
 
     def transfers_running(self):
         """A download or speed test that a restart would cut off."""
@@ -2150,7 +2224,7 @@ class Watcher:
     def take_restart(self):
         """The pending restart's reason, if one should start now. Requests wait while a
         download or speed test runs, and are dropped while a restart is under way."""
-        if self.restart_active:
+        if self.restart_in_progress():
             self.restart_signal = False
             with self.restart_lock:
                 self.restart_request = None
@@ -2172,7 +2246,13 @@ class Watcher:
                        "it loads fresh when it comes back")
             return
         self.event(why)
-        self.restart_active = True
+        self.restart_busy, self.restart_gen = True, None
+        try:
+            self._restart(why)
+        finally:
+            self.restart_busy = False
+
+    def _restart(self, why):
         self.oom_retried = True          # memory is as clear as a restart can make it
         self.warm_gen += 1               # abandon a load in progress
         self.warm_status = "restarting: freeing GPU memory"
@@ -2181,13 +2261,11 @@ class Watcher:
         self.ollama.stop()
         after = wait_vram_settled(10, self.stop_evt)
         self.report_vram(before, after)
-        if self.stop_evt.is_set() or self.confirm_wine(scan_games(self.cfg), time.monotonic()) \
-                or PAUSE_FILE.exists():
-            self.restart_active = False
+        if self.stop_evt.is_set() or scan_games(self.cfg) or PAUSE_FILE.exists():
             return                       # the next pass turns this into "gaming"/"paused"
         self.go_on("starting Ollama again with the GPU memory cleared")
-        if not self.warming:             # no model, or Ollama wouldn't start: nothing to wait for
-            self.restart_active = False
+        if self.warming:
+            self.restart_gen = self.warm_gen
 
     def report_vram(self, before, after, quiet=False):
         if after is None:
@@ -2208,8 +2286,9 @@ class Watcher:
             self.warm_status = "out of GPU memory; restarting Ollama to clear it"
             self.event(f"{model} didn't fit in GPU memory ({detail[:160]}); restarting Ollama "
                        "to clear it and trying once more", "warn")
-            self.request_restart("automatic restart after running out of GPU memory")
-            return
+            if self.request_restart("automatic restart after running out of GPU memory"):
+                return
+            # A restart is already under way or queued; this load still has to end.
         ctx = int(self.cfg["context_length"])
         self.report_vram(None, (memory_readings() or {}).get("vram_used"), quiet=True)
         where = f" {self.vram_report}." if self.vram_report else ""
@@ -2231,7 +2310,6 @@ class Watcher:
         finally:
             if gen == self.warm_gen:
                 self.warming = False
-                self.restart_active = False   # a restart ends when its load does
 
     def _fail(self, gen, status, retry=300):
         if gen == self.warm_gen:
@@ -2797,13 +2875,16 @@ class Watcher:
         if not wine:
             self.wine_since = None
             return games
-        if self.state in ("gaming", "cooldown"):   # Ollama is already off: no need to wait
-            return games
+        if self.state != "ai":       # Ollama is off (game, cooldown, pause, starting up):
+            return games             # holding it off costs nothing, so no need to wait
         if self.wine_since is None:
             self.wine_since = now
         if now - self.wine_since >= WINE_CONFIRM_SECONDS:
             return games
-        return {pid: label for pid, label in games.items() if pid not in wine}
+        # A program that has already been running a while counts at once: what's being
+        # filtered out is short Wine runs, not games that were running before we looked.
+        return {pid: label for pid, label in games.items()
+                if pid not in wine or process_age(pid) >= WINE_CONFIRM_SECONDS}
 
     def busy(self):
         """Something the update's restart would cut off: a download, a speed test, a load."""
@@ -2875,7 +2956,7 @@ class Watcher:
         if self.in_use:
             self.last_used = time.time()
 
-    def snapshot(self, now=None):
+    def snapshot(self, now=None, memory=True):
         now = time.monotonic() if now is None else now
         if not self.mac:            # the network may not have been up when we started
             self.mac = nic_info()[1]
@@ -2908,7 +2989,7 @@ class Watcher:
             "alias": self.cfg["alias"] if self.loaded_name and same_model(
                 self.loaded_name, self.cfg["alias"] or "-") else "",
             "loaded_name": self.loaded_name if ready else None,
-            "memory": memory_readings(),
+            "memory": memory_readings() if memory else None,
             "events": list(self.events)[:20],
             "speed": self.speed,
             "speed_results": self.current_speed_results()[:8],
@@ -2917,13 +2998,14 @@ class Watcher:
         }
 
     def write_status(self, now):
-        status = self.snapshot(now)
+        status = self.snapshot(now, memory=False)
         # Only write when something changed, plus a heartbeat so `status` can tell a
-        # live watcher from a dead one.
+        # live watcher from a dead one. Memory readings change every poll, so they don't
+        # count as a change; they're added when writing anyway.
         if status == self.last_status and now - self.last_status_write < 10:
             return
         self.last_status, self.last_status_write = status, now
-        write_status_file(dict(status, updated=time.time()))
+        write_status_file(dict(status, memory=memory_readings(), updated=time.time()))
 
     def run(self):
         if threading.current_thread() is threading.main_thread():
@@ -2970,7 +3052,9 @@ class Watcher:
                 self.write_status(mono)
             except Exception as e:
                 self.event(f"couldn't write status: {e!r}")
-            self.stop_evt.wait(poll)
+            # A game ending only starts the cooldown, so while one runs, checking every 5 s
+            # costs nothing noticeable and saves the game most of the watcher's work.
+            self.stop_evt.wait(max(poll, 5) if self.state == "gaming" else poll)
         self.standin.stop()
         if self.page:
             self.page.stop()
@@ -3037,6 +3121,9 @@ def load_config_or_wait():
     m = re.search(r"^\s*port\s*=\s*(\d+)", _read_text(CONFIG_FILE), re.M)
     port = int(m.group(1)) if m else DEFAULTS["port"]
     user_systemctl("stop", MANAGED_OLLAMA_UNIT)
+    u = re.search(r"""^\s*ollama_unit\s*=\s*["']([\w@.:-]+\.service)["']""", _read_text(CONFIG_FILE), re.M)
+    if u and u.group(1) != MANAGED_OLLAMA_UNIT:
+        user_systemctl("stop", u.group(1))     # your own Ollama must not keep the GPU either
     standin = StandIn(port)
     standin.message = (f"The AI server on {socket.gethostname()} is off: gpu-yield's config "
                        f"file has an error ({CONFIG_FILE}).")
@@ -3120,6 +3207,7 @@ def cmd_status(args):
         print("No status yet.")
         return
     stale = time.time() - st.get("updated", 0) > 30
+    st["memory"] = memory_readings() or st.get("memory")    # same PC: read it fresh
     print_status(st, "   (stale: last update " + ago(time.time() - st['updated']) + " ago)"
                  if stale else "")
     if st.get("version") and st["version"] != VERSION:
@@ -3218,18 +3306,21 @@ def fetch_remote_status(host, port, timeout=4):
                                  headers={"User-Agent": f"{APP}/{VERSION}"})
     end = time.monotonic() + timeout
     data = b""
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        while True:
-            chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
-            if not chunk:
-                break
-            data += chunk
-            if len(data) > REMOTE_MAX:
-                raise ValueError("the reply is too large to be a gpu-yield status")
-            if time.monotonic() > end:
-                raise ValueError("the reply took too long")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            while True:
+                chunk = r.read1(65536) if hasattr(r, "read1") else r.read(65536)
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) > REMOTE_MAX:
+                    raise ValueError("the reply is too large to be a gpu-yield status")
+                if time.monotonic() > end:
+                    raise ValueError("the reply took too long")
+    except http.client.HTTPException as e:     # something that isn't a web server
+        raise ValueError(f"that port doesn't answer like a web page ({e!r})") from None
     st = json.loads(data)
-    if not isinstance(st, dict):
+    if not isinstance(st, dict) or not ("state" in st or "version" in st):
         raise ValueError("the reply isn't a gpu-yield status")
     st = _clean(st)
     if st.get("mac") is not None and not (isinstance(st["mac"], str) and MAC_RE.match(st["mac"])):
@@ -3288,6 +3379,9 @@ def send_magic_packet(mac, ip=None):
 
 
 def cmd_wake(args):
+    """Wake a PC and wait until its AI answers (not just the PC): exit 0 when the AI is
+    ready, 1 when the PC is up but the AI isn't available (a game, a pause) or never
+    came up, so `gpu-yield wake pc && my-ai-script` does what it says."""
     hosts = load_hosts()
     target = args.target or (next(iter(hosts)) if len(hosts) == 1 else None)
     if not target:
@@ -3300,43 +3394,57 @@ def cmd_wake(args):
         host, port = split_host(target)
     except ValueError as e:
         die(str(e))
-    try:
-        st = fetch_remote_status(host, port, timeout=2)
-        remember_host(host, port, st)
-        print(f"{host} is already awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
-        return
-    except OSError as e:
-        if refused(e):
-            print(f"{host} is already awake (its status page is off or gpu-yield isn't running).")
-            return
-    except ValueError:
-        pass
-    info = hosts.get(host_key(host, port), {})
-    if not info.get("mac"):
-        die(f"don't know {host}'s network card address yet. While it's awake, run once:\n"
-            f"  gpu-yield status --host {target}\n"
-            f"or pass the address directly: gpu-yield wake AA:BB:CC:DD:EE:FF "
-            f"(shown by gpu-yield wol on that PC)")
-    send_magic_packet(info["mac"], info.get("ip"))
-    print(f"Wake-up packet sent to {host} ({info['mac']}).")
-    if args.no_wait:
-        return
-    print("Waiting for it to come up", end="", flush=True)
-    end = time.time() + 120
-    answered = False          # refused = network up, but gpu-yield not started (yet)
-    while time.time() < end:
-        time.sleep(3)
-        print(".", end="", flush=True)
+
+    def probe():
+        """("status", st), ("refused", None) or ("silent", None)."""
         try:
             st = fetch_remote_status(host, port, timeout=2)
+            remember_host(host, port, st)
+            return "status", st
         except OSError as e:
-            answered = answered or refused(e)
-            continue
+            return ("refused" if refused(e) else "silent"), None
         except ValueError:
-            continue
-        print(f" awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
+            return "silent", None
+
+    kind, st = probe()
+    if kind == "refused":
+        print(f"{host} is already awake (its status page is off or gpu-yield isn't running).")
         return
+    if kind == "silent":
+        info = hosts.get(host_key(host, port), {})
+        if not info.get("mac"):
+            die(f"don't know {host}'s network card address yet. While it's awake, run once:\n"
+                f"  gpu-yield status --host {target}\n"
+                f"or pass the address directly: gpu-yield wake AA:BB:CC:DD:EE:FF "
+                f"(shown by gpu-yield wol on that PC)")
+        send_magic_packet(info["mac"], info.get("ip"))
+        print(f"Wake-up packet sent to {host} ({info['mac']}).")
+        if args.no_wait:
+            return
+    elif args.no_wait or st.get("ai_available"):
+        print(f"{host} is already awake ({STATE_TEXT.get(st.get('state'), st.get('state'))}).")
+        return
+    # Up to 2 minutes for the PC to come up, then up to 3 more for the model to load.
+    print("Waiting for the AI to be ready", end="", flush=True)
+    start, seen_up, answered = time.time(), kind == "status", False
+    while time.time() < start + (300 if seen_up else 120):
+        if kind == "status":
+            seen_up = True
+            state = st.get("state")
+            if st.get("ai_available"):
+                print(f" ready ({st.get('model_status') or STATE_TEXT.get(state)}).")
+                return
+            if state in ("gaming", "paused", "config_error"):
+                print(f" {host} is awake, but the AI isn't available: {STATE_TEXT.get(state, state)}.")
+                sys.exit(1)
+        answered = answered or kind == "refused"
+        time.sleep(3)
+        print(".", end="", flush=True)
+        kind, st = probe()
     print()
+    if seen_up:
+        die(f"{host} is awake, but the AI still isn't ready ({(st or {}).get('model_status') or 'no answer'}); "
+            f"see: gpu-yield status --host {target}")
     if answered:
         print(f"{host} is awake, but its status page never answered: it's turned off there, "
               "or gpu-yield isn't running.")
@@ -3594,6 +3702,9 @@ def cmd_doctor(args):
     backend, targets = resolve_backend(cfg), gpu_targets()
     gpus = ", ".join(sorted(targets)) or "no AMD GPU found"
     note(f"GPU: {gpus}; backend {backend}" + (" (chosen automatically)" if cfg["backend"] == "auto" else ""))
+    if backend_installed(cfg) is False:
+        bad("the ROCm backend is chosen but its download isn't installed, so Ollama uses "
+            "Vulkan for now. Install it with: gpu-yield setup --reinstall")
     if backend == "rocm" and targets and not targets & ROCM_TARGETS:
         bad(f"ROCm doesn't support {gpus}, so Ollama would run on the CPU. "
             "Set backend to auto or vulkan: gpu-yield config backend auto, then "
@@ -3888,6 +3999,10 @@ def cmd_model(args):
         if not name:
             print("No change.")
             return
+    try:
+        name = normalize_model_name(name)
+    except ValueError as e:
+        die(str(e))
     if cfg["alias"] and same_model(cfg["alias"], name):
         die(f"{name} is the fixed name gpu-yield gives the loaded model for your apps; choose "
             f"the real model, or change that name first: gpu-yield config alias OTHER-NAME")
@@ -3982,7 +4097,8 @@ def cmd_config(args):
     if key == "context_length":
         print(f"Set context_length and ollama_num_ctx to {cfg[key]} in Hermes's config too.")
     elif key == "backend":
-        print("The Ollama download depends on the backend; finish with: gpu-yield setup --reinstall")
+        print("The ROCm backend is a separate download: if it isn't installed yet, Ollama keeps "
+              "using Vulkan until you run: gpu-yield setup --reinstall")
     elif key == "status_page":
         print(f"Status page: http://{socket.gethostname()}:{cfg['status_port']}/" if page_port(cfg)
               else "Status page off. gpu-yield status still works on this PC; status --host "
@@ -4020,15 +4136,27 @@ def cmd_setup(args):
     if not CONFIG_FILE.exists():
         write_private(CONFIG_FILE, CONFIG_TEMPLATE)
         log(f"  wrote {CONFIG_FILE}")
-    overrides = {k: v for k, v in (("model", args.model), ("context_length", args.context),
-                                   ("backend", args.backend)) if v is not None}
+    overrides = {k: v for k, v in (("context_length", args.context), ("backend", args.backend))
+                 if v is not None}
     cfg = change_settings(overrides) if overrides else load_config()
-    if not cfg["model"]:
-        choice = choose_model(args)
-        if choice:
-            cfg = change_settings({"model": choice})
+    # A new model is saved to the config only once it has downloaded (step 7), so a typo
+    # or a failed download leaves the working model in place.
+    new_model = args.model if args.model is not None else \
+        (None if cfg["model"] else choose_model(args) or None)
+    if new_model:
+        try:
+            new_model = normalize_model_name(new_model)
+        except ValueError as e:
+            die(f"{e}; nothing changed")
+        if cfg["alias"] and same_model(cfg["alias"], new_model):
+            die(f"{new_model} is the fixed name for your apps; choose the real model")
+        if cfg["model"] and same_model(cfg["model"], new_model):
+            new_model = None
+    if new_model and args.skip_pull:          # you'll download it yourself
+        cfg, new_model = change_settings({"model": new_model}), None
     managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
-    log(f"  model {cfg['model'] or 'none yet'}, context {cfg['context_length']}, "
+    shown = f"{new_model} (downloaded in step 7)" if new_model else cfg["model"] or "none yet"
+    log(f"  model {shown}, context {cfg['context_length']}, "
         f"backend {resolve_backend(cfg)}" + (" (auto)" if cfg["backend"] == "auto" else ""))
 
     log("2/8 Checking for other Ollama installs")
@@ -4041,9 +4169,11 @@ def cmd_setup(args):
     try:
         if not managed:
             log(f"  using your own unit {cfg['ollama_unit']}")
-        elif OLLAMA_BIN.exists() and not args.reinstall:
+        elif OLLAMA_BIN.exists() and not args.reinstall and backend_installed(cfg) is not False:
             log(f"  already installed at {OLLAMA_DIR} (--reinstall to update)")
         else:
+            if OLLAMA_BIN.exists() and not args.reinstall:
+                log("  the ROCm part of Ollama isn't installed yet; downloading it")
             install_ollama(resolve_backend(cfg))
     except BaseException:
         if was_running:              # a failed reinstall keeps the old Ollama; keep the AI too
@@ -4075,16 +4205,23 @@ def cmd_setup(args):
     enable_wol(args)
 
     log("7/8 Model")
-    if not cfg["model"]:
+    target, failed = new_model or cfg["model"], False
+    if not target:
         log("  none chosen; pick one any time with: gpu-yield model")
     elif args.skip_pull:
         log("  skipped")
     elif not Ollama(cfg).wait_ready(60):
         st = read_status() or {}
         warn(f"Ollama isn't up (state: {STATE_TEXT.get(st.get('state'))}). "
-             f"Download the model later with: gpu-yield model {cfg['model']}")
-    else:
-        pull_and_load(cfg, cfg["model"])
+             f"Download the model later with: gpu-yield model {target}")
+        failed = bool(new_model)
+    elif pull_and_load(cfg, target):
+        if new_model:
+            cfg = change_settings({"model": new_model})
+            user_systemctl("restart", WATCHER_UNIT)
+    elif new_model:
+        failed = True
+        warn(f"kept {cfg['model'] or 'no model'}; try again with: gpu-yield model {new_model}")
 
     log("8/8 Done\n")
     print(hermes_snippet(cfg))
@@ -4096,6 +4233,8 @@ Useful commands:
   gpu-yield status      gpu-yield doctor      gpu-yield config
   gpu-yield pause       gpu-yield resume      gpu-yield model
   journalctl --user -u gpu-yield -f""")
+    if failed:
+        sys.exit(1)
 
 
 def cmd_uninstall(args):

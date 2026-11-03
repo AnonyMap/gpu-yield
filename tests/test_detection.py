@@ -82,6 +82,9 @@ ok("a Windows game using the GPU counts, only when no Steam game is running; ign
 
 # The watcher waits 5 s before acting on a Windows program outside Steam
 wt = gy.Watcher(dict(gy.DEFAULTS, port=1))
+wt.state = "ai"                                  # the wait only applies while the AI is on
+real_age = gy.process_age
+gy.process_age = lambda pid: 0.0                 # a program that has just started
 wine_game = {1: "Hades2.exe" + gy.WINE_SUFFIX}
 steam_game = {2: "The Riftbreaker (AppId 1820000)"}
 assert wt.confirm_wine(steam_game, 100.0) == steam_game, "Steam games count at once"
@@ -90,7 +93,18 @@ assert wt.confirm_wine(wine_game, 104.0) == {}
 assert wt.confirm_wine(wine_game, 105.5) == wine_game
 assert wt.confirm_wine({}, 106.0) == {} and wt.wine_since is None
 assert wt.confirm_wine(wine_game, 107.0) == {}, "a new Wine run starts the wait again"
-ok("a Windows program outside Steam must keep running 5 s before the AI stops")
+gy.process_age = lambda pid: 60.0                # already running when we looked
+wt.wine_since = None
+assert wt.confirm_wine(wine_game, 200.0) == wine_game, "a game that was already running counts at once"
+gy.process_age = lambda pid: 0.0
+wt.wine_since = None
+for state in (None, "paused", "cooldown", "gaming"):
+    wt.state = state
+    assert wt.confirm_wine(wine_game, 300.0) == wine_game, f"no wait while the AI is off ({state})"
+gy.process_age = real_age
+import os
+assert 0 <= gy.process_age(os.getpid()) < 600 and gy.process_age(999999999) == 0.0
+ok("a Windows program outside Steam must keep running 5 s before the AI stops (only while it's on)")
 
 # extra_processes also matches the short name `ps -e` shows (15 chars)
 import shutil, subprocess
