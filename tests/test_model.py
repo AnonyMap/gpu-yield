@@ -61,4 +61,21 @@ w.step({}, False, False, time.monotonic())
 time.sleep(0.2)
 assert w.state == "ai" and "warm" not in calls and "gpu-yield model" in w.warm_status
 ok("with no model chosen, Ollama runs and nothing is preloaded")
+# A model that's already installed (including one made with `ollama create`, which exists
+# on no server) is used as it is, not downloaded again
+runs = []
+real_run = gy.subprocess.run
+gy.subprocess.run = lambda cmd, **k: runs.append(cmd) or types.SimpleNamespace(returncode=1)
+class Tags(FO):
+    def request(self, path, payload=None, **k):
+        return {"models": [{"name": "muse-glimmer-text:latest"}]} if path == "/api/tags" else {}
+    def warm(self, name=None): calls.append("warm")
+    def loaded(self): return []
+gy.Ollama = Tags
+gy.placement_note = lambda *a: (False, "")
+cfg = dict(gy.DEFAULTS, port=1)
+assert gy.pull_and_load(cfg, "muse-glimmer-text") and not runs, runs
+assert gy.pull_and_load(cfg, "qwen3.5:9b") is False and runs and runs[0][1:] == ["pull", "qwen3.5:9b"]
+gy.subprocess.run = real_run
+ok("gpu-yield model uses a model already on the PC (e.g. made with ollama create) without downloading")
 print("model tests passed")

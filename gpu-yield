@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.11.1"
+VERSION = "1.11.2"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -4036,7 +4036,16 @@ def pull_and_load(cfg, name):
     managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
     exe = str(OLLAMA_BIN) if managed else (shutil.which("ollama") or "ollama")
     env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{cfg['port']}")
-    if subprocess.run([exe, "pull", name], env=env).returncode:
+    try:
+        installed = [tag_name(m) for m in
+                     Ollama(cfg).request("/api/tags", timeout=10).get("models", [])]
+    except Exception:
+        installed = []
+    if any(same_model(name, m) for m in installed):
+        # Already here. It may be one you made yourself (ollama create), which exists on
+        # no server, so asking Ollama to download it again would only fail.
+        log(f"  {name} is already on this PC; not downloading it again")
+    elif subprocess.run([exe, "pull", name], env=env).returncode:
         warn(f"download failed; check the name, then retry with: gpu-yield model {name}")
         return False
     log("  loading it into VRAM...")
