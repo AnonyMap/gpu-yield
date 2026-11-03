@@ -2,6 +2,12 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.13.0 (2026-11-02)
+- Shared-memory chips (the AMD BC-250 and most APUs, where the GPU borrows system memory) are handled properly. The status page, `status` and `doctor` show the shared pool and the GPU's use of it, instead of a tiny fixed slice. The model picker and restart reports measure against it. There's no "spilled to system RAM" warning, since that's how these chips work.
+- A fit check for shared memory: a model whose file is bigger than the pool minus about 3 GB (about 12.5 GB on a 16 GB BC-250) is refused before it loads. One that leaves the rest of the PC less than 0.75 GB is unloaded. Either way, gpu-yield goes back to the last model that fit.
+- On a BC-250: context storage defaults to 8 bits (q8_0), and `doctor` checks the board's known pitfalls: kernel versions, the GPU memory limit and BIOS split, IOMMU, GPU overrides, ROCm, Mesa, the clock governor, swap and zram, and persistent crash logs. It reports only; it never changes system settings.
+- New, separate script `extras/glimmer-text`: lists the Muse Glimmer builds with a fit verdict for this PC, downloads only the text model (no image part) with resume and checksum verification, builds it in Ollama, and loads it through gpu-yield.
+
 ## 1.12.0 (2026-11-02)
 - On ROCm, a model that doesn't fit entirely in the graphics card's memory is unloaded as soon as it loads, and gpu-yield goes back to the last model and context that fit, if that model is still downloaded, saying why in the recent events. Running part of a model from system RAM through ROCm stalled the driver and shut down the example PC twice. This covers model switches and context changes that make the model too big. `gpu-yield model` refuses such a model, and one that fails to load, without switching. `allow_partial_gpu = true` turns the check off; on Vulkan it only warns, as before.
 - If an app loads a model or context that doesn't fit, it's unloaded once the app's request finishes, and gpu-yield reloads its own. If the app does it again, gpu-yield pauses the AI, and the stand-in and status page say why, until you fix the app and run `gpu-yield resume`.

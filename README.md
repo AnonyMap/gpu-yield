@@ -25,6 +25,7 @@ It's a single Python file with no dependencies, built for [Bazzite](https://bazz
 - [Controls on the status page](#controls-on-the-status-page)
 - [From other computers](#from-other-computers)
 - [Sleep and Wake-on-LAN](#sleep-and-wake-on-lan)
+- [BC-250 and other shared-memory chips](#bc-250-and-other-shared-memory-chips)
 - [Game detection](#game-detection)
 - [Settings](#settings)
 - [Updating](#updating)
@@ -234,6 +235,22 @@ Wake-on-LAN is most reliable over a wired connection. Some PCs also need it enab
 
 **Or don't let it sleep.** Set Steam's sleep timer to *Never* (Steam → Settings → Power). gpu-yield can't keep the PC awake itself: Linux lets a user override their own sleep blocks, and gpu-yield runs as the same user as Steam, so Steam's sleep would ignore a block from gpu-yield.
 
+## BC-250 and other shared-memory chips
+
+Some chips have no graphics memory of their own: the GPU borrows system memory instead. The AMD BC-250 board is one, along with most APUs. gpu-yield notices when a chip has only a small fixed slice of graphics memory (under 2 GB), and adjusts:
+
+- **Readings.** The status page, `status` and `doctor` show the shared pool and how much of it the GPU is using. A model living in "system RAM" is how these chips work, so gpu-yield doesn't warn about it.
+- **A fit check for the shared pool.** Model and system draw on the same memory, and running it out freezes the whole board. So gpu-yield refuses a model whose file is bigger than the pool minus about 3 GB, before loading it; that's about 12.5 GB on a 16 GB BC-250. It also unloads a model that leaves the rest of the PC less than 0.75 GB once loaded. Either way it goes back to the last model that fit. `allow_partial_gpu = true` turns this off.
+- **Restart reports** count each program's borrowed memory, so they name what's really using it.
+- **The model picker** measures models against the shared pool.
+
+On a **BC-250** (detected by its chip ID), two more things happen:
+
+- **Context storage at 8 bits** (`OLLAMA_KV_CACHE_TYPE=q8_0`) unless you set it yourself. It halves context memory in the shared pool. It also protects models with few KV heads, such as Muse Glimmer with 2, which 4-bit context storage can wreck. It needs Mesa 25.1 or newer for flash attention; on older Mesa, Ollama ignores it.
+- **`doctor` checks the board's known pitfalls:** kernel versions with BC-250 bugs, the GPU memory limit (`ttm.pages_limit`, and conflicting places it's set), the BIOS memory split, IOMMU, a risky `HSA_OVERRIDE_GFX_VERSION`, ROCm being installed, the Mesa version, the GPU clock governor and its voltage settings, swap and zram, whether crash logs survive a reboot, and 4-bit context storage with a few-head model. It only reports; it never changes kernel, BIOS or governor settings. For crash history and temperatures, use the community BC-250 health check script.
+
+gpu-yield uses Vulkan on these chips, chosen automatically. The board works the same whether or not you play games on it. Without games, gpu-yield is simply a model manager with a status page.
+
 ## Game detection
 
 You don't need to set anything up per game.
@@ -345,7 +362,7 @@ The watcher checks once a day (time asleep counts) and installs only while no ga
 - **There's a short gap at each handoff.** The stand-in exists only while Ollama is stopped, so connections are refused for under a second whenever the AI stops or starts.
 - **Native Linux games outside Steam** need to be added to `extra_processes`.
 - **gpu-yield can't keep the PC from sleeping;** see [Sleep and Wake-on-LAN](#sleep-and-wake-on-lan).
-- **Not tested on NVIDIA or Intel GPUs.**
+- **Not tested on NVIDIA or Intel GPUs.** The BC-250 support is tested against simulated readings, not yet on a real board.
 
 ## Example setup
 

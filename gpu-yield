@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.12.0"
+VERSION = "1.13.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -965,6 +965,11 @@ def ollama_unit_text(cfg):
         "OLLAMA_NUM_PARALLEL": "1",              # parallel slots multiply context memory
         "OLLAMA_MAX_LOADED_MODELS": "1",
     }
+    # BC-250: store the context at 8 bits unless you chose otherwise. It halves context
+    # memory in a pool shared with Linux; and models with few KV heads (Muse Glimmer has
+    # 2) must never use q4_0, which can wreck their output.
+    if is_bc250() and "OLLAMA_KV_CACHE_TYPE" not in cfg["ollama_env"]:
+        env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
     # Until the ROCm download is installed (gpu-yield setup --reinstall), keep using Vulkan
     # rather than silently falling back to the CPU.
     if resolve_backend(cfg) == "vulkan" or backend_installed(cfg) is False:
@@ -1109,6 +1114,12 @@ class Ollama:
         return any(k.endswith(".expert_count") and v for k, v in info.items())
 
 
+def guards_shared_fit(cfg):
+    """True where a model must leave Linux enough memory: shared-memory chips like the
+    BC-250, where model and system draw on one pool and running out freezes the board."""
+    return not cfg["allow_partial_gpu"] and shared_memory_gpu()
+
+
 def guards_gpu_fit(cfg):
     """True where a model must fit entirely in VRAM: ROCm (unless allowed). Through ROCm
     the GPU reads spilled weights from system RAM via the driver, which has stalled the
@@ -1199,6 +1210,41 @@ def tilde(path):
 
 
 DRM_DIR = Path("/sys/class/drm")
+SHARED_VRAM_BELOW = 2 * 2**30      # a fixed GPU slice this small means shared memory
+SHARED_OS_RESERVE = 3 * 2**30      # shared memory kept back for Linux itself
+SHARED_MIN_FREE = 3 * 2**30 // 4   # less than this available after a load: too big
+
+
+def gpu_used(m):
+    """Memory the GPU is using: its VRAM, plus borrowed system memory on shared chips."""
+    m = m or {}
+    return m.get("gpu_used", m.get("vram_used"))
+
+
+def shared_memory_gpu():
+    """True on a chip whose GPU shares system memory (BC-250, APUs)."""
+    return bool((memory_readings() or {}).get("shared"))
+
+
+def mem_available():
+    m = re.search(r"^MemAvailable:\s+(\d+) kB", _read_text(Path("/proc/meminfo")), re.M)
+    return int(m.group(1)) * 1024 if m else None
+
+
+def shared_budget():
+    """Biggest model file a shared-memory chip can take: all memory minus room for Linux
+    and the model's context (the BC-250 health check's own lines: ~12.5 GB of 16)."""
+    total = total_ram()
+    return total - SHARED_OS_RESERVE if total else None
+
+
+def is_bc250():
+    """The AMD BC-250 board (Cyan Skillfish, PCI device 0x13fe)."""
+    for dev in DRM_DIR.glob("card*/device"):
+        if _read_text(dev / "vendor").strip() == "0x1002" and \
+                _read_text(dev / "device").strip() == "0x13fe":
+            return True
+    return False
 
 
 def memory_readings():
@@ -1216,7 +1262,11 @@ def memory_readings():
                 gtt = int(_read_text(dev / "mem_info_gtt_used"))
             except ValueError:
                 gtt = None
-            gpu = {"vram_used": used, "vram_total": total, "gtt_used": gtt}
+            try:
+                gtt_total = int(_read_text(dev / "mem_info_gtt_total"))
+            except ValueError:
+                gtt_total = None
+            gpu = {"vram_used": used, "vram_total": total, "gtt_used": gtt, "gtt_total": gtt_total}
     info = dict(re.findall(r"^(\w+):\s+(\d+) kB", _read_text(Path("/proc/meminfo")), re.M))
     ram = None
     if "MemTotal" in info and "MemAvailable" in info:
@@ -1224,7 +1274,13 @@ def memory_readings():
         ram = {"ram_used": total - int(info["MemAvailable"]) * 1024, "ram_total": total}
     if not gpu and not ram:
         return None
-    return {**(gpu or {}), **(ram or {})}
+    m = {**(gpu or {}), **(ram or {})}
+    # A chip that shares system memory with its GPU (BC-250, APUs) has only a small
+    # fixed slice of "VRAM"; the model lives in system memory the GPU borrows (GTT).
+    m["shared"] = bool(gpu and gpu["vram_total"] < SHARED_VRAM_BELOW)
+    borrowed = (gpu["gtt_used"] or 0) if gpu and m["shared"] else 0
+    m["gpu_used"] = gpu["vram_used"] + borrowed if gpu else None
+    return m
 
 
 _FDINFO_VRAM = [re.compile(rf"^drm-{k}-vram:\s*(\d+)\s*([KMG]iB)?", re.M)
@@ -1232,17 +1288,30 @@ _FDINFO_VRAM = [re.compile(rf"^drm-{k}-vram:\s*(\d+)\s*([KMG]iB)?", re.M)
 _UNITS = {None: 1, "KiB": 2**10, "MiB": 2**20, "GiB": 2**30}
 
 
-def fdinfo_vram(info):
-    """(GPU client id or None, bytes of VRAM, PCI device or None) from one
-    /proc/PID/fdinfo/FD, or None if it isn't a GPU file with VRAM accounting."""
-    for pattern in _FDINFO_VRAM:
+_FDINFO_GTT = [re.compile(rf"^drm-{k}-gtt:\s*(\d+)\s*([KMG]iB)?", re.M)
+               for k in ("memory", "resident", "total")]
+
+
+def _fdinfo_bytes(patterns, info):
+    for pattern in patterns:
         m = pattern.search(info)
         if m:
-            cid = re.search(r"^drm-client-id:\s*(\d+)", info, re.M)
-            pdev = re.search(r"^drm-pdev:\s*(\S+)", info, re.M)
-            return ((cid.group(1) if cid else None), int(m.group(1)) * _UNITS[m.group(2)],
-                    pdev.group(1) if pdev else None)
+            return int(m.group(1)) * _UNITS[m.group(2)]
     return None
+
+
+def fdinfo_vram(info, gtt=False):
+    """(GPU client id or None, bytes of VRAM, PCI device or None) from one
+    /proc/PID/fdinfo/FD, or None if it isn't a GPU file with VRAM accounting. With
+    `gtt`, borrowed system memory counts too (shared-memory chips keep models there)."""
+    vram = _fdinfo_bytes(_FDINFO_VRAM, info)
+    if vram is None:
+        return None
+    if gtt:
+        vram += _fdinfo_bytes(_FDINFO_GTT, info) or 0
+    cid = re.search(r"^drm-client-id:\s*(\d+)", info, re.M)
+    pdev = re.search(r"^drm-pdev:\s*(\S+)", info, re.M)
+    return (cid.group(1) if cid else None), vram, pdev.group(1) if pdev else None
 
 
 def main_gpu_pdev():
@@ -1259,13 +1328,14 @@ def main_gpu_pdev():
     return best[1]
 
 
-def vram_holders(min_bytes=64 * 2**20, proc="/proc", pdev=None):
+def vram_holders(min_bytes=64 * 2**20, proc="/proc", pdev=None, gtt=None):
     """Programs holding video memory, biggest first: [(pid, name, bytes)], from the
     driver's own per-program accounting. Only programs this user may look at, which on
     a gaming PC includes Steam, its interface and its games. Costs a scan of /proc, so
     it runs on request, never in the 2 s loop."""
     out = []
     pdev = pdev or main_gpu_pdev()
+    gtt = shared_memory_gpu() if gtt is None else gtt
     try:
         entries = sorted((e.name for e in os.scandir(proc) if e.name.isdigit()), key=int)
     except OSError:
@@ -1283,7 +1353,7 @@ def vram_holders(min_bytes=64 * 2**20, proc="/proc", pdev=None):
                     continue
             except OSError:
                 continue
-            found = fdinfo_vram(_read_text(Path(f"{proc}/{pid}/fdinfo/{fd}")))
+            found = fdinfo_vram(_read_text(Path(f"{proc}/{pid}/fdinfo/{fd}")), gtt)
             if not found or (pdev and found[2] and found[2] != pdev):
                 continue
             key = (found[2], found[0]) if found[0] else (pid, fd)
@@ -1311,7 +1381,7 @@ def wait_vram_settled(timeout=10.0, stop=None):
     can take a moment to hand memory back). Returns the settled reading, or None."""
     end, last, steady = time.monotonic() + timeout, None, 0
     while time.monotonic() < end:
-        used = (memory_readings() or {}).get("vram_used")
+        used = gpu_used(memory_readings())
         if used is None:
             return None
         steady = steady + 1 if last is not None and abs(used - last) < 32 * 2**20 else 0
@@ -1333,10 +1403,14 @@ OOM_RE = re.compile(r"out[- _]of[- _](device[- _])?memory|outofdevicememory|erro
 
 
 def memory_line(m):
-    """'GPU 15.1 / 16.0 GB · RAM 9.8 / 31.3 GB (+2.3 GB of RAM mapped for the GPU)'."""
+    """'GPU 15.1 / 16.0 GB · RAM 9.8 / 31.3 GB (+2.3 GB of RAM mapped for the GPU)', or on
+    a shared-memory chip 'shared memory 13.2 / 15.5 GB, 11.8 GB of it used by the GPU'."""
     if not m:
         return ""
     g = lambda b: f"{b / 2**30:.1f}"      # GiB: how cards and RAM are sold ("16 GB")
+    if m.get("shared") and m.get("ram_total"):
+        return (f"shared memory {g(m['ram_used'])} / {g(m['ram_total'])} GB, "
+                f"{g(gpu_used(m) or 0)} GB of it used by the GPU")
     parts = []
     if m.get("vram_total"):
         parts.append(f"GPU {g(m['vram_used'])} / {g(m['vram_total'])} GB")
@@ -1775,7 +1849,9 @@ function renderStatus(s) {
   else rows.push(["Model", "none chosen"]);
   if (s.model && s.alias) rows.push(["Apps use", s.alias + " (always the loaded model)"]);
   const m = s.memory;
-  if (m && m.vram_total) rows.push(["GPU memory", gb1(m.vram_used) + " / " + gb1(m.vram_total) + " GB"
+  if (m && m.shared && m.ram_total) rows.push(["Shared memory", gb1(m.ram_used) + " / " + gb1(m.ram_total)
+    + " GB, " + gb1(m.gpu_used || 0) + " GB of it used by the GPU"]);
+  else if (m && m.vram_total) rows.push(["GPU memory", gb1(m.vram_used) + " / " + gb1(m.vram_total) + " GB"
     + (m.gtt_used > 1073741824 ? " (+" + gb1(m.gtt_used) + " GB of RAM mapped for the GPU)" : "")]);
   if (m && m.ram_total) rows.push(["RAM", gb1(m.ram_used) + " / " + gb1(m.ram_total) + " GB"]);
   if (s.in_use) rows.push(["In use", "yes, right now"]);
@@ -2416,7 +2492,7 @@ class Watcher:
         self.warm_gen += 1               # abandon a load in progress
         self.warm_status = "restarting: freeing GPU memory"
         self.write_status(time.monotonic())
-        before = (memory_readings() or {}).get("vram_used")
+        before = gpu_used(memory_readings())
         self.ollama.stop()
         after = wait_vram_settled(10, self.stop_evt)
         self.report_vram(before, after)
@@ -2450,7 +2526,7 @@ class Watcher:
                 return
             # A restart is already under way or queued; this load still has to end.
         ctx = int(self.cfg["context_length"])
-        self.report_vram(None, (memory_readings() or {}).get("vram_used"), quiet=True)
+        self.report_vram(None, gpu_used(memory_readings()), quiet=True)
         where = f" {self.vram_report}." if self.vram_report else ""
         self._fail(gen, f"failed: not enough GPU memory for {model} at context {ctx}.{where} "
                         f"Close whatever is using it, or try a smaller context: "
@@ -2525,6 +2601,16 @@ class Watcher:
                                               f"({http_error_detail(e)}); apps using {alias} may "
                                               f"get an older model")
                         self.event(self.alias_problem, "error")
+            if guards_shared_fit(self.cfg):
+                # Shared memory: check the file against the pool before loading. Running
+                # it out freezes the whole board, so this can't wait for the load.
+                size = next((m.get("size") for m in tags if same_model(tag_name(m), model)), None)
+                budget = shared_budget()
+                if size and budget and size > budget:
+                    return self.refuse_spill(gen, model, target, None, why=(
+                        f"{model} ({size_text(size)}) is too big for this PC's shared memory: "
+                        f"models up to about {size_text(budget)} leave Linux and the model's "
+                        "context enough room, and running out freezes the whole board"))
             self.loaded_name = target
             self.ollama.warm(target)
         except urllib.error.HTTPError as e:
@@ -2547,7 +2633,15 @@ class Watcher:
         share = gpu_share(loaded)
         if guards_gpu_fit(self.cfg) and spilled(loaded):
             return self.refuse_spill(gen, model, target, share)
-        if fits(loaded):
+        shared = guards_shared_fit(self.cfg)
+        if shared:
+            left = mem_available()
+            if left is not None and left < SHARED_MIN_FREE:
+                return self.refuse_spill(gen, model, target, share, why=(
+                    f"{model} at context {self.cfg['context_length']} left only "
+                    f"{size_text(left)} of memory for the rest of the PC, so it was unloaded: "
+                    "on a shared-memory board, running out freezes everything"))
+        if (loaded and shared) or fits(loaded):
             save_fit(model, self.cfg["context_length"])
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
@@ -2556,10 +2650,10 @@ class Watcher:
         self.oom_retried = False
         self.event(f"{model} loaded{named} in {time.monotonic() - t:.1f}s{where}")
         problem, note = placement_note(self.ollama, model, share)
-        if note:
+        if note and not (shared_memory_gpu() and share):   # shared: "in system RAM" is normal
             self.event(note, "error" if problem else "warn")
 
-    def refuse_spill(self, gen, model, target, share):
+    def refuse_spill(self, gen, model, target, share, why=None):
         """Unload a model that didn't fit in VRAM (ROCm) and go back to the last model and
         context that did, or wait and retry if there isn't one."""
         try:
@@ -2569,9 +2663,9 @@ class Watcher:
         if gen != self.warm_gen:
             return
         ctx = int(self.cfg["context_length"])
-        why = (f"{model} at context {ctx} loaded only {share}% in GPU memory, so it was "
-               "unloaded: on ROCm, running part of a model from system RAM has stalled the "
-               "graphics driver and shut down a PC")
+        why = why or (f"{model} at context {ctx} loaded only {share}% in GPU memory, so it was "
+                      "unloaded: on ROCm, running part of a model from system RAM has stalled "
+                      "the graphics driver and shut down a PC")
         prev = last_fit()
         try:
             installed = [tag_name(m) for m in self.ollama.request("/api/tags", timeout=10)
@@ -2594,7 +2688,7 @@ class Watcher:
                 for key, value in back.items():
                     self.actions.put(({"model": "model", "context_length": "context"}[key], value))
                 return
-        self.report_vram(None, (memory_readings() or {}).get("vram_used"), quiet=True)
+        self.report_vram(None, gpu_used(memory_readings()), quiet=True)
         where = f" {self.vram_report}." if self.vram_report else ""
         self._fail(gen, f"failed: {why}.{where} Free some GPU memory, choose a smaller model, "
                         f"or lower context_length (gpu-yield config context_length "
@@ -3068,6 +3162,8 @@ class Watcher:
             available = True
         store = models_dir(self.cfg)
         vram = detect_memory()[1]
+        if shared_memory_gpu() and shared_budget():
+            vram = shared_budget() / 2**30   # what a model file can use on a shared chip
         return {"models": self.models_cache["models"], "available": available,
                 "disk_free": models_free_space(store), "models_dir": tilde(store),
                 "vram_gb": round(vram, 1) if vram else None}
@@ -3973,6 +4069,141 @@ def cmd_resume(args):
         print("Not paused.")
 
 
+def _version_tuple(text):
+    nums = re.findall(r"\d+", text or "")[:3]
+    return tuple(int(n) for n in nums + ["0"] * (3 - len(nums)))
+
+
+def bc250_checks(cfg, ollama=None):
+    """The BC-250 board's own pitfalls, from the community's experience (the project's
+    bc250-check.sh): [(kind, message)] with kind "ok", "bad" or "note". Read-only:
+    gpu-yield never changes kernel, BIOS or governor settings, it only says what to do."""
+    out = []
+    add = lambda kind, msg: out.append((kind, msg))
+    cmdline = _read_text(Path("/proc/cmdline"))
+
+    kv = _version_tuple(os.uname().release)
+    if (6, 15, 0) <= kv <= (6, 15, 6) or (6, 17, 8) <= kv <= (6, 17, 10):
+        add("bad", f"kernel {os.uname().release} is in a known-bad range for the BC-250 "
+                   "(6.15.0-6.15.6, 6.17.8-6.17.10); use 6.19.x or 6.18.18+ LTS")
+    elif kv < (6, 18, 0):
+        add("note", f"kernel {os.uname().release}: 6.18.18+ LTS or 6.19.x is recommended")
+    else:
+        add("ok", f"kernel {os.uname().release}")
+
+    pl = _read_text(Path("/sys/module/ttm/parameters/pages_limit")).strip()
+    if pl.isdigit():
+        if int(pl) >= 3959290:
+            add("ok", f"GPU memory limit ttm.pages_limit = {pl} ({size_text(int(pl) * 4096)})")
+        else:
+            add("bad", f"ttm.pages_limit = {pl} caps GPU memory at {size_text(int(pl) * 4096)}: "
+                       "bigger models load, then fail or hang. Set ttm.pages_limit=4194304")
+    sources = {}
+    m = re.search(r"ttm\.pages_limit=(\d+)", cmdline)
+    if m:
+        sources["kernel command line"] = m.group(1)
+    for d in ("/etc/modprobe.d", "/etc/tmpfiles.d", "/usr/lib/tmpfiles.d"):
+        for f in sorted(Path(d).glob("*.conf")) if Path(d).is_dir() else []:
+            for line in _read_text(f).splitlines():
+                m = re.search(r"pages_limit[= ](?:.*\s)?(\d{5,})\s*$", line.strip())
+                if "pages_limit" in line and not line.lstrip().startswith("#") and m:
+                    sources[str(f)] = m.group(1)
+    if len(set(sources.values())) > 1:
+        add("bad", "ttm.pages_limit is set to different values in " + ", ".join(
+            f"{k} ({v})" for k, v in sources.items()) + "; the tmpfiles.d setting wins last. "
+            "Make them all 4194304")
+
+    mem = memory_readings() or {}
+    if mem.get("vram_total", 0) > 1.1e9 and mem.get("ram_total", 2**40) < 10e9:
+        add("bad", f"the BIOS splits memory into {size_text(mem['vram_total'])} fixed for the GPU "
+                   f"and {size_text(mem['ram_total'])} for Linux, so models over ~7 GB can't fit. "
+                   "Set 512MB dynamic VRAM in the BIOS (it may need the community-patched BIOS)")
+    elif mem.get("gtt_total"):
+        (add("ok", f"the GPU can use {size_text(mem['gtt_total'])} of shared memory")
+         if mem["gtt_total"] >= 15e9 else
+         add("bad", f"the GPU can only use {size_text(mem['gtt_total'])} of shared memory: "
+                    "set ttm.pages_limit=4194304"))
+
+    if re.search(r"\b(amd_)?iommu=off\b", cmdline):
+        add("ok", "IOMMU off")
+    elif any(Path("/sys/class/iommu").glob("*")):
+        add("bad", "IOMMU is on: turn it off in the BIOS (a known source of BC-250 instability)")
+
+    env = dict(os.environ, **cfg["ollama_env"])
+    if "HSA_OVERRIDE_GFX_VERSION" in env:
+        add("bad", "HSA_OVERRIDE_GFX_VERSION is set: pretending to be another GPU risks wrong "
+                   "results and freezes on this board. Remove it")
+    if Path("/opt/rocm").is_dir():
+        add("note", "ROCm is installed in /opt/rocm. Newer ROCm can hard-freeze this board; "
+                    "gpu-yield uses Vulkan here, so make sure nothing else uses ROCm")
+
+    try:
+        vk = run(["vulkaninfo", "--summary"], timeout=20) if shutil.which("vulkaninfo") else None
+    except (OSError, subprocess.TimeoutExpired):
+        vk = None
+    if vk and vk.returncode == 0:
+        if re.search(r"llvmpipe", vk.stdout, re.I) and not re.search(r"gfx1013", vk.stdout, re.I):
+            add("bad", "Vulkan only sees llvmpipe (software rendering): the AI would run on the "
+                       "CPU. Check the Mesa/RADV install")
+        mesa = re.search(r"Mesa (\d+\.\d+(?:\.\d+)?)", vk.stdout)
+        if mesa and _version_tuple(mesa.group(1)) < (25, 1, 0):
+            add("note", f"Mesa {mesa.group(1)}: 25.1+ is needed for flash attention, which "
+                        "8-bit context storage (q8_0) relies on")
+    elif not shutil.which("vulkaninfo"):
+        add("note", "vulkaninfo isn't installed (package vulkan-tools), so the Vulkan driver "
+                    "can't be checked")
+
+    gov = next((u for u in ("cyan-skillfish-governor-smu", "cyan-skillfish-governor",
+                            "oberon-governor")
+                if run(["systemctl", "is-active", "--quiet", u]).returncode == 0), None)
+    if gov:
+        add("ok", f"GPU clock governor running ({gov})")
+    else:
+        add("bad", "no GPU clock governor running: install and enable "
+                   "cyan-skillfish-governor-smu, the only working clock and voltage control "
+                   "on this GPU (a stable baseline is 1500 MHz at 900 mV)")
+    for conf in (Path("/etc/cyan-skillfish-governor-smu/config.toml"),
+                 Path("/etc/cyan-skillfish-governor/config.toml")):
+        text = _read_text(conf)
+        mvs = [int(v) for v in re.findall(r"\[\s*\d{3,4}\s*,\s*(\d{3,4})\s*\]", text)]
+        if mvs and min(mvs) < 700:
+            add("bad", f"{conf}: a voltage point of {min(mvs)} mV locks the GPU at 1500 MHz; "
+                       "keep every point at 700 mV or more")
+        rng = re.search(r"^\[frequency-range\](.*?)(^\[|\Z)", text, re.M | re.S)
+        if rng and re.search(r"mhz", rng.group(1), re.I):
+            add("bad", f"{conf}: an 'MHz' suffix in [frequency-range] breaks the governor's "
+                       "parser; use bare numbers")
+
+    swap = sum(int(line.split()[2]) * 1024 for line in _read_text(Path("/proc/swaps")).splitlines()[1:]
+               if len(line.split()) > 2 and "zram" not in line.split()[0])
+    zram = sum(int(_read_text(z).strip() or 0) for z in Path("/sys/block").glob("zram*/disksize"))
+    if swap < 8 * 2**30:
+        add("note", f"disk swap is {size_text(swap) if swap else 'none'}: a 16 GB swapfile on the "
+                    "NVMe is a safety net for memory peaks while a model loads")
+    if zram > 4 * 2**30:
+        add("note", f"zram is {size_text(zram)}: it lives in the same 16 GB as the model. "
+                    "About 2 GB is plenty")
+    if not any(Path("/var/log/journal").glob("*")):
+        add("bad", "the system journal isn't kept across reboots, so a crash leaves no evidence: "
+                   "sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald")
+
+    kvtype = cfg["ollama_env"].get("OLLAMA_KV_CACHE_TYPE", "q8_0")
+    if kvtype == "q4_0" and ollama is not None and cfg["model"]:
+        try:
+            info = ollama.request("/api/show", {"model": cfg["model"]}, timeout=10).get("model_info", {})
+            heads = next((v for k, v in info.items() if k.endswith(".attention.head_count_kv")), None)
+            heads = min(h for h in heads if h) if isinstance(heads, list) else heads
+        except Exception:
+            heads = None
+        if heads and heads <= 4:
+            add("bad", f"{cfg['model']} has only {heads} KV heads, and 4-bit context storage "
+                       "(q4_0) can wreck such models' answers: gpu-yield config "
+                       "env.OLLAMA_KV_CACHE_TYPE q8_0")
+    add("note", "for crash history, temperatures and the back-side memory chips, run the "
+                "community BC-250 health check (bc250-check.sh)")
+    return out
+
+
 def cmd_doctor(args):
     cfg = load_config()
     problems = 0
@@ -4010,6 +4241,10 @@ def cmd_doctor(args):
     if run(["systemctl", "is-active", "--quiet", "ollama.service"]).returncode == 0:
         bad("a system-wide ollama.service is running and competes for the port: "
             "sudo systemctl disable --now ollama.service")
+    if is_bc250():
+        print("  BC-250 board detected:")
+        for kind, msg in bc250_checks(cfg, Ollama(cfg)):
+            {"ok": ok, "bad": bad, "note": note}[kind](msg)
     backend, targets = resolve_backend(cfg), gpu_targets()
     gpus = ", ".join(sorted(targets)) or "no AMD GPU found"
     note(f"GPU: {gpus}; backend {backend}" + (" (chosen automatically)" if cfg["backend"] == "auto" else ""))
@@ -4240,19 +4475,18 @@ MODEL_CHOICES = [
 
 
 def detect_memory():
-    """(system RAM GiB, largest GPU VRAM GiB); either may be None."""
-    ram = vram = None
-    try:
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            if line.startswith("MemTotal:"):
-                ram = int(line.split()[1]) / 2**20
-    except (OSError, ValueError):
-        pass
-    for f in Path("/sys/class/drm").glob("card*/device/mem_info_vram_total"):
+    """(system RAM GiB, largest GPU VRAM GiB); either may be None. On a shared-memory chip
+    the GPU's memory is the system's, so that's what's reported for it."""
+    ram_b = total_ram()
+    ram = ram_b / 2**30 if ram_b else None
+    vram = None
+    for f in DRM_DIR.glob("card*/device/mem_info_vram_total"):
         try:
-            vram = max(vram or 0, int(f.read_text()) / 2**30)
-        except (OSError, ValueError):
+            vram = max(vram or 0, int(_read_text(f)) / 2**30)
+        except ValueError:
             pass
+    if vram is not None and vram < SHARED_VRAM_BELOW / 2**30 and ram:
+        vram = ram           # shared-memory chip: the GPU's memory is the system's
     return ram, vram
 
 
@@ -4304,6 +4538,18 @@ def pull_and_load(cfg, name):
     elif subprocess.run([exe, "pull", name], env=env).returncode:
         warn(f"download failed; check the name, then retry with: gpu-yield model {name}")
         return "download"
+    if guards_shared_fit(cfg):
+        try:
+            size = next((m.get("size") for m in Ollama(cfg).request("/api/tags", timeout=10)
+                         .get("models", []) if same_model(tag_name(m), name)), None)
+        except Exception:
+            size = None
+        budget = shared_budget()
+        if size and budget and size > budget:
+            warn(f"{name} ({size_text(size)}) is too big for this PC's shared memory; models up "
+                 f"to about {size_text(budget)} fit. Not loading it: running out freezes the "
+                 "whole board.")
+            return "refused"
     log("  loading it into VRAM...")
     o = Ollama(dict(cfg, model=name))
     try:
@@ -4321,10 +4567,22 @@ def pull_and_load(cfg, name):
                  "system RAM has stalled the driver and shut down a PC. Choose a smaller model, "
                  "or lower context_length (allow_partial_gpu = true overrides this).")
             return "refused"
-        if fits(loaded):
+        if guards_shared_fit(cfg):
+            left = mem_available()
+            if left is not None and left < SHARED_MIN_FREE:
+                try:
+                    o.request("/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
+                except Exception:
+                    pass
+                warn(f"{name} at context {cfg['context_length']} left only {size_text(left)} "
+                     "of memory for the rest of the PC, so it was unloaded: on a shared-memory "
+                     "board, running out freezes everything. Choose a smaller model or lower "
+                     "context_length.")
+                return "refused"
+        if fits(loaded) or (loaded and guards_shared_fit(cfg)):
             save_fit(name, cfg["context_length"])
         problem, msg = placement_note(o, name, share)
-        if msg:
+        if msg and not (shared_memory_gpu() and share):
             (warn if problem else log)(("" if problem else "  ") + msg)
     except Exception as e:
         warn(f"{name} downloaded, but loading it failed ({e}), so it wasn't switched to")
