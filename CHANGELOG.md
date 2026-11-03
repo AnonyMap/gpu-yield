@@ -2,6 +2,10 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.11.1 (2026-11-02)
+- Setup's model list now offers only models that fit at an agent's 64K context: `qwen3.5:9b` (recommended; about 10.5 GB, so it fits 12 GB cards), `gemma4:12b-it-qat` (needs a 16 GB card) and `qwen3.5:4b`. It flags a model too big for this PC's card. `gpt-oss:20b` is gone from the list: at 64K it nearly fills a 16 GB card, so loads could run out of memory, and it did poorly on real agent tasks. `qwen3.6:35b-a3b` is gone too: it doesn't fit a 16 GB card, and running it partly from system RAM on ROCm stalled the driver. Any model can still be chosen by name.
+- The README explains why context, not download size, decides what fits, and which models to avoid on 16 GB cards.
+
 ## 1.11.0 (2026-11-02)
 Fixes from a security audit, a bug review and a performance review.
 

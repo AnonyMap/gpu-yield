@@ -79,32 +79,32 @@ This downloads the model, loads it, saves it to the config and restarts the watc
 
 The list setup offers:
 
-| Model | Size | Notes |
-|---|---|---|
-| `gpt-oss:20b` | ~13 GB | Recommended. Native, reliable tool calling; fast, since only ~3.6B of its parameters are active per token |
-| `qwen3.6:35b-a3b` | ~23 GB | Stronger agent model. Bigger than a 16 GB card, so part of it runs from system RAM; needs ~32 GB of RAM |
-| `qwen3.5:9b` | ~6.6 GB | Smaller and faster, accepts images; lower ceiling. Test its tool calling with your client |
-| `qwen3.5:4b` | ~3.4 GB | Smallest. Fine for quick questions; weak at multi-step tool use |
+| Model | Download | At 64K context | Notes |
+|---|---|---|---|
+| `qwen3.5:9b` | ~6.6 GB | ~10.5 GB | Recommended. Fits a 12 GB card with an agent's 64K context, fast, accepts images |
+| `gemma4:12b-it-qat` | ~7.2 GB | ~12 GB | Alternative with built-in tool calling and image input; needs a 16 GB card at 64K |
+| `qwen3.5:4b` | ~3.4 GB | ~5 GB | Smallest. Fine for quick questions; weak at multi-step tool use |
 
-**Fitting a model to your hardware.** What has to fit is the model plus its context (the conversation memory, which grows with `context_length`). Gaming Mode's own interface also holds some VRAM. As a rough guide:
+**Fitting a model to your hardware.** What has to fit is the model *plus its context*, the conversation memory, which grows with `context_length`. Agents like Hermes need 64K, and depending on the model's design that costs anywhere from 2 GB (Qwen 3.5, which uses full attention in only a quarter of its layers) to 10 GB or more (ordinary dense models such as Ministral 14B or Devstral 24B). So a download that looks small enough can still be far too big. Gaming Mode's own interface also holds between a few hundred MB and about 2 GB, and that can grow after the model has loaded, so leave at least 1.5 GB free. As a rough guide:
 
-| GPU memory | Good starting point |
+| GPU memory | Good starting point at 64K context |
 |---|---|
 | 8 GB | `qwen3.5:4b`, or `qwen3.5:9b` with `context_length` 32768 |
-| 12 GB | `qwen3.5:9b` fits entirely; `gpt-oss:20b` works with part of it in system RAM (needs 16 GB+ of RAM) |
-| 16 GB | `gpt-oss:20b` |
-| 16 GB + 32 GB of RAM | `gpt-oss:20b`, or `qwen3.6:35b-a3b` for a stronger model |
-| 24 GB or more | `gpt-oss:20b` with room for a large context, or `qwen3.6:35b-a3b` mostly on the GPU |
+| 12 GB | `qwen3.5:9b`. If the card also drives a desktop, use `context_length` 32768 for headroom |
+| 16 GB | `qwen3.5:9b` with several GB to spare, or `gemma4:12b-it-qat` |
+| 24 GB or more | Room for bigger models, such as `qwen3.6:27b` |
 
-Most of these are *mixture-of-experts* models, which degrade gracefully when they don't quite fit: Ollama moves expert weights into system RAM first and keeps the rest on the GPU, and each token only reads a few experts. That costs some speed, mostly when reading long prompts, instead of failing outright. A *dense* model that spills over is much slower, so for those, lower `context_length` or pick a smaller model.
+**Models I'd avoid on a 16 GB card:**
+- `gpt-oss:20b`: about 15 GB at 64K, so it can run out of GPU memory when Steam's interface grows. On the example setup it also did poorly on real agent tasks.
+- Anything whose download is close to or bigger than the card, such as `qwen3.6:35b-a3b`, `gemma4:26b`, `devstral-small-2` or `glm-4.7-flash`.
 
-**Be careful with models bigger than the card's memory on ROCm.** That's how it's supposed to work, but on the [example PC](#example-setup) a 23 GB model on a 16 GB card ran through system RAM that the graphics driver had mapped for the GPU. The driver stalled repeatedly, and under that sustained load the power supply eventually shut the PC off. If you try one, watch *GPU memory* on the status page (it shows any RAM mapped for the GPU) and run the speed test before relying on it. A model that fits on the card is the safe choice.
+**Be careful with models bigger than the card's memory on ROCm.** Ollama can run part of a model from system RAM, and on Vulkan that only costs speed. On ROCm, the example PC's driver stalled repeatedly doing it (see [Example setup](#example-setup)). A model that fits on the card is the safe choice.
 
 **Comparing models.** The status page's speed test (or `gpu-yield speed`) measures how fast the loaded model *reads* a 2,000-token prompt and *writes* an answer, and keeps the results so models can be compared side by side. Reading speed matters most for agents like Hermes, which send long prompts. Run it while nothing else is using the AI: requests wait behind the test, and Ollama's cached conversation is replaced, so the next long request is read again from the start. The page asks first if the AI was used in the last two minutes; `gpu-yield speed` needs `--force` then.
 
 `gpu-yield doctor` shows how much of the loaded model is on the GPU and says whether that's expected. If it reports the model running entirely on the CPU, the GPU backend isn't working; doctor suggests the fix.
 
-To make context use less memory, at a small quality cost: `gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0`. It only works when Ollama uses flash attention, and helps most with dense models. gpt-oss already keeps its context small, so it gains little there.
+To make context use less memory, at a small quality cost: `gpu-yield config env.OLLAMA_KV_CACHE_TYPE q8_0`. It only works when Ollama uses flash attention, and helps most with dense models; Qwen 3.5's context is already small.
 
 ## Connecting clients
 
@@ -343,13 +343,16 @@ The watcher checks once a day (time asleep counts) and installs only while no ga
 
 The setup gpu-yield was built for:
 
-- **Gaming PC:** a living-room PC running Bazzite in Steam Gaming Mode, with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, connected over Wi-Fi. It runs `gpt-oss:20b` at a 64K context. `backend` resolves to ROCm (the RX 7800 XT is `gfx1101`).
+- **Gaming PC:** a living-room PC running Bazzite in Steam Gaming Mode, with a Radeon RX 7800 XT (16 GB) and 32 GB of RAM, connected over Wi-Fi. Hermes uses a 64K context. `backend` resolves to ROCm (the RX 7800 XT is `gfx1101`).
 - **Clients:** Hermes Agent on a desktop on the same network, set to the model name `gpu-yield` as in [Connecting clients](#connecting-clients), plus the status page on a phone.
-- **A model that didn't fit:** `qwen3.6:35b-a3b` (about 23 GB) loaded on this 16 GB card, but on ROCm the GPU read part of it from system RAM through the graphics driver. The driver logged repeated stalls, and after about 15 minutes of heavy use the 750 W power supply's protection shut the PC off. `gpt-oss:20b` fits on the card and has run without trouble.
+- **Models that didn't work out:**
+  - `qwen3.6:35b-a3b` (about 23 GB) loaded on this 16 GB card, but on ROCm the GPU read part of it from system RAM through the graphics driver. The driver logged repeated stalls, and the PC later turned off.
+  - `gpt-oss:20b` fit, but at 64K it used about 15 GB. One reload ran out of GPU memory, and in practice it did poorly on Hermes's tasks.
+  - `qwen3.5:9b` uses about 10.5 GB at 64K, leaving several GB free.
 - **Day to day:** games are launched from Big Picture, and updates can be run from the desktop with `ssh <gaming-pc> gpu-yield update`. Models and context can be changed from the status page on any device.
 - **Sleep:** the PC stays on all the time, so the AI is always reachable and Wake-on-LAN isn't used.
 
-On a card with less memory, such as a desktop with an RX 6700 XT (12 GB) and 32 GB of RAM, the same install picks Vulkan automatically. `qwen3.5:9b` fits there entirely, while `gpt-oss:20b` runs with part of it in system RAM.
+On a card with less memory, such as a desktop with an RX 6700 XT (12 GB) and 32 GB of RAM, the same install picks Vulkan automatically. `qwen3.5:9b` fits there, with `context_length` 32768 for headroom when the card also drives the desktop; `qwen3.5:4b` is the light option.
 
 ## Testing
 

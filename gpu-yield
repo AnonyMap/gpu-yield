@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.11.0"
+VERSION = "1.11.1"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -3973,11 +3973,13 @@ def enable_linger(args):
         sudo(["loginctl", "enable-linger", user])
 
 
-# name, approximate size in GB, one-line description, system RAM (GiB) it needs
+# (name, download GB, description, smallest card in GB that fits it at a 64K context)
+# Context memory decides what fits: agents like Hermes need 64K, and on these models it
+# costs 2-4 GB on top of the download. Gaming Mode's interface needs up to ~2 GB more.
 MODEL_CHOICES = [
-    ("gpt-oss:20b", 13, "recommended: reliable tool calling, fast", 0),
-    ("qwen3.6:35b-a3b", 23, "stronger agent model; part of it runs from system RAM", 30),
-    ("qwen3.5:9b", 6.6, "smaller and faster, accepts images", 0),
+    ("qwen3.5:9b", 6.6, "recommended: ~10.5 GB at 64K context, so it fits 12 GB cards; "
+                        "accepts images", 0),
+    ("gemma4:12b-it-qat", 7.2, "alternative with built-in tool calling; ~12 GB at 64K", 16),
     ("qwen3.5:4b", 3.4, "smallest; quick answers, weak at multi-step tool use", 0),
 ]
 
@@ -4007,8 +4009,10 @@ def choose_model(args):
     hw = ", ".join(x for x in (f"{vram:.0f} GB VRAM" if vram else "",
                                f"{ram:.0f} GB RAM" if ram else "") if x)
     print(f"\nWhich model should stay loaded while the PC is idle?" + (f"  (this PC: {hw})" if hw else ""))
-    for i, (name, size, blurb, min_ram) in enumerate(MODEL_CHOICES, 1):
-        short = f"   [needs ~32 GB RAM, this PC has {ram:.0f}]" if min_ram and ram and ram < min_ram else ""
+    for i, (name, size, blurb, card) in enumerate(MODEL_CHOICES, 1):
+        # Cards report a bit under their advertised size (a "16 GB" card shows ~15.98).
+        short = f"   [needs a {card} GB card at 64K context; this one has {vram:.0f} GB]" \
+            if card and vram and vram < card * 0.9 else ""
         print(f"  {i}) {name:<16} {'~' + format(size, 'g') + ' GB':<8} {blurb}{short}")
     n = len(MODEL_CHOICES)
     print(f"  {n + 1}) another model (type its Ollama name)")
