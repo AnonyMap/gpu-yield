@@ -1,0 +1,676 @@
+#!/usr/bin/env python3
+"""glimmer-text: download a text-only Muse Glimmer build and set it up in Ollama.
+
+Muse Glimmer's Hugging Face repos ship the language model and its image-understanding
+part (the "mmproj", ~4 GB) as separate files. Pulling the repo through Ollama fetches
+and loads both, which on a 16 GB card pushed part of the model into system RAM. This
+script downloads only the language-model file you choose, checks it, imports it into
+Ollama as a text-only model, and loads it (through gpu-yield when that's installed).
+
+  glimmer-text                   list the builds and pick one interactively
+  glimmer-text list              show the builds with a fit verdict for this PC
+  glimmer-text install AD-IQ3_XXS
+  glimmer-text remove [NAME]     delete a model this script created
+
+Run it as your normal user on the PC that runs Ollama.
+"""
+import argparse
+import hashlib
+import http.client
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:          # Python < 3.11: gpu-yield's config just isn't read
+    tomllib = None
+
+VERSION = "1.0"
+UA = f"glimmer-text/{VERSION}"
+HF = "https://huggingface.co"
+DEFAULT_REPO = "AtomicChat/Muse-Glimmer-30B-GGUF"
+GIB = 2**30
+
+# Muse Glimmer's context memory (from its config.json): 13 of its 52 layers keep the
+# whole conversation, with 2 KV heads of 128 dims each, so one token costs
+# 13 layers x 2 heads x 128 x 2 (keys and values) x 2 bytes = 13 KiB at f16. The other
+# 39 layers only keep the last 2,048 tokens: a fixed ~0.1 GiB.
+CTX_BYTES_PER_TOKEN_F16 = 13 * 1024
+CTX_SLIDING_BYTES = int(0.1 * GIB)
+WORKING_SPACE = int(0.7 * GIB)      # Ollama's compute buffers for a model this size
+APU_OS_RESERVE = int(2.5 * GIB)     # shared-memory boards: what Linux itself needs
+DGPU_HEADROOM = int(1.5 * GIB)      # graphics cards: Gaming Mode/desktop plus a margin
+BC250_DEVICE = "0x13fe"
+
+current_part = None                 # the partial download, for a Ctrl-C message
+
+
+def log(msg=""):
+    print(msg, flush=True)
+
+
+def warn(msg):
+    print(f"WARNING: {msg}", file=sys.stderr, flush=True)
+
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr, flush=True)
+    sys.exit(1)
+
+
+def gib(n):
+    return f"{n / GIB:.1f} GB"
+
+
+# ------------------------------------------------------------------ gpu-yield's settings
+
+def home():
+    return Path(os.environ.get("HOME") or Path.home())
+
+
+def gy_config():
+    """gpu-yield's config, so this script uses the same context, port and Ollama
+    settings it does. {} when gpu-yield isn't installed or the file can't be read."""
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or home() / ".config")
+    path = base / "gpu-yield" / "config.toml"
+    if tomllib is None or not path.is_file():
+        return {}
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+
+
+def gy_status():
+    """gpu-yield's live status (state: ai, gaming, paused, ...), or {}."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    candidates = []
+    if runtime and Path(runtime).is_dir():
+        candidates.append(Path(runtime) / "gpu-yield" / "status.json")
+    state = Path(os.environ.get("XDG_STATE_HOME") or home() / ".local/state")
+    candidates.append(state / "gpu-yield" / "status.json")
+    for p in candidates:
+        try:
+            st = json.loads(p.read_text())
+            if isinstance(st, dict):
+                return st
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def ollama_env(cfg):
+    env = cfg.get("ollama_env")
+    return env if isinstance(env, dict) else {}
+
+
+def context_length(cfg, override=None):
+    if override:
+        return int(override)
+    ctx = cfg.get("context_length")
+    return int(ctx) if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) else 65536
+
+
+def kv_cache_type(cfg):
+    return str(ollama_env(cfg).get("OLLAMA_KV_CACHE_TYPE")
+               or os.environ.get("OLLAMA_KV_CACHE_TYPE") or "f16").lower()
+
+
+def context_bytes(ctx, kv):
+    per_token = CTX_BYTES_PER_TOKEN_F16 * {"q8_0": 0.5, "q4_0": 0.25}.get(kv, 1)
+    return int(ctx * per_token) + CTX_SLIDING_BYTES
+
+
+def ollama_port(cfg):
+    port = cfg.get("port")
+    return int(port) if isinstance(port, int) and not isinstance(port, bool) else 11434
+
+
+def ollama_models_dir(cfg):
+    custom = ollama_env(cfg).get("OLLAMA_MODELS") or os.environ.get("OLLAMA_MODELS")
+    return Path(custom).expanduser() if custom else home() / ".ollama/models"
+
+
+# ----------------------------------------------------------------------- this PC's GPU
+
+def _read(path):
+    try:
+        return Path(path).read_text().strip()
+    except OSError:
+        return ""
+
+
+def gpu_info(drm=Path("/sys/class/drm"), meminfo=Path("/proc/meminfo")):
+    """{"kind": "dgpu" | "apu" | None, "vram", "device", "budget"}.
+
+    A graphics card's own memory is the budget, minus headroom for Gaming Mode or the
+    desktop. A shared-memory chip like the BC-250 has only a small fixed slice (its
+    model lives in RAM the GPU borrows), so there the budget is the RAM Linux sees
+    minus what the OS itself needs."""
+    best = None
+    for dev in sorted(Path(drm).glob("card*/device")):
+        if _read(dev / "vendor") != "0x1002":
+            continue
+        try:
+            vram = int(_read(dev / "mem_info_vram_total"))
+        except ValueError:
+            continue
+        if best is None or vram > best[0]:
+            best = (vram, _read(dev / "device"))
+    if best is None:
+        return {"kind": None, "vram": None, "device": None, "budget": None}
+    vram, device = best
+    if vram < 2 * GIB:
+        m = re.search(r"^MemTotal:\s+(\d+) kB", _read(meminfo), re.M)
+        total = int(m.group(1)) * 1024 if m else 0
+        return {"kind": "apu", "vram": vram, "device": device,
+                "budget": max(0, total - APU_OS_RESERVE) if total else None}
+    return {"kind": "dgpu", "vram": vram, "device": device, "budget": vram - DGPU_HEADROOM}
+
+
+def verdict(need, budget):
+    if budget is None:
+        return "unknown"
+    if need <= budget - GIB:
+        return "fits"
+    if need <= budget:
+        return "tight"
+    return "won't fit"
+
+
+# --------------------------------------------------------------------- Hugging Face
+
+REPO_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,95}/[A-Za-z0-9][A-Za-z0-9._-]{0,95}")
+NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}(:[A-Za-z0-9._-]{1,40})?")
+QUANT_RE = re.compile(r"(?:(?:AD|UD)-)?(?:IQ\d(?:_[A-Z0-9]+)*|Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32|"
+                      r"MXFP\d\w*|NVFP\d\w*)$", re.I)
+SPLIT_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
+
+
+def validate_repo(repo):
+    if not REPO_RE.fullmatch(repo or "") or ".." in repo:
+        die(f"{repo!r} doesn't look like a Hugging Face repo (owner/name)")
+    return repo
+
+
+def http_get(url, headers=None, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent": UA, **(headers or {})})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def hf_api_list(repo):
+    """The repo's files: [{"path", "size", "lfs": {"oid", "size"}}, ...]."""
+    # recursive: some publishers keep big builds (BF16, Q8_0) in subfolders
+    url = f"{HF}/api/models/{urllib.parse.quote(repo, safe='/')}/tree/main?recursive=true"
+    try:
+        with http_get(url) as r:
+            data = json.loads(r.read(16 * 2**20))
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 404):
+            die(f"Hugging Face has no public repo {repo}")
+        if e.code == 429:
+            die("Hugging Face is rate-limiting requests right now; try again in a few minutes")
+        die(f"Hugging Face answered {e.code} for the file list of {repo}")
+    except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+        die(f"couldn't reach Hugging Face ({getattr(e, 'reason', e)}); check the network")
+    except ValueError:
+        die("Hugging Face's file list wasn't valid JSON; try again later")
+    if not isinstance(data, list):
+        die("Hugging Face's file list had an unexpected shape")
+    return data
+
+
+def quant_name(filename):
+    stem = filename[:-5] if filename.lower().endswith(".gguf") else filename
+    for i in range(len(stem)):
+        if (i == 0 or stem[i - 1] in "-_.") and QUANT_RE.fullmatch(stem[i:]):
+            return stem[i:].upper()
+    return stem
+
+
+def quant_entries(listing):
+    """The language-model builds in a repo listing, smallest first. Leaves out the image
+    part (mmproj), the speed-up drafter (dflash) and anything that isn't a GGUF. A build
+    split over several files is listed but marked: Ollama can't import those directly."""
+    singles, splits = [], {}
+    for item in listing:
+        if not isinstance(item, dict) or item.get("type", "file") != "file":
+            continue
+        path = str(item.get("path", ""))
+        low = path.lower()
+        if not low.endswith(".gguf") or ".." in path:
+            continue
+        name = path.rsplit("/", 1)[-1].lower()
+        if name.startswith("mmproj") or "dflash" in name or "mmproj" in name:
+            continue
+        lfs = item.get("lfs") if isinstance(item.get("lfs"), dict) else {}
+        size = int(lfs.get("size") or item.get("size") or 0)
+        sha = str(lfs.get("oid") or "")
+        m = SPLIT_RE.match(path.rsplit("/", 1)[-1])
+        if m:
+            key = m.group(1)
+            group = splits.setdefault(key, {"quant": quant_name(key), "path": path, "size": 0,
+                                            "sha256": "", "split": True})
+            group["size"] += size
+            continue
+        singles.append({"quant": quant_name(path.rsplit("/", 1)[-1]), "path": path, "size": size,
+                        "sha256": sha, "split": False})
+    return sorted(singles + list(splits.values()), key=lambda e: e["size"])
+
+
+def describe(quant):
+    q = quant.upper()
+    recipes = {"AD-": " (AtomicChat's recipe for which parts get more bits)",
+               "UD-": " (Unsloth's recipe for which parts get more bits)"}
+    recipe = recipes.get(q[:3], "")
+    base = q[3:] if recipe else q
+    if base == "BF16":
+        text = "the original (full precision, 16 bits per weight)"
+    elif base == "Q4_K_M":
+        text = "standard 4-bit"
+    elif base.startswith("Q8"):
+        text = "8-bit: practically identical to the original"
+    elif base.startswith(("IQ4", "Q4")):
+        text = "4-bit: a small quality loss"
+    elif base.startswith(("IQ3", "Q3")):
+        text = "3-bit: noticeable on demanding tasks"
+    elif base.startswith(("IQ2", "Q2")):
+        text = "2-bit: a big quality drop"
+    elif base.startswith(("Q5", "Q6")):
+        text = f"{base[1]}-bit: close to the original"
+    else:
+        text = "other format"
+    return text + recipe
+
+
+# ----------------------------------------------------------------- choosing a build
+
+def assess(entries, info, need_extra):
+    for e in entries:
+        e["need"] = e["size"] + need_extra
+        e["verdict"] = verdict(e["need"], info["budget"])
+    return entries
+
+
+def find_quant(entries, text):
+    t = (text or "").strip().lower()
+    for e in entries:
+        if t in (e["quant"].lower(), e["path"].lower(), e["path"].rsplit("/", 1)[-1].lower()):
+            return e
+    return None
+
+
+def default_choice(entries):
+    fitting = [e for e in entries if e["verdict"] == "fits" and not e["split"]]
+    return fitting[-1] if fitting else None
+
+
+def print_listing(repo, entries, info, ctx, kv):
+    if info["kind"] is None:
+        log("No AMD GPU found, so this script can't tell what will fit.")
+    elif info["kind"] == "apu":
+        board = "a BC-250" if info["device"] == BC250_DEVICE else "a shared-memory chip"
+        log(f"This PC: {board}; the model lives in shared RAM. Budget for the model: "
+            f"{gib(info['budget']) if info['budget'] else 'unknown'}.")
+    else:
+        log(f"This PC: a {gib(info['vram'])} graphics card; budget for the model: "
+            f"{gib(info['budget'])} (leaving room for the desktop or Gaming Mode).")
+    log(f"Context: {ctx} tokens ({kv} context memory), about "
+        f"{gib(context_bytes(ctx, kv) + WORKING_SPACE)} on top of the file.\n")
+    log(f"Builds in {repo}:")
+    for e in entries:
+        mark = "  (split into parts: not supported)" if e["split"] else ""
+        log(f"  {e['quant']:<14} {gib(e['size']):>8}   {e['verdict']:<9}  {describe(e['quant'])}{mark}")
+    log("\nfits = room to spare; tight = loads, but little room for anything else; "
+        "won't fit = part of it would run from system RAM.")
+
+
+# ------------------------------------------------------------------- download
+
+def free_space(path):
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return shutil.disk_usage(p).free, os.stat(p).st_dev
+
+
+def check_disk(entry, download_dir, models_dir):
+    """The file exists twice for a moment: the download, and Ollama's copy of it."""
+    part = Path(download_dir) / (Path(entry["path"]).name + ".part")
+    have = part.stat().st_size if part.exists() else 0
+    dl_free, dl_dev = free_space(download_dir)
+    om_free, om_dev = free_space(models_dir)
+    margin = GIB
+    if dl_dev == om_dev:
+        need = entry["size"] - have + entry["size"] + margin
+        if dl_free < need:
+            die(f"not enough disk space: {gib(need)} needed on the drive holding {download_dir} "
+                f"and Ollama's models (the file is briefly there twice), {gib(dl_free)} free")
+    else:
+        if dl_free < entry["size"] - have + margin:
+            die(f"not enough space in {download_dir}: {gib(entry['size'] - have + margin)} "
+                f"needed, {gib(dl_free)} free (choose another folder with --dir)")
+        if om_free < entry["size"] + margin:
+            die(f"not enough space for Ollama's copy in {models_dir}: "
+                f"{gib(entry['size'] + margin)} needed, {gib(om_free)} free")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(4 * 2**20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def download(url, final, size, sha256, retries=6):
+    """Download to final + ".part", continuing a partial file, and check the SHA256.
+    Returns the final path. A dropped connection is retried; Ctrl-C keeps the .part."""
+    global current_part
+    final = Path(final)
+    part = final.with_name(final.name + ".part")
+    current_part = part
+    attempt = 0
+    while True:
+        have = part.stat().st_size if part.exists() else 0
+        if size and have >= size:
+            break
+        headers = {"Range": f"bytes={have}-"} if have else {}
+        try:
+            with http_get(url, headers, timeout=60) as r:
+                if have and r.status != 206:      # server ignored the range: start over
+                    have = 0
+                mode = "ab" if have else "wb"
+                last = 0.0
+                with open(part, mode) as out:
+                    while True:
+                        chunk = r.read(4 * 2**20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        have += len(chunk)
+                        now = time.monotonic()
+                        if now - last > 1:
+                            last = now
+                            pct = f" ({100 * have // size}%)" if size else ""
+                            print(f"\r  {gib(have)} of {gib(size) if size else '?'}{pct}   ",
+                                  end="", flush=True)
+            print()
+            if not size or have >= size:
+                break
+            raise http.client.IncompleteRead(b"")
+        except urllib.error.HTTPError as e:
+            if e.code == 416 and size and have >= size:
+                break
+            if e.code == 429:
+                die("Hugging Face is rate-limiting downloads; run the same command later to "
+                    f"continue ({part} is kept)")
+            if e.code in (401, 403, 404):
+                die(f"Hugging Face refused the download ({e.code}); the file may have moved")
+            attempt += 1
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            attempt += 1
+            print()
+            warn(f"download interrupted ({getattr(e, 'reason', e)}); retrying")
+        if attempt > retries:
+            die(f"the download kept failing; run the same command again to continue "
+                f"({part} is kept)")
+        time.sleep(min(30, 2 ** attempt))
+    log("  checking the file's SHA256 (this takes a moment for a big file)...")
+    if sha256:
+        got = sha256_file(part)
+        if got.lower() != sha256.lower():
+            bad = part.with_name(part.name + ".bad")
+            part.replace(bad)
+            current_part = None
+            die(f"the downloaded file doesn't match Hugging Face's checksum (got {got[:12]}..., "
+                f"expected {sha256[:12]}...). It was set aside as {bad}; run again to "
+                "download it fresh.")
+    else:
+        warn("Hugging Face gave no checksum for this file, so it couldn't be verified")
+    part.replace(final)
+    current_part = None
+    return final
+
+
+# --------------------------------------------------------------------- Ollama
+
+def ollama_bin():
+    managed = home() / ".local/opt/ollama/bin/ollama"
+    if managed.is_file():
+        return str(managed)                    # gpu-yield's own install: matches the server
+    found = shutil.which("ollama")
+    if not found:
+        die("Ollama isn't installed (install it with: gpu-yield setup)")
+    return found
+
+
+def ollama_request(port, path, payload=None, timeout=10):
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
+                                 headers={"Content-Type": "application/json", "User-Agent": UA})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read() or b"{}")
+
+
+def check_ollama_ready(port):
+    st = gy_status()
+    state = st.get("state")
+    if state in ("gaming", "cooldown"):
+        die("a game is running, so gpu-yield has Ollama switched off; try again after the game")
+    if state == "paused":
+        die("gpu-yield has the AI paused; run gpu-yield resume first")
+    if state == "config_error":
+        die("gpu-yield's config file has an error, so Ollama is off; run gpu-yield doctor")
+    try:
+        ollama_request(port, "/api/version", timeout=5)
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException):
+        die(f"Ollama isn't answering on port {port}; start it (gpu-yield resume, or "
+            "systemctl --user start gpu-yield) and try again")
+
+
+def create_model(name, gguf, port):
+    """Import the GGUF into Ollama with a one-line recipe: just the file, no image part.
+    Ollama reads the chat format from the file itself."""
+    modelfile = Path(gguf).with_suffix(".Modelfile")
+    modelfile.write_text(f"FROM {Path(gguf).resolve()}\n")
+    env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{port}")
+    r = subprocess.run([ollama_bin(), "create", name, "-f", str(modelfile)], env=env)
+    modelfile.unlink(missing_ok=True)
+    if r.returncode:
+        die(f"ollama create failed (exit {r.returncode}); the downloaded file is kept at {gguf}")
+
+
+def gpu_yield_bin():
+    found = shutil.which("gpu-yield")
+    if found:
+        return found
+    local = home() / ".local/bin/gpu-yield"
+    return str(local) if local.is_file() else None
+
+
+def load_model(name, port, ctx):
+    """Load it: through gpu-yield when installed (which checks it fits and switches its
+    config), otherwise directly. Returns a one-line description of where it loaded."""
+    gy = gpu_yield_bin()
+    if gy:
+        r = subprocess.run([gy, "model", name])
+        if r.returncode:
+            die("gpu-yield didn't switch to it (see above); the model stays in Ollama, "
+                f"and you can try again with: gpu-yield model {name}")
+        return "loaded by gpu-yield (it checked the model fits)"
+    try:
+        ollama_request(port, "/api/generate", {"model": name, "prompt": "", "keep_alive": -1,
+                                               "options": {"num_ctx": int(ctx)}}, timeout=900)
+        models = ollama_request(port, "/api/ps").get("models", [])
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+        die(f"Ollama couldn't load it ({getattr(e, 'reason', e)})")
+    m = next((m for m in models if str(m.get("name", "")).split(":")[0] == name.split(":")[0]), None)
+    if not m or not m.get("size"):
+        return "loaded (Ollama didn't report where)"
+    share = round(100 * m.get("size_vram", 0) / m["size"])
+    if share >= 100:
+        return "loaded, 100% on the GPU"
+    warn(f"{100 - share}% of it is outside GPU memory and runs from system RAM: slower, "
+         "and on ROCm that has crashed a PC. Unload it with: ollama stop " + name)
+    return f"loaded, {share}% on the GPU"
+
+
+# ---------------------------------------------------------------------- commands
+
+def listing_for(args):
+    repo = validate_repo(args.repo)
+    cfg = gy_config()
+    ctx = context_length(cfg, args.context)
+    kv = kv_cache_type(cfg)
+    info = gpu_info()
+    entries = quant_entries(hf_api_list(repo))
+    if not entries:
+        die(f"{repo} has no language-model GGUF files")
+    assess(entries, info, context_bytes(ctx, kv) + WORKING_SPACE)
+    return repo, cfg, ctx, kv, info, entries
+
+
+def cmd_list(args):
+    repo, cfg, ctx, kv, info, entries = listing_for(args)
+    print_listing(repo, entries, info, ctx, kv)
+
+
+def cmd_install(args, interactive=None):
+    repo, cfg, ctx, kv, info, entries = listing_for(args)
+    interactive = sys.stdin.isatty() if interactive is None else interactive
+    if args.quant:
+        entry = find_quant(entries, args.quant)
+        if not entry:
+            die(f"{repo} has no build called {args.quant}. Choose one of: "
+                + ", ".join(e["quant"] for e in entries))
+    elif interactive:
+        print_listing(repo, entries, info, ctx, kv)
+        default = default_choice(entries)
+        prompt = f"\nWhich build? [{default['quant']}]: " if default else "\nWhich build? "
+        answer = input(prompt).strip()
+        entry = find_quant(entries, answer) if answer else default
+        if not entry:
+            die("no build chosen" if not answer else f"no build called {answer}")
+    else:
+        die("say which build to install, for example: glimmer-text install AD-IQ3_XXS. "
+            "Choices: " + ", ".join(e["quant"] for e in entries))
+    if entry["split"]:
+        die(f"{entry['quant']} is split into several files, which Ollama can't import "
+            "directly; choose a single-file build")
+    if entry["verdict"] == "won't fit" and not args.force:
+        die(f"{entry['quant']} needs about {gib(entry['need'])}, more than this PC has for a "
+            f"model ({gib(info['budget'])}). Part of it would run from system RAM: slow, and on "
+            "ROCm that has crashed a PC (gpu-yield 1.12 refuses such a model anyway). Choose a "
+            "smaller build, or use --force to download it regardless.")
+    if entry["verdict"] == "tight":
+        warn(f"{entry['quant']} is a tight fit; close other GPU-heavy programs while it loads")
+    name = args.name or f"muse-glimmer-text-{entry['quant'].lower()}"
+    if not NAME_RE.fullmatch(name):
+        die(f"{name!r} isn't a valid Ollama model name (lowercase letters, digits, . _ -)")
+    port = ollama_port(cfg)
+    check_ollama_ready(port)                    # before a 12 GB download, not after
+    download_dir = Path(args.dir).expanduser() if args.dir else home() / "Downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    check_disk(entry, download_dir, ollama_models_dir(cfg))
+    previous = cfg.get("model") if isinstance(cfg.get("model"), str) else ""
+
+    filename = Path(entry["path"]).name         # from the API listing, not from user text
+    url = f"{HF}/{urllib.parse.quote(repo, safe='/')}/resolve/main/" \
+          f"{urllib.parse.quote(entry['path'], safe='/')}"
+    log(f"\nDownloading {filename} ({gib(entry['size'])}) from {repo}...")
+    gguf = download(url, download_dir / filename, entry["size"], entry["sha256"])
+    log(f"Importing it into Ollama as {name} (text only)...")
+    create_model(name, gguf, port)
+    if args.keep:
+        log(f"  kept the downloaded file: {gguf}")
+    else:
+        gguf.unlink(missing_ok=True)             # Ollama has its own copy now
+    where = "not loaded (--no-load)"
+    if not args.no_load:
+        log(f"Loading {name}...")
+        where = load_model(name, port, ctx)
+    log(f"\nDone: {name}")
+    log(f"  build:   {entry['quant']} ({gib(entry['size'])}), {describe(entry['quant'])}")
+    log(f"  status:  {where}")
+    if gpu_yield_bin() and not args.no_load:
+        log(f"  apps set to the model name 'gpu-yield' now use it")
+    if previous and previous != name:
+        log(f"  switch back with: gpu-yield model {previous}")
+
+
+def cmd_remove(args):
+    cfg = gy_config()
+    name = args.name
+    if not name:
+        die("say which model to remove, for example: glimmer-text remove muse-glimmer-text-ad-iq3_xxs")
+    if not NAME_RE.fullmatch(name) or not name.startswith("muse-glimmer-text"):
+        die("glimmer-text only removes models it created (named muse-glimmer-text-...); "
+            "use ollama rm for others")
+    if cfg.get("model") == name:
+        die(f"{name} is gpu-yield's current model; switch to another first (gpu-yield model)")
+    env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{ollama_port(cfg)}")
+    r = subprocess.run([ollama_bin(), "rm", name], env=env)
+    if r.returncode:
+        die(f"ollama rm failed (exit {r.returncode})")
+
+
+def main(argv=None):
+    p = argparse.ArgumentParser(
+        prog="glimmer-text",
+        description="Download a text-only Muse Glimmer build (no ~4 GB image part) and set it "
+                    "up in Ollama, choosing a size that fits this PC.")
+    p.add_argument("--repo", default=DEFAULT_REPO, help=f"Hugging Face repo (default {DEFAULT_REPO})")
+    p.add_argument("--context", type=int, help="context length to plan for (default: gpu-yield's, or 65536)")
+    # The same two options after the command too (glimmer-text install X --repo Y); left
+    # unset there unless given, so they don't override the ones given before it.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--repo", default=argparse.SUPPRESS, help="Hugging Face repo")
+    common.add_argument("--context", type=int, default=argparse.SUPPRESS,
+                        help="context length to plan for")
+    sub = p.add_subparsers(dest="cmd")
+    sub.add_parser("list", parents=[common], help="show the builds and whether each fits this PC")
+    i = sub.add_parser("install", parents=[common], help="download, import and load a build")
+    i.add_argument("quant", nargs="?", help="the build, e.g. AD-IQ3_XXS (asks if left out)")
+    i.add_argument("--name", help="Ollama model name (default muse-glimmer-text-<build>)")
+    i.add_argument("--dir", help="where to download (default ~/Downloads)")
+    i.add_argument("--force", action="store_true", help="install even a build that won't fit")
+    i.add_argument("--keep", action="store_true", help="keep the downloaded file afterwards")
+    i.add_argument("--no-load", action="store_true", help="import it but don't load it")
+    r = sub.add_parser("remove", help="delete a model this script created")
+    r.add_argument("name", nargs="?")
+    args = p.parse_args(argv)
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        die("run this as your normal user, not as root or with sudo: Ollama's models and "
+            "gpu-yield's settings belong to that user")
+    try:
+        if args.cmd == "list":
+            cmd_list(args)
+        elif args.cmd == "remove":
+            cmd_remove(args)
+        else:
+            if args.cmd is None:            # no command: the interactive install
+                for k, v in (("quant", None), ("name", None), ("dir", None), ("force", False),
+                             ("keep", False), ("no_load", False)):
+                    setattr(args, k, getattr(args, k, v))
+            cmd_install(args)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        if current_part and Path(current_part).exists():
+            die(f"stopped. The partial download is kept at {current_part}; run the same "
+                "command again to continue where it left off.")
+        die("stopped")
+
+
+if __name__ == "__main__":
+    main()
