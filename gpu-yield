@@ -1266,7 +1266,8 @@ def memory_readings():
                 gtt_total = int(_read_text(dev / "mem_info_gtt_total"))
             except ValueError:
                 gtt_total = None
-            gpu = {"vram_used": used, "vram_total": total, "gtt_used": gtt, "gtt_total": gtt_total}
+            gpu = {"vram_used": used, "vram_total": total, "gtt_used": gtt, "gtt_total": gtt_total,
+                   "bc250": _read_text(dev / "device").strip() == "0x13fe"}
     info = dict(re.findall(r"^(\w+):\s+(\d+) kB", _read_text(Path("/proc/meminfo")), re.M))
     ram = None
     if "MemTotal" in info and "MemAvailable" in info:
@@ -1277,7 +1278,14 @@ def memory_readings():
     m = {**(gpu or {}), **(ram or {})}
     # A chip that shares system memory with its GPU (BC-250, APUs) has only a small
     # fixed slice of "VRAM"; the model lives in system memory the GPU borrows (GTT).
-    m["shared"] = bool(gpu and gpu["vram_total"] < SHARED_VRAM_BELOW)
+    # (A small AMD slice next to an NVIDIA or Intel card is an integrated GPU nobody
+    # uses for the AI, so that isn't shared mode.)
+    other_gpu = any(_read_text(d / "vendor").strip() not in ("", "0x1002")
+                    and _read_text(d / "class").strip().startswith("0x03")
+                    for d in DRM_DIR.glob("card*/device"))
+    m["shared"] = bool(gpu and (gpu.pop("bc250", False) or
+                                (gpu["vram_total"] < SHARED_VRAM_BELOW and not other_gpu)))
+    m.pop("bc250", None)
     borrowed = (gpu["gtt_used"] or 0) if gpu and m["shared"] else 0
     m["gpu_used"] = gpu["vram_used"] + borrowed if gpu else None
     return m
@@ -2568,6 +2576,18 @@ class Watcher:
             self.alias_problem = ""
             alias = self.cfg["alias"]
             tags = self.ollama.request("/api/tags", timeout=10).get("models", [])
+            if guards_shared_fit(self.cfg):
+                # Shared memory: check the file against the pool before anything else,
+                # including pointing the apps' fixed name at it (an app using that name
+                # would load it). Running the pool out freezes the whole board.
+                size = next((m.get("size") for m in tags if same_model(tag_name(m), model)), None)
+                budget = shared_budget()
+                if size and budget and size > budget:
+                    return self.refuse_spill(gen, model, model, None, why=(
+                        f"{model} ({size_text(size)}) is too big for this PC's shared memory: "
+                        f"models up to about {size_text(budget)} leave Linux and the model's "
+                        "context enough room, and running out freezes the whole board"),
+                        advice="Choose a smaller model or a smaller build of it")
             self.forget_old_alias(tags, alias)
             if alias:
                 # Point the fixed name at this model and load it under that name, so apps
@@ -2601,16 +2621,6 @@ class Watcher:
                                               f"({http_error_detail(e)}); apps using {alias} may "
                                               f"get an older model")
                         self.event(self.alias_problem, "error")
-            if guards_shared_fit(self.cfg):
-                # Shared memory: check the file against the pool before loading. Running
-                # it out freezes the whole board, so this can't wait for the load.
-                size = next((m.get("size") for m in tags if same_model(tag_name(m), model)), None)
-                budget = shared_budget()
-                if size and budget and size > budget:
-                    return self.refuse_spill(gen, model, target, None, why=(
-                        f"{model} ({size_text(size)}) is too big for this PC's shared memory: "
-                        f"models up to about {size_text(budget)} leave Linux and the model's "
-                        "context enough room, and running out freezes the whole board"))
             self.loaded_name = target
             self.ollama.warm(target)
         except urllib.error.HTTPError as e:
@@ -2641,7 +2651,7 @@ class Watcher:
                     f"{model} at context {self.cfg['context_length']} left only "
                     f"{size_text(left)} of memory for the rest of the PC, so it was unloaded: "
                     "on a shared-memory board, running out freezes everything"))
-        if (loaded and shared) or fits(loaded):
+        if fits(loaded):
             save_fit(model, self.cfg["context_length"])
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
@@ -2650,10 +2660,16 @@ class Watcher:
         self.oom_retried = False
         self.event(f"{model} loaded{named} in {time.monotonic() - t:.1f}s{where}")
         problem, note = placement_note(self.ollama, model, share)
-        if note and not (shared_memory_gpu() and share):   # shared: "in system RAM" is normal
+        if note and shared_memory_gpu() and share:
+            # Shared memory: the model being in system memory is normal, but layers that
+            # Ollama put on the CPU still make it several times slower.
+            note = (f"{100 - share}% of {model} runs on the CPU, because Ollama sees less GPU "
+                    "memory than the board has. It will be slow; gpu-yield doctor checks the "
+                    "GPU memory limit (ttm.pages_limit)")
+        if note:
             self.event(note, "error" if problem else "warn")
 
-    def refuse_spill(self, gen, model, target, share, why=None):
+    def refuse_spill(self, gen, model, target, share, why=None, advice=None):
         """Unload a model that didn't fit in VRAM (ROCm) and go back to the last model and
         context that did, or wait and retry if there isn't one."""
         try:
@@ -2690,9 +2706,9 @@ class Watcher:
                 return
         self.report_vram(None, gpu_used(memory_readings()), quiet=True)
         where = f" {self.vram_report}." if self.vram_report else ""
-        self._fail(gen, f"failed: {why}.{where} Free some GPU memory, choose a smaller model, "
-                        f"or lower context_length (gpu-yield config context_length "
-                        f"{max(8192, ctx // 2)})", retry=300)
+        self._fail(gen, f"failed: {why}.{where} " + (advice or (
+            f"Free some GPU memory, choose a smaller model, or lower context_length "
+            f"(gpu-yield config context_length {max(8192, ctx // 2)})")), retry=300)
 
     def note_ollama_exit(self):
         """Ollama (or the program running the model) ended unexpectedly: say if Linux
@@ -2809,6 +2825,12 @@ class Watcher:
             if spilled(models):
                 self.unload_spilled(models)
                 return
+        elif guards_shared_fit(self.cfg) and not self.warming:
+            models = self.ollama.loaded()
+            left = mem_available()
+            if models and left is not None and left < SHARED_MIN_FREE:
+                self.shared_memory_low(models, left)
+                return
         if self.warming or not self.cfg["model"]:
             return
         if self.warm_failed_at is not None:
@@ -2821,7 +2843,33 @@ class Watcher:
             return
         self.check_loaded(models)
 
-    def unload_spilled(self, models):
+    def shared_memory_low(self, models, left):
+        """Shared-memory chip, and the rest of the PC is nearly out of memory with a model
+        loaded. An app's different model or context is handled like a model that doesn't
+        fit (unloaded; the AI paused if it keeps happening). If it's gpu-yield's own model,
+        something else grew: unload it to keep the board alive, and retry in 5 minutes."""
+        model, ctx = self.cfg["model"], int(self.cfg["context_length"])
+        ours = [n for n in (model, self.cfg["alias"]) if n]
+        others = [m for m in models
+                  if not any(same_model(m.get("name") or m.get("model") or "", n) for n in ours)
+                  or (m.get("context_length") and int(m["context_length"]) != ctx)]
+        if others:
+            return self.unload_spilled(models, others, why=(
+                f"left the rest of the PC only {size_text(left)} of memory"))
+        for m in models:
+            try:
+                self.ollama.request("/api/generate", {"model": m.get("name"), "keep_alive": 0},
+                                    timeout=60)
+            except Exception:
+                pass
+        self.warm_gen += 1
+        self.warm_status = (f"failed: only {size_text(left)} of memory was left for the rest of "
+                            f"the PC, so {model} was unloaded to keep the board from freezing; "
+                            "trying again in 5 minutes")
+        self.warm_failed_at, self.warm_retry = time.monotonic(), 300
+        self.event(self.warm_status, "error")
+
+    def unload_spilled(self, models, offenders=None, why=None):
         """An app loaded a model, or a context, that doesn't fit in VRAM. Ollama only
         unloads it once the app's current request finishes, so it can't be stopped from
         running once; if the same thing is loaded again, the AI is paused instead, with
@@ -2829,7 +2877,7 @@ class Watcher:
         model, ctx = self.cfg["model"], int(self.cfg["context_length"])
         now = time.monotonic()
         repeat = []
-        for m in spilled(models):
+        for m in offenders if offenders is not None else spilled(models):
             name = m.get("name") or m.get("model") or "?"
             key = (name, m.get("context_length"))
             times = [t for t in self.client_spills.get(key, []) if now - t < 3600] + [now]
@@ -2840,15 +2888,18 @@ class Watcher:
                 self.ollama.request("/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
             except Exception:
                 pass
-            self.event(f"an app loaded {name} at context {m.get('context_length', '?')}, and "
-                       f"{100 - gpu_share([m])}% of it didn't fit in GPU memory; unloaded it, "
-                       "since on ROCm that has shut down this PC. Set the app to use "
-                       f"{self.cfg['alias'] or model} at context {ctx}", "error")
+            what = why or (f"didn't fit in GPU memory ({100 - gpu_share([m])}% was outside it); "
+                           "unloaded it, since on ROCm that has shut down this PC")
+            if why:
+                what += "; unloaded it, since running out of memory freezes this board"
+            self.event(f"an app loaded {name} at context {m.get('context_length', '?')}, and it "
+                       f"{what}. Set the app to use {self.cfg['alias'] or model} at context {ctx}",
+                       "error")
         if repeat:
             m = repeat[0]
             self.block_reason = (f"The AI on {self.host} is paused: an app keeps loading "
                                  f"{m.get('name')} at context {m.get('context_length', '?')}, which "
-                                 f"doesn't fit in GPU memory. Set the app to use "
+                                 f"doesn't fit in {'shared' if why else 'GPU'} memory. Set the app to use "
                                  f"{self.cfg['alias'] or model} at context {ctx}, then run "
                                  "gpu-yield resume.")
             self.event("paused the AI: " + self.block_reason, "error")
@@ -2874,6 +2925,10 @@ class Watcher:
         if guards_gpu_fit(self.cfg) and spilled(models):
             self.unload_spilled(models)
             return
+        if guards_shared_fit(self.cfg):
+            left = mem_available()
+            if left is not None and left < SHARED_MIN_FREE:
+                return self.shared_memory_low(models, left)
         self.empty_checks = 0
         trusted_alias = self.loaded_name if self.loaded_name and self.cfg["alias"] and \
             same_model(self.loaded_name, self.cfg["alias"]) else None
@@ -4086,7 +4141,7 @@ def bc250_checks(cfg, ollama=None):
     if (6, 15, 0) <= kv <= (6, 15, 6) or (6, 17, 8) <= kv <= (6, 17, 10):
         add("bad", f"kernel {os.uname().release} is in a known-bad range for the BC-250 "
                    "(6.15.0-6.15.6, 6.17.8-6.17.10); use 6.19.x or 6.18.18+ LTS")
-    elif kv < (6, 18, 0):
+    elif kv < (6, 18, 18):
         add("note", f"kernel {os.uname().release}: 6.18.18+ LTS or 6.19.x is recommended")
     else:
         add("ok", f"kernel {os.uname().release}")
@@ -4105,8 +4160,13 @@ def bc250_checks(cfg, ollama=None):
     for d in ("/etc/modprobe.d", "/etc/tmpfiles.d", "/usr/lib/tmpfiles.d"):
         for f in sorted(Path(d).glob("*.conf")) if Path(d).is_dir() else []:
             for line in _read_text(f).splitlines():
-                m = re.search(r"pages_limit[= ](?:.*\s)?(\d{5,})\s*$", line.strip())
-                if "pages_limit" in line and not line.lstrip().startswith("#") and m:
+                if line.lstrip().startswith("#") or "pages_limit" not in line:
+                    continue
+                # modprobe.d: "options ttm pages_limit=N [more=...]";
+                # tmpfiles.d: "w /sys/module/ttm/parameters/pages_limit - - - - N"
+                m = re.search(r"\bpages_limit=(\d+)", line) or \
+                    re.search(r"/pages_limit\s.*?(\d{5,})\s*$", line.strip())
+                if m:
                     sources[str(f)] = m.group(1)
     if len(set(sources.values())) > 1:
         add("bad", "ttm.pages_limit is set to different values in " + ", ".join(
@@ -4114,11 +4174,13 @@ def bc250_checks(cfg, ollama=None):
             "Make them all 4194304")
 
     mem = memory_readings() or {}
-    if mem.get("vram_total", 0) > 1.1e9 and mem.get("ram_total", 2**40) < 10e9:
-        add("bad", f"the BIOS splits memory into {size_text(mem['vram_total'])} fixed for the GPU "
-                   f"and {size_text(mem['ram_total'])} for Linux, so models over ~7 GB can't fit. "
-                   "Set 512MB dynamic VRAM in the BIOS (it may need the community-patched BIOS)")
-    elif mem.get("gtt_total"):
+    if mem.get("vram_total", 0) > 1.1e9:
+        add("bad", f"the BIOS gives the GPU a fixed {size_text(mem['vram_total'])}, leaving "
+                   f"{size_text(mem.get('ram_total', 0))} for Linux, the model and its context to "
+                   "share" + (", so models over ~7 GB can't fit" if mem.get("ram_total", 2**40) < 10e9
+                              else "") + ". Set 512MB dynamic VRAM in the BIOS (it may need the "
+                   "community-patched BIOS)")
+    if mem.get("gtt_total"):
         (add("ok", f"the GPU can use {size_text(mem['gtt_total'])} of shared memory")
          if mem["gtt_total"] >= 15e9 else
          add("bad", f"the GPU can only use {size_text(mem['gtt_total'])} of shared memory: "
@@ -4170,7 +4232,8 @@ def bc250_checks(cfg, ollama=None):
             add("bad", f"{conf}: a voltage point of {min(mvs)} mV locks the GPU at 1500 MHz; "
                        "keep every point at 700 mV or more")
         rng = re.search(r"^\[frequency-range\](.*?)(^\[|\Z)", text, re.M | re.S)
-        if rng and re.search(r"mhz", rng.group(1), re.I):
+        body = "\n".join(line.split("#", 1)[0] for line in rng.group(1).splitlines()) if rng else ""
+        if re.search(r"\d\s*mhz", body, re.I):
             add("bad", f"{conf}: an 'MHz' suffix in [frequency-range] breaks the governor's "
                        "parser; use bare numbers")
 
@@ -4485,7 +4548,7 @@ def detect_memory():
             vram = max(vram or 0, int(_read_text(f)) / 2**30)
         except ValueError:
             pass
-    if vram is not None and vram < SHARED_VRAM_BELOW / 2**30 and ram:
+    if vram is not None and ram and (memory_readings() or {}).get("shared"):
         vram = ram           # shared-memory chip: the GPU's memory is the system's
     return ram, vram
 
@@ -4579,10 +4642,14 @@ def pull_and_load(cfg, name):
                      "board, running out freezes everything. Choose a smaller model or lower "
                      "context_length.")
                 return "refused"
-        if fits(loaded) or (loaded and guards_shared_fit(cfg)):
+        if fits(loaded):
             save_fit(name, cfg["context_length"])
         problem, msg = placement_note(o, name, share)
-        if msg and not (shared_memory_gpu() and share):
+        if msg and shared_memory_gpu() and share:
+            msg = (f"{100 - share}% of {name} runs on the CPU, because Ollama sees less GPU "
+                   "memory than the board has; it will be slow. gpu-yield doctor checks the "
+                   "GPU memory limit (ttm.pages_limit)")
+        if msg:
             (warn if problem else log)(("" if problem else "  ") + msg)
     except Exception as e:
         warn(f"{name} downloaded, but loading it failed ({e}), so it wasn't switched to")

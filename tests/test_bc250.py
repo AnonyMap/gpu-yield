@@ -58,7 +58,7 @@ ok("BC-250: Ollama stores context at 8 bits unless you chose otherwise; no autom
 class Stub:
     base = "http://stub"
 
-    def __init__(self, size, share=60):
+    def __init__(self, size, share=100):
         self.size, self.share, self.calls = size, share, []
 
     def wait_ready(self, *a): return True
@@ -73,10 +73,10 @@ class Stub:
     def is_moe(self, m): return False
 
 
-def warm(size, available):
+def warm(size, available, share=100, alias=""):
     proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {int(available * 2**20)} kB\n"
-    w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias=""))
-    w.state, w.ollama = "ai", Stub(int(size * GiB))
+    w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias=alias))
+    w.state, w.ollama = "ai", Stub(int(size * GiB), share)
     w._warm_inner(w.warm_gen)
     return w
 
@@ -88,9 +88,16 @@ assert not any("spilled" in e["text"] or "system RAM" in e["text"] for e in w.ev
     "on a shared chip, 'part of it in system RAM' is normal, not a warning"
 ok("a model that fits the shared pool loads, is remembered, and gets no misleading 'spilled' warning")
 
+gy.FIT_FILE.unlink()
+w = warm(11.4, 3.0, share=60)
+assert gy.last_fit() == {}, "layers on the CPU: not a fit"
+assert any("runs on the CPU" in e["text"] and "pages_limit" in e["text"] for e in w.events)
+ok("layers that Ollama put on the CPU are still warned about (pointing at the GPU memory limit)")
+
 gy.save_fit("small:1", 65536)
-w = warm(13.9, 3.0)                                   # AD-IQ3_M: over the line
+w = warm(13.9, 3.0, alias="gpu-yield")                # AD-IQ3_M: over the line
 assert ("warm", "big:1") not in w.ollama.calls, "refused before loading"
+assert not any(c[0] == "/api/copy" for c in w.ollama.calls), "the apps' fixed name must not move to it"
 assert list(w.actions.queue) == [("model", "small:1")] and "too big for this PC's shared memory" in w.events[0]["text"]
 ok("a model file too big for the shared pool is refused before it loads, and gpu-yield goes back")
 
@@ -99,9 +106,46 @@ assert ("/api/generate", {"model": "big:1", "keep_alive": 0}) in w.ollama.calls
 assert list(w.actions.queue) == [("model", "small:1")] and "left only" in w.events[0]["text"]
 ok("a model that leaves too little memory for the rest of the PC is unloaded at once")
 
+# an app loading a bigger context (or another model) that runs the shared pool low
+proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {int(0.2 * 2**20)} kB\n"
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias=""))
+w.state, w.ollama = "ai", Stub(int(11.4 * GiB))
+w.ollama.active = w.ollama.ready = lambda: True
+w.ollama.loaded = lambda: [{"name": "big:1", "size": 1, "size_vram": 1, "context_length": 262144}]
+w.start_warm = lambda: None
+w.last_health, w.last_restart = 0, -1000
+w.health(gy.time.monotonic())
+assert ("/api/generate", {"model": "big:1", "keep_alive": 0}) in w.ollama.calls
+assert "left the rest of the PC only" in w.events[0]["text"] and "262144" in w.events[0]["text"]
+# its own model, at its own context, with memory gone low (something else grew)
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias=""))
+w.state, w.ollama = "ai", Stub(int(11.4 * GiB))
+w.ollama.active = w.ollama.ready = lambda: True
+w.ollama.loaded = lambda: [{"name": "big:1", "size": 1, "size_vram": 1, "context_length": 65536}]
+w.last_health, w.last_restart = 0, -1000
+w.health(gy.time.monotonic())
+assert w.warm_status.startswith("failed: only") and w.warm_retry == 300 and not gy.PAUSE_FILE.exists()
+proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {3 * 2**20} kB\n"
+ok("shared pool running low: an app's oversized load is unloaded; its own model waits 5 minutes")
+
 gy.Ollama = lambda c: Stub(int(13.9 * GiB))
 assert gy.pull_and_load(dict(gy.DEFAULTS, port=1), "big:1") == "refused"
 ok("gpu-yield model refuses a model too big for the shared pool, without loading it")
+
+# --- detection: a BC-250 with a bigger BIOS slice, and an iGPU next to another vendor's card
+(dev / "mem_info_vram_total").write_text(f"{4 * GiB}\n")
+assert gy.memory_readings()["shared"], "a BC-250 is shared at any BIOS setting"
+(dev / "mem_info_vram_total").write_text(f"{512 * 2**20}\n")
+(dev / "device").write_text("0x164e\n")                  # a Ryzen 7000 iGPU
+other = drm / "card1/device"
+other.mkdir(parents=True)
+(other / "vendor").write_text("0x10de\n")               # NVIDIA
+(other / "class").write_text("0x030000\n")
+assert not gy.memory_readings()["shared"], "an iGPU next to an NVIDIA card isn't the AI's GPU"
+import shutil as _sh
+_sh.rmtree(drm / "card1")
+(dev / "device").write_text("0x13fe\n")
+ok("detection: a BC-250 with a 2-4 GB BIOS slice is shared; an iGPU beside an NVIDIA card isn't")
 
 # --- programs holding memory count borrowed system memory on a shared chip
 holders_proc = Path(tempfile.mkdtemp())
@@ -146,6 +190,25 @@ checks = gy.bc250_checks(dict(gy.DEFAULTS, model="glimmer"), Show())
 assert not any(k == "bad" and ("kernel" in m or "pages_limit" in m or "governor" in m) for k, m in checks)
 assert any(k == "ok" and "governor running" in m for k, m in checks)
 ok("doctor on a BC-250: kernel, memory limit, overrides, governor, journal and context-storage checks")
+
+gy.os.uname = lambda: types.SimpleNamespace(release="6.18.5-200.fc43.x86_64")
+assert any(k == "note" and "6.18.18+" in m for k, m in gy.bc250_checks(dict(gy.DEFAULTS)))
+etc = Path(tempfile.mkdtemp())
+(etc / "ttm.conf").write_text("options ttm pages_limit=3959290 page_pool_size=3959290\n")
+real_path = gy.Path
+gy.Path = lambda p, *a: real_path(str(etc) if p == "/etc/modprobe.d" else p, *a)
+proc["/proc/cmdline"] = "root=/dev/x ttm.pages_limit=4194304 amd_iommu=off\n"
+checks = gy.bc250_checks(dict(gy.DEFAULTS))
+gy.Path = real_path
+assert any(k == "bad" and "different values" in m and "3959290" in m for k, m in checks), checks
+gov = Path(tempfile.mkdtemp()) / "config.toml"
+gov.write_text("[frequency-range]\n# both values in MHz\nmin = 350\nmax = 1500\n")
+real_conf = gy.Path
+gy.Path = lambda p, *a: gov if str(p).endswith("cyan-skillfish-governor-smu/config.toml") else real_conf(p, *a)
+checks = gy.bc250_checks(dict(gy.DEFAULTS))
+gy.Path = real_conf
+assert not any("MHz" in m for k, m in checks if k == "bad"), "a comment mentioning MHz is fine"
+ok("doctor: 6.18 before .18 gets the note; pages_limit read with other options; MHz in a comment is fine")
 
 # --- nothing changes on an ordinary graphics card
 (dev / "device").write_text("0x747e\n")              # an RX 7800 XT

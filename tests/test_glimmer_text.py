@@ -283,4 +283,65 @@ assert where == "loaded, 80% on the GPU" and "20% of it is outside GPU memory" i
 replies["/api/ps"]["models"][0]["size_vram"] = 100
 assert gt.load_model("muse-glimmer-text-x", 11434, 65536) == "loaded, 100% on the GPU"
 ok("without gpu-yield, it loads through Ollama and warns if any of it spilled")
+# --- from the review: a fresh copy of the script, since the tests above replaced parts of it
+spec2 = importlib.util.spec_from_loader("glimmer_text2", importlib.machinery.SourceFileLoader("glimmer_text2", str(SCRIPT)))
+g2 = importlib.util.module_from_spec(spec2)
+spec2.loader.exec_module(g2)
+g2.time.sleep = lambda s: None
+
+# a finished download from an earlier run is reused (checked), not downloaded again
+d2 = Path(tempfile.mkdtemp())
+(d2 / "model.gguf").write_bytes(BLOB)
+served["ranges"].clear()
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    assert g2.download(url, d2 / "model.gguf", len(BLOB), SHA) == d2 / "model.gguf"
+assert served["ranges"] == [], "must not download it again"
+g2.free_space = lambda path: (int(20e9), 1)                  # 20 GB free, 12.2 GB file already here
+(d2 / "x.gguf").write_bytes(b"")
+os.truncate(d2 / "x.gguf", int(12.2e9))
+assert attempt(g2.check_disk, {"path": "x.gguf", "size": int(12.2e9)}, d2, HOME / ".ollama/models")[0] == 0
+ok("a rerun after a failed import reuses the finished download and counts it in the disk check")
+
+# a full disk stops at once, with the partial file kept
+class Full(io.BytesIO):
+    status = 200
+    headers = {}
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+g2.http_get = lambda *a, **k: Full(b"x" * 100)
+real_open = open
+def full_open(path, mode="r", *a, **k):
+    if "b" in mode and str(path).endswith(".part"):
+        raise OSError(28, "No space left on device")
+    return real_open(path, mode, *a, **k)
+g2.open = full_open
+code, err = attempt(g2.download, url, d2 / "full.gguf", 100, None)
+del g2.open
+assert code == 1 and "disk is full" in err and "retrying" not in err, err
+ok("a full disk stops the download at once instead of retrying it as a network drop")
+
+# long listings come in pages
+pages = {"first": ([LISTING[3]], '<https://huggingface.co/api/models/a/b/tree/main?cursor=2>; rel="next"'),
+         "https://huggingface.co/api/models/a/b/tree/main?cursor=2": ([LISTING[4]], "")}
+class Page(io.BytesIO):
+    def __init__(self, body, link):
+        super().__init__(body)
+        self.headers = {"Link": link}
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+def paged(url_, *a, **k):
+    items, link = pages.get(url_, pages["first"])
+    return Page(gt.json.dumps(items).encode(), link)
+g2.http_get = paged
+assert [e["path"] for e in g2.hf_api_list("a/b")] == [LISTING[3]["path"], LISTING[4]["path"]]
+ok("follows Hugging Face's next-page links for long file lists")
+
+# a BC-250 with a bigger BIOS slice is still shared memory, and plans for q8_0 context
+drm, mi = fake_sysfs(4 * GIB, g2.BC250_DEVICE, mem_kb=int(11.5 * 2**20))
+info = g2.gpu_info(drm, mi)
+assert info["kind"] == "apu"
+assert g2.kv_cache_type({"model": "m"}, g2.BC250_DEVICE) == "q8_0"
+assert g2.kv_cache_type({}, g2.BC250_DEVICE) == "f16", "without gpu-yield, Ollama's own default"
+assert g2.kv_cache_type({"ollama_env": {"OLLAMA_KV_CACHE_TYPE": "f16"}}, g2.BC250_DEVICE) == "f16"
+ok("BC-250 at any BIOS setting counts as shared memory, and plans for gpu-yield's q8_0 default")
 print("glimmer-text tests passed")

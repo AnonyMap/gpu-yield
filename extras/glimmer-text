@@ -15,6 +15,7 @@ Ollama as a text-only model, and loads it (through gpu-yield when that's install
 Run it as your normal user on the PC that runs Ollama.
 """
 import argparse
+import errno
 import hashlib
 import http.client
 import json
@@ -121,9 +122,12 @@ def context_length(cfg, override=None):
     return int(ctx) if isinstance(ctx, (int, float)) and not isinstance(ctx, bool) else 65536
 
 
-def kv_cache_type(cfg):
-    return str(ollama_env(cfg).get("OLLAMA_KV_CACHE_TYPE")
-               or os.environ.get("OLLAMA_KV_CACHE_TYPE") or "f16").lower()
+def kv_cache_type(cfg, device=None):
+    """How Ollama stores context. gpu-yield (1.13+) uses q8_0 on a BC-250 by default."""
+    chosen = ollama_env(cfg).get("OLLAMA_KV_CACHE_TYPE") or os.environ.get("OLLAMA_KV_CACHE_TYPE")
+    if chosen:
+        return str(chosen).lower()
+    return "q8_0" if device == BC250_DEVICE and cfg else "f16"
 
 
 def context_bytes(ctx, kv):
@@ -150,6 +154,9 @@ def _read(path):
         return ""
 
 
+BC250_DEVICE = "0x13fe"
+
+
 def gpu_info(drm=Path("/sys/class/drm"), meminfo=Path("/proc/meminfo")):
     """{"kind": "dgpu" | "apu" | None, "vram", "device", "budget"}.
 
@@ -170,7 +177,7 @@ def gpu_info(drm=Path("/sys/class/drm"), meminfo=Path("/proc/meminfo")):
     if best is None:
         return {"kind": None, "vram": None, "device": None, "budget": None}
     vram, device = best
-    if vram < 2 * GIB:
+    if vram < 2 * GIB or device == BC250_DEVICE:
         m = re.search(r"^MemTotal:\s+(\d+) kB", _read(meminfo), re.M)
         total = int(m.group(1)) * 1024 if m else 0
         return {"kind": "apu", "vram": vram, "device": device,
@@ -212,9 +219,20 @@ def hf_api_list(repo):
     """The repo's files: [{"path", "size", "lfs": {"oid", "size"}}, ...]."""
     # recursive: some publishers keep big builds (BF16, Q8_0) in subfolders
     url = f"{HF}/api/models/{urllib.parse.quote(repo, safe='/')}/tree/main?recursive=true"
+    data = []
     try:
-        with http_get(url) as r:
-            data = json.loads(r.read(16 * 2**20))
+        for _ in range(20):                      # long listings come in pages (Link: next)
+            with http_get(url) as r:
+                page = json.loads(r.read(16 * 2**20))
+                link = r.headers.get("Link", "") if r.headers else ""
+            if not isinstance(page, list):
+                data = page
+                break
+            data += page
+            nxt = re.search(r'<([^>]+)>\s*;\s*rel="next"', link)
+            if not nxt or not nxt.group(1).startswith(HF + "/api/"):
+                break
+            url = nxt.group(1)
     except urllib.error.HTTPError as e:
         if e.code in (401, 404):
             die(f"Hugging Face has no public repo {repo}")
@@ -346,8 +364,11 @@ def free_space(path):
 
 def check_disk(entry, download_dir, models_dir):
     """The file exists twice for a moment: the download, and Ollama's copy of it."""
-    part = Path(download_dir) / (Path(entry["path"]).name + ".part")
+    final = Path(download_dir) / Path(entry["path"]).name
+    part = final.with_name(final.name + ".part")
     have = part.stat().st_size if part.exists() else 0
+    if final.exists() and final.stat().st_size == entry["size"]:
+        have = entry["size"]                     # already downloaded (reused if intact)
     dl_free, dl_dev = free_space(download_dir)
     om_free, om_dev = free_space(models_dir)
     margin = GIB
@@ -379,6 +400,14 @@ def download(url, final, size, sha256, retries=6):
     global current_part
     final = Path(final)
     part = final.with_name(final.name + ".part")
+    if final.exists() and size and final.stat().st_size == size:
+        # Finished earlier (an import that failed or was interrupted): reuse it if intact.
+        log("  already downloaded; checking it's intact...")
+        if not sha256 or sha256_file(final).lower() == sha256.lower():
+            return final
+        bad = final.with_name(final.name + ".bad")
+        final.replace(bad)
+        warn(f"the earlier download didn't match the checksum; set it aside as {bad}")
     current_part = part
     attempt = 0
     while True:
@@ -419,6 +448,10 @@ def download(url, final, size, sha256, retries=6):
                 die(f"Hugging Face refused the download ({e.code}); the file may have moved")
             attempt += 1
         except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
+            if isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT):
+                print()
+                die(f"the disk is full; free some space and run the same command again to "
+                    f"continue ({part} is kept)")
             attempt += 1
             print()
             warn(f"download interrupted ({getattr(e, 'reason', e)}); retrying")
@@ -485,8 +518,10 @@ def create_model(name, gguf, port):
     modelfile = Path(gguf).with_suffix(".Modelfile")
     modelfile.write_text(f"FROM {Path(gguf).resolve()}\n")
     env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{port}")
-    r = subprocess.run([ollama_bin(), "create", name, "-f", str(modelfile)], env=env)
-    modelfile.unlink(missing_ok=True)
+    try:
+        r = subprocess.run([ollama_bin(), "create", name, "-f", str(modelfile)], env=env)
+    finally:
+        modelfile.unlink(missing_ok=True)
     if r.returncode:
         die(f"ollama create failed (exit {r.returncode}); the downloaded file is kept at {gguf}")
 
@@ -532,8 +567,8 @@ def listing_for(args):
     repo = validate_repo(args.repo)
     cfg = gy_config()
     ctx = context_length(cfg, args.context)
-    kv = kv_cache_type(cfg)
     info = gpu_info()
+    kv = kv_cache_type(cfg, info["device"])
     entries = quant_entries(hf_api_list(repo))
     if not entries:
         die(f"{repo} has no language-model GGUF files")
