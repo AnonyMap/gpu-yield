@@ -196,12 +196,12 @@ ok("malformed requests get a clear 400")
 assert call("POST", "/api/auth", "{}", "hunter2", ctype="text/plain")[0] == 415
 assert call("OPTIONS", "/api/auth")[0] == 405
 _, _, h = call("GET", "/status")
-assert h.get("Access-Control-Allow-Origin") == "*"
+assert "Access-Control-Allow-Origin" not in h and h.get("X-Frame-Options") == "DENY"
 _, _, h = call("POST", "/api/auth", {}, "hunter2")
 assert "Access-Control-Allow-Origin" not in h
 assert call("POST", "/api/auth", "x" * 20000, "hunter2")[0] == 413
 assert call("POST", "/api/nope", {}, "hunter2")[0] == 404
-ok("cross-site protection: JSON only, no CORS on controls, size limit, unknown actions")
+ok("cross-site protection: JSON only, no CORS anywhere, no framing, size limit, unknown actions")
 
 code, body, _ = call("GET", "/api/models")
 assert [m["name"] for m in body["models"]] == ["gpt-oss:20b", "qwen3.5:9b"] and body["available"]
