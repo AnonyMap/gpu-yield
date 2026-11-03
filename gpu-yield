@@ -571,6 +571,17 @@ def process_age(pid):
 
 
 _NO_CMDLINE = set()   # (pid, inode) of kernel threads and zombies: their cmdline stays empty
+_GPU_EXES = []        # Windows programs outside Steam using the GPU, from the last scan
+PF_KTHREAD = 0x00200000
+
+
+def _never_has_cmdline(pid):
+    """A kernel thread or a zombie: neither will ever have a command line."""
+    try:
+        fields = _read_text(Path(f"/proc/{pid}/stat")).rsplit(")", 1)[1].split()
+        return fields[0] == "Z" or bool(int(fields[6]) & PF_KTHREAD)
+    except (IndexError, ValueError):
+        return False
 
 
 def scan_games(cfg):
@@ -602,7 +613,11 @@ def scan_games(cfg):
             continue
         raw = _read_cmdline(pid)
         if not raw:
-            empty.add((pid, inode))    # half of /proc on a typical desktop: skip from now on
+            # Half of /proc on a typical desktop is kernel threads, which never get a
+            # command line. A process caught mid-exec (Steam starting a game) briefly has
+            # none either, so only the kernel's own threads and zombies are remembered.
+            if _never_has_cmdline(pid):
+                empty.add((pid, inode))
             continue
         base = _basename(raw.partition(b"\0")[0])
         if base == b"reaper" and b"\0SteamLaunch\0" in raw:
@@ -623,11 +638,14 @@ def scan_games(cfg):
                 exes.append((pid, base.decode(errors="replace")))
     _NO_CMDLINE.clear()
     _NO_CMDLINE.update(empty)          # only those still present: the set can't grow
+    _GPU_EXES.clear()
     if wine_pids and not steam_present:
         # Wine also runs briefly for things that aren't games: Steam's install scripts,
         # redistributable installers, Proton's own helpers. A game draws with the GPU, so
         # only a Windows program that has the GPU open counts.
-        playing = [name for pid, name in exes if _uses_gpu(pid)]
+        gpu = [(pid, name) for pid, name in exes if _uses_gpu(pid)]
+        _GPU_EXES[:] = [int(pid) for pid, _ in gpu]
+        playing = [name for _, name in gpu]
         if playing:
             for pid in wine_pids:
                 found[pid] = playing[0] + WINE_SUFFIX
@@ -1357,6 +1375,39 @@ def http_error_detail(e):
 
 # ---------------------------------------------------------------------------- stand-in
 
+def drain_body(rfile, headers, limit=64 * 2**20, seconds=120):
+    """Read a request body and throw it away as it arrives (nothing is kept), so the
+    client can read the reply. Handles Content-Length and chunked bodies; stops at
+    `limit` bytes or `seconds`, and the socket's own timeout covers a client that stalls."""
+    end, total = time.monotonic() + seconds, 0
+
+    def take(n):
+        nonlocal total
+        while n > 0 and total < limit and time.monotonic() < end:
+            chunk = rfile.read(min(n, 65536))
+            if not chunk:
+                return False
+            n -= len(chunk)
+            total += len(chunk)
+        return n <= 0
+
+    if "chunked" in headers.get("Transfer-Encoding", "").lower():
+        while total < limit and time.monotonic() < end:
+            size = int(rfile.readline(1024).split(b";", 1)[0].strip() or b"0", 16)
+            if size == 0:
+                while rfile.readline(1024).strip():      # trailers, then the blank line
+                    pass
+                return
+            if not take(size + 2):                       # chunk data and its CRLF
+                return
+        return
+    try:
+        length = max(0, int(headers.get("Content-Length") or 0))
+    except ValueError:
+        length = 0
+    take(length)
+
+
 class StandIn:
     """Answers every request with 503 + a reason while Ollama is down.
 
@@ -1387,18 +1438,14 @@ class StandIn:
                 # One request per connection: a client that keeps a connection open must
                 # not keep talking to the stand-in after the real Ollama is back.
                 self.close_connection = True
+                # The headers are in: the server's short deadline was for them. A body can
+                # take a while over slow Wi-Fi (a long prompt, an image), and the client
+                # should still get the 503 and Retry-After, not a cut connection.
+                self.server.request_read(self.request)
                 try:
-                    length = max(0, int(self.headers.get("Content-Length") or 0))
-                except ValueError:
-                    length = 0
-                # Read the request before answering, or the client may get a reset instead
-                # of the 503, but throw it away as it arrives: nothing is kept in memory.
-                left = min(length, 64 * 2**20)
-                while left > 0:
-                    chunk = self.rfile.read(min(left, 65536))
-                    if not chunk:
-                        break
-                    left -= len(chunk)
+                    drain_body(self.rfile, self.headers)
+                except (OSError, ValueError):
+                    pass
                 if self.path.startswith("/v1"):
                     body = {"error": {"message": owner.message, "type": "server_error",
                                       "code": "gpu_busy"}}
@@ -1994,23 +2041,30 @@ class QuietServer(ThreadingHTTPServer):
     """Sleeps until a connection arrives. The stock serve_forever wakes twice a second to
     check whether it should stop, which costs wakeups during a game for nothing."""
 
+    def __init__(self, *args, **kw):
+        self._stopping, self._running, self._done = False, False, threading.Event()
+        super().__init__(*args, **kw)
+
     def serve_forever(self, poll_interval=None):
-        self._done, self._stopping = threading.Event(), False
+        self._running = True
         try:
-            while not self._stopping:
+            while not self._stopping:          # set before the thread started: exit at once
                 self.handle_request()          # blocks: self.timeout is None
         finally:
             self._done.set()
 
     def shutdown(self):
         self._stopping = True
-        try:                                   # wake the loop with a connection of our own
-            socket.create_connection(("127.0.0.1", self.server_address[1]), timeout=1).close()
+        try:      # wakes the blocked select at once, whatever address the server is bound to
+            self.socket.shutdown(socket.SHUT_RDWR)
         except OSError:
             pass
-        done = getattr(self, "_done", None)
-        if done:
-            done.wait(5)
+        if self._running and not self._done.wait(1):
+            try:                               # fallback: a connection of our own
+                socket.create_connection(("127.0.0.1", self.server_address[1]), timeout=1).close()
+            except OSError:
+                pass
+            self._done.wait(4)
 
 
 class PageServer(QuietServer):
@@ -2261,7 +2315,8 @@ class Watcher:
         self.ollama.stop()
         after = wait_vram_settled(10, self.stop_evt)
         self.report_vram(before, after)
-        if self.stop_evt.is_set() or scan_games(self.cfg) or PAUSE_FILE.exists():
+        if self.stop_evt.is_set() or PAUSE_FILE.exists() or \
+                self.confirm_wine(scan_games(self.cfg), time.monotonic()):
             return                       # the next pass turns this into "gaming"/"paused"
         self.go_on("starting Ollama again with the GPU memory cleared")
         if self.warming:
@@ -2881,10 +2936,12 @@ class Watcher:
             self.wine_since = now
         if now - self.wine_since >= WINE_CONFIRM_SECONDS:
             return games
-        # A program that has already been running a while counts at once: what's being
-        # filtered out is short Wine runs, not games that were running before we looked.
-        return {pid: label for pid, label in games.items()
-                if pid not in wine or process_age(pid) >= WINE_CONFIRM_SECONDS}
+        # A Windows program that has already been using the GPU a while counts at once:
+        # what's filtered out is short Wine runs, not games running before we looked. Its
+        # own age counts, not wineserver's (a Wine prefix can outlive many programs).
+        if any(process_age(p) >= WINE_CONFIRM_SECONDS for p in _GPU_EXES):
+            return games
+        return {pid: label for pid, label in games.items() if pid not in wine}
 
     def busy(self):
         """Something the update's restart would cut off: a download, a speed test, a load."""
@@ -3319,10 +3376,13 @@ def fetch_remote_status(host, port, timeout=4):
                     raise ValueError("the reply took too long")
     except http.client.HTTPException as e:     # something that isn't a web server
         raise ValueError(f"that port doesn't answer like a web page ({e!r})") from None
-    st = json.loads(data)
-    if not isinstance(st, dict) or not ("state" in st or "version" in st):
-        raise ValueError("the reply isn't a gpu-yield status")
-    st = _clean(st)
+    try:
+        st = json.loads(data)
+        if not isinstance(st, dict) or not ("state" in st or "version" in st):
+            raise ValueError("the reply isn't a gpu-yield status")
+        st = _clean(st)
+    except RecursionError:
+        raise ValueError("the reply is nested too deeply to be a gpu-yield status") from None
     if st.get("mac") is not None and not (isinstance(st["mac"], str) and MAC_RE.match(st["mac"])):
         st["mac"] = None
     return st
@@ -3436,6 +3496,10 @@ def cmd_wake(args):
                 return
             if state in ("gaming", "paused", "config_error"):
                 print(f" {host} is awake, but the AI isn't available: {STATE_TEXT.get(state, state)}.")
+                sys.exit(1)
+            status = str(st.get("model_status") or "")
+            if state == "ai" and status.startswith(("failed", "no model")):
+                print(f" {host} is awake, but the model isn't loading: {status}")
                 sys.exit(1)
         answered = answered or kind == "refused"
         time.sleep(3)

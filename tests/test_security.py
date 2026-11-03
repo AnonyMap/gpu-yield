@@ -148,6 +148,7 @@ ok("status page: no CORS, no framing; refused names don't make it run `ip` each 
 # --- config error: your own Ollama unit is stopped too
 gy.CONFIG_FILE.write_text('ollama_unit = "ollama.service"\nport = "oops"\n')
 calls.clear()
+real_standin_start = gy.StandIn.start
 gy.StandIn.start = lambda self: True
 th = threading.Thread(target=gy.load_config_or_wait, daemon=True)
 th.start()
@@ -225,4 +226,86 @@ assert len(writes) == 1 and writes[0]["memory"], len(writes)
 w.write_status(111.0)
 assert len(writes) == 2, "the 10 s heartbeat still writes"
 ok("memory readings alone don't rewrite the status file every poll; it still has them")
+# --- from the check of these fixes
+# a process caught mid-exec (empty command line, not a kernel thread) is never skipped for good
+gy._NO_CMDLINE.clear()
+real_read, real_text = gy._read_cmdline, gy._read_text
+blank = {"424242"}
+gy._read_cmdline = lambda pid, full=False: b"" if pid in blank else real_read(pid, full)
+fake_entries = [types.SimpleNamespace(name="424242", inode=lambda: 9)]
+real_scandir = gy.os.scandir
+gy.os.scandir = lambda path: fake_entries if path == "/proc" else real_scandir(path)
+stats = {"424242": "424242 (reaper) R 1 1 1 0 -1 4194560 0 0"}           # a user process
+gy._read_text = lambda p: stats.get(str(p).split("/")[2]) if str(p).endswith("/stat") \
+    and str(p).split("/")[2] in stats else real_text(p)
+gy.scan_games(gy.DEFAULTS)
+assert not gy._NO_CMDLINE, "a process mid-exec must be looked at again next time"
+stats["424242"] = "424242 (kworker/0:1) I 2 0 0 0 -1 69238880 0 0"       # PF_KTHREAD set
+gy.scan_games(gy.DEFAULTS)
+assert ("424242", 9) in gy._NO_CMDLINE
+gy._read_cmdline, gy._read_text, gy.os.scandir = real_read, real_text, real_scandir
+gy._NO_CMDLINE.clear()
+ok("only kernel threads and zombies are skipped for good, never a process starting up")
+
+# stand-in: a slow upload or a chunked body still gets the 503
+gy.StandIn.start = real_standin_start
+gy.PageServer.DEADLINE, deadline = 1, gy.PageServer.DEADLINE
+s2 = gy.StandIn(free_port())
+assert s2.start()
+with socket.create_connection(("127.0.0.1", s2.port)) as c:
+    c.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 30\r\n\r\n")
+    for _ in range(3):                        # slower than the 1 s deadline for headers
+        time.sleep(0.8)
+        c.sendall(b"x" * 10)
+    c.settimeout(5)
+    assert c.recv(200).startswith(b"HTTP/1.1 503"), "a slow upload must still get the 503"
+with socket.create_connection(("127.0.0.1", s2.port)) as c:
+    c.sendall(b"POST /api/chat HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
+              b"5\r\nhello\r\n6;x=y\r\n world\r\n0\r\n\r\n")
+    c.settimeout(5)
+    assert c.recv(200).startswith(b"HTTP/1.1 503")
+gy.PageServer.DEADLINE = deadline
+ok("stand-in: the deadline covers the headers only; slow and chunked bodies still get the 503")
+
+# servers stop even if they can't connect to themselves, and when stopped before they start
+real_conn = gy.socket.create_connection
+gy.socket.create_connection = lambda *a, **k: (_ for _ in ()).throw(OSError("loopback filtered"))
+t = time.monotonic()
+s2.stop()
+gy.socket.create_connection = real_conn
+assert time.monotonic() - t < 1.5
+with socket.socket() as probe:
+    probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    probe.bind(("0.0.0.0", s2.port))       # the port is free again
+srv = gy.PageServer(("127.0.0.1", 0), BaseHTTPRequestHandler)
+srv.shutdown()                            # before serve_forever ever ran
+th = threading.Thread(target=srv.serve_forever, daemon=True)
+th.start()
+th.join(2)
+assert not th.is_alive(), "a server stopped before it started must not run afterwards"
+srv.server_close()
+ok("servers stop at once without a loopback connection, and stay stopped if stopped early")
+
+# remote: deeply nested JSON is a clean error
+Remote.body = b"[" * 100000 + b"]" * 100000
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Remote)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+try:
+    gy.fetch_remote_status("127.0.0.1", srv.server_address[1])
+    raise AssertionError("accepted deeply nested JSON")
+except ValueError:
+    pass
+srv.shutdown()
+ok("remote status: deeply nested JSON is refused cleanly")
+
+# wake: an awake PC whose model can't load answers at once (exit 1), not after 5 minutes
+gy.load_hosts = lambda: {}
+gy.fetch_remote_status = lambda *a, **k: {"state": "ai", "ai_available": False,
+                                          "model_status": "failed: m is not downloaded"}
+gy.remember_host = lambda *a: None
+t = time.monotonic()
+with contextlib.redirect_stdout(io.StringIO()):
+    assert attempt(gy.cmd_wake, types.SimpleNamespace(target="pc", no_wait=False)) == 1
+assert time.monotonic() - t < 2
+ok("wake: a model that failed to load ends the wait at once with exit code 1")
 print("security and review-fix tests passed")

@@ -93,9 +93,14 @@ assert wt.confirm_wine(wine_game, 104.0) == {}
 assert wt.confirm_wine(wine_game, 105.5) == wine_game
 assert wt.confirm_wine({}, 106.0) == {} and wt.wine_since is None
 assert wt.confirm_wine(wine_game, 107.0) == {}, "a new Wine run starts the wait again"
-gy.process_age = lambda pid: 60.0                # already running when we looked
+gy.process_age = lambda pid: 60.0 if pid == 77 else 0.0   # the .exe (pid 77) has run a minute
+gy._GPU_EXES[:] = [77]
 wt.wine_since = None
 assert wt.confirm_wine(wine_game, 200.0) == wine_game, "a game that was already running counts at once"
+gy._GPU_EXES[:] = [78]                           # an old wineserver doesn't make a new .exe old
+wt.wine_since = None
+assert wt.confirm_wine(wine_game, 201.0) == {}, "aged by the Windows program, not by wineserver"
+gy._GPU_EXES.clear()
 gy.process_age = lambda pid: 0.0
 wt.wine_since = None
 for state in (None, "paused", "cooldown", "gaming"):

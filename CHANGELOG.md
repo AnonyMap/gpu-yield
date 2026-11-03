@@ -21,13 +21,14 @@ Fixes:
 - The automatic restart after running out of GPU memory could be skipped if the model or context was changed during a restart.
 - `wake` waits until the AI is ready, not just the PC, and its exit code says whether it is.
 - `status --host` and `wake` give a message instead of a Python error when something other than gpu-yield answers.
+- The stand-in reads chunked request bodies too, so those clients get the 503 and its retry time instead of a dropped connection.
 - `gpu-yield config` accepts values containing emoji.
 
 Performance (about 70% less CPU time while a game runs):
 - The status page and stand-in sleep until a connection arrives instead of waking twice a second.
 - The status file is only rewritten when something besides memory readings changed.
 - While a game runs, the watcher checks every 5 seconds instead of 2; a game ending only starts the cooldown anyway. Game starts are still caught within 2 seconds.
-- Processes without a command line (kernel threads) are skipped after the first look.
+- Kernel threads, which make up about half the process list, are skipped after the first look.
 - The watcher runs at a lower CPU priority than games.
 - The status page stops polling while its browser tab is hidden.
 
