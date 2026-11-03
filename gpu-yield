@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.11.2"
+VERSION = "1.12.0"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -113,6 +113,8 @@ DEFAULTS = {
     "auto_update": "off",
     "control_password": "",
     "alias": "gpu-yield",
+    "ollama_ram_limit": "auto",
+    "allow_partial_gpu": False,
     "ollama_env": {},
 }
 
@@ -208,6 +210,18 @@ control_password = ""
 # "gpu-yield" follows every model switch. Empty turns it off.
 alias = "gpu-yield"
 
+# Most system RAM Ollama may use: "auto" (a third of this PC's RAM), "off", or a size in
+# GB like "12". If it goes over, Linux stops Ollama alone and gpu-yield restarts it and
+# says so, instead of the whole PC slowing to a crawl. Ollama is also kept out of swap,
+# and if RAM ever runs out anyway, Linux stops Ollama before Steam or a game.
+ollama_ram_limit = "auto"
+
+# On ROCm (the RX 7000 series), a model that doesn't fit entirely in the graphics card's
+# memory is unloaded and gpu-yield goes back to the last model and context that did fit:
+# running part of a model from system RAM through ROCm has stalled the driver and shut
+# down a PC. true allows it anyway. (On Vulkan, spilling only costs speed; it just warns.)
+allow_partial_gpu = false
+
 # Extra environment variables for the managed Ollama, for example:
 #   OLLAMA_KV_CACHE_TYPE = "q8_0"   # roughly halves context memory, small quality cost
 [ollama_env]
@@ -284,6 +298,9 @@ def config_problem(cfg):
             return f"{key} must be a whole number, not {cfg[key]}"
     if page_port(cfg) == cfg["port"]:
         return "status_port must differ from port"
+    if ram_limit_bytes(cfg["ollama_ram_limit"]) is False:
+        return (f"ollama_ram_limit must be \"auto\", \"off\" or a size in GB like \"12\", "
+                f"not {cfg['ollama_ram_limit']!r}")
     if cfg["alias"] and not (MODEL_NAME_RE.fullmatch(cfg["alias"]) and len(cfg["alias"]) <= 100):
         return f"alias must be a simple model name like \"gpu-yield\", not {cfg['alias']!r}"
     if cfg["alias"] and cfg["model"] and same_model(cfg["alias"], cfg["model"]):
@@ -907,6 +924,27 @@ def systemd_quote(value):
     return str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
 
 
+def total_ram():
+    m = re.search(r"^MemTotal:\s+(\d+) kB", _read_text(Path("/proc/meminfo")), re.M)
+    return int(m.group(1)) * 1024 if m else None
+
+
+def ram_limit_bytes(setting):
+    """Bytes for ollama_ram_limit, None for no limit, False if the setting is invalid."""
+    text = str(setting).strip().lower()
+    if text == "off":
+        return None
+    if text == "auto":
+        total = total_ram()
+        if not total:
+            return None
+        return max(4 * 2**30, total // 3 // 2**29 * 2**29)     # a third, in 0.5 GiB steps
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*(g|gb|gib)?", text)
+    if not m or not 1 <= float(m.group(1)) <= 4096:
+        return False
+    return int(float(m.group(1)) * 2**30)
+
+
 def ollama_unit_text(cfg):
     env = {
         "OLLAMA_HOST": f"0.0.0.0:{cfg['port']}",
@@ -922,6 +960,10 @@ def ollama_unit_text(cfg):
     env.update(cfg["ollama_env"])
     env_lines = "\n".join(f'Environment="{systemd_quote(k)}={systemd_quote(v)}"'
                           for k, v in env.items())
+    # RAM: a ceiling (Linux stops Ollama alone if it goes over), no swap (a model paged
+    # out to disk would crawl and take the PC with it), and first in line if RAM runs out.
+    limit = ram_limit_bytes(cfg["ollama_ram_limit"])
+    ram_lines = (f"MemoryMax={limit}\n" if limit else "") + "MemorySwapMax=0\nOOMScoreAdjust=800\n"
     # BindsTo+After: Ollama may only run while the watcher is active. If the watcher dies
     # or crash-loops, Ollama is stopped instead of being left holding the GPU.
     return f"""\
@@ -937,7 +979,7 @@ ExecStart={OLLAMA_BIN} serve
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=15
-"""
+{ram_lines}"""
 
 
 def watcher_unit_text():
@@ -1053,6 +1095,46 @@ class Ollama:
         except Exception:
             return False
         return any(k.endswith(".expert_count") and v for k, v in info.items())
+
+
+def guards_gpu_fit(cfg):
+    """True where a model must fit entirely in VRAM: ROCm (unless allowed). Through ROCm
+    the GPU reads spilled weights from system RAM via the driver, which has stalled the
+    driver and shut down a PC; on Vulkan spilling only costs speed."""
+    return not cfg["allow_partial_gpu"] and resolve_backend(cfg) == "rocm" \
+        and backend_installed(cfg) is not False
+
+
+def spilled(models):
+    """Loaded models with part of them outside VRAM."""
+    return [m for m in models or [] if m.get("size") and m.get("size_vram", 0) < m["size"]]
+
+
+FIT_FILE = STATE_DIR / "last-fit.json"
+
+
+def last_fit():
+    """The model and context that last loaded entirely in VRAM: {"model", "context_length"}."""
+    try:
+        rec = json.loads(FIT_FILE.read_text())
+        return rec if isinstance(rec, dict) and isinstance(rec.get("model"), str) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_fit(model, ctx):
+    try:
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        FIT_FILE.write_text(json.dumps({"model": model, "context_length": int(ctx)}))
+    except OSError:
+        pass
+
+
+def oom_killed_since(unit, since):
+    """True if systemd recorded an out-of-memory kill in this unit since `since` (epoch)."""
+    r = run(["journalctl", "--user", "-u", unit, "--since", f"@{int(since)}", "-o", "cat",
+             "-q", "--no-pager", "-n", "200"])
+    return bool(re.search(r"killed by the OOM killer|oom-kill", r.stdout or "", re.I))
 
 
 def placement_note(ollama, model, share):
@@ -2211,6 +2293,8 @@ class Watcher:
         self.oom_retried = False         # one automatic restart per out-of-memory streak
         self.vram_report = ""            # what was left on the GPU after the last restart
         self.restart_busy = False        # inside restart_ai
+        self.oom_checked = time.time()   # journal checked for out-of-memory kills up to here
+        self.oom_kills = collections.deque(maxlen=5)
         self.restart_gen = None          # the load a restart started (its warm_gen)
         self.restart_count = 0           # lets `gpu-yield restart` see its restart begin
 
@@ -2434,7 +2518,12 @@ class Watcher:
             return self._fail(gen, f"failed: {e}")
         if gen != self.warm_gen:
             return
-        share = gpu_share(self.ollama.loaded())
+        loaded = self.ollama.loaded()
+        share = gpu_share(loaded)
+        if guards_gpu_fit(self.cfg) and spilled(loaded):
+            return self.refuse_spill(gen, model, target, share)
+        if share is None or share >= 100:
+            save_fit(model, self.cfg["context_length"])
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
         self.warm_status = f"ready ({model}{named}{where})"
@@ -2444,6 +2533,52 @@ class Watcher:
         problem, note = placement_note(self.ollama, model, share)
         if note:
             self.event(note, "error" if problem else "warn")
+
+    def refuse_spill(self, gen, model, target, share):
+        """Unload a model that didn't fit in VRAM (ROCm) and go back to the last model and
+        context that did, or wait and retry if there isn't one."""
+        try:
+            self.ollama.request("/api/generate", {"model": target, "keep_alive": 0}, timeout=60)
+        except Exception:
+            self.ollama.stop()            # it must not stay loaded either way
+        if gen != self.warm_gen:
+            return
+        ctx = int(self.cfg["context_length"])
+        why = (f"{model} at context {ctx} loaded only {share}% in GPU memory, so it was "
+               "unloaded: on ROCm, running part of a model from system RAM has stalled the "
+               "graphics driver and shut down a PC")
+        prev = last_fit()
+        back = {}
+        if prev.get("model") and not same_model(prev["model"], model):
+            back["model"] = prev["model"]
+        if prev.get("context_length") and int(prev["context_length"]) != ctx:
+            back["context_length"] = int(prev["context_length"])
+        if back:
+            self.event(f"{why}. Going back to {prev['model']} at context "
+                       f"{prev['context_length']}, which fit.", "error")
+            self.warm_status = "didn't fit in GPU memory; going back to the last model that did"
+            with self.model_lock:
+                for key, value in back.items():
+                    self.actions.put(({"model": "model", "context_length": "context"}[key], value))
+            return
+        self.report_vram(None, (memory_readings() or {}).get("vram_used"), quiet=True)
+        where = f" {self.vram_report}." if self.vram_report else ""
+        self._fail(gen, f"failed: {why}.{where} Free some GPU memory, choose a smaller model, "
+                        f"or lower context_length (gpu-yield config context_length "
+                        f"{max(8192, ctx // 2)})", retry=300)
+
+    def note_ollama_exit(self):
+        """Ollama (or the program running the model) ended unexpectedly: say if Linux
+        stopped it for going over its RAM limit. True if that keeps happening."""
+        since, self.oom_checked = self.oom_checked, time.time()
+        if not oom_killed_since(self.cfg["ollama_unit"], since - 5):
+            return False
+        limit = ram_limit_bytes(self.cfg["ollama_ram_limit"])
+        self.oom_kills.append(time.monotonic())
+        self.event(f"Ollama went over its RAM limit ({size_text(limit) if limit else 'none set'}) "
+                   "and Linux stopped it; the rest of the PC wasn't affected", "error")
+        recent = [t for t in self.oom_kills if time.monotonic() - t < 600]
+        return len(recent) >= 2
 
     def update_message(self, now):
         cd = int(self.cfg["cooldown_seconds"])
@@ -2502,6 +2637,7 @@ class Watcher:
         settling = now - self.last_restart < 120
         if not self.ollama.active():
             if now - self.last_restart >= 30:
+                self.note_ollama_exit()
                 self.go_on("Ollama is not running; restarting it")
             return
         if not self.ollama.ready():
@@ -2532,8 +2668,32 @@ class Watcher:
             self.empty_checks += 1
             if self.empty_checks >= 2:
                 self.empty_checks = 0
+                if self.note_ollama_exit():
+                    self.warm_gen += 1
+                    self.warm_status = (f"failed: {model} keeps going over Ollama's RAM limit "
+                                        "(see ollama_ram_limit); not loading it again until you "
+                                        "change the model, the limit, or run gpu-yield restart")
+                    self.warm_failed_at, self.warm_retry = time.monotonic(), 10**9
+                    self.event(self.warm_status)
+                    return
                 self.event(f"{model} is no longer loaded; loading it again")
                 self.start_warm()
+            return
+        if guards_gpu_fit(self.cfg) and spilled(models):
+            # Something else (an app asking for a different model or context) loaded a
+            # model that doesn't fit: unload it before it's put to work.
+            for m in spilled(models):
+                name = m.get("name") or m.get("model") or "?"
+                try:
+                    self.ollama.request("/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
+                except Exception:
+                    pass
+                self.warn_once(("spill", name, m.get("context_length")),
+                               f"an app loaded {name} (context {m.get('context_length', '?')}) "
+                               f"with {100 - gpu_share([m])}% outside GPU memory; unloaded it, "
+                               "since on ROCm that has shut down this PC. Set the app to use "
+                               f"{self.cfg['alias'] or model} at context {ctx}")
+            self.start_warm()
             return
         self.empty_checks = 0
         trusted_alias = self.loaded_name if self.loaded_name and self.cfg["alias"] and \
@@ -3813,6 +3973,14 @@ def cmd_doctor(args):
     mem = memory_readings()
     if mem:
         note("memory (from the driver, not Ollama): " + memory_line(mem))
+    if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT:
+        limit = ram_limit_bytes(cfg["ollama_ram_limit"])
+        note(f"Ollama's RAM limit: {size_text(limit) if limit else 'none'}; kept out of swap, "
+             "and stopped first if RAM runs out")
+    note("models that don't fit in GPU memory: " + (
+        "unloaded (ROCm); gpu-yield goes back to the last model that fit" if guards_gpu_fit(cfg)
+        else "allowed (allow_partial_gpu = true)" if cfg["allow_partial_gpu"]
+        else "allowed with a warning (Vulkan: it only costs speed)"))
     holders = vram_holders()
     if holders:
         note("GPU memory by program: " + holders_text(holders, 6))
@@ -4052,8 +4220,20 @@ def pull_and_load(cfg, name):
     o = Ollama(dict(cfg, model=name))
     try:
         o.warm()
-        share = gpu_share(o.loaded())
+        loaded = o.loaded()
+        share = gpu_share(loaded)
         log(f"  loaded, {share}% on GPU" if share is not None else "  loaded")
+        if guards_gpu_fit(cfg) and spilled(loaded):
+            try:
+                o.request("/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
+            except Exception:
+                pass
+            warn(f"{name} at context {cfg['context_length']} doesn't fit in GPU memory "
+                 f"({share}% fit), so it was unloaded and not switched to. On ROCm, running "
+                 "part of a model from system RAM has stalled the driver and shut down a PC. "
+                 "Choose a smaller model or lower context_length (allow_partial_gpu = true "
+                 "overrides this). The current model reloads in a moment.")
+            return False
         problem, msg = placement_note(o, name, share)
         if msg:
             (warn if problem else log)(("" if problem else "  ") + msg)
