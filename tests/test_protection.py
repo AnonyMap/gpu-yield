@@ -21,10 +21,18 @@ for bad in ("lots", "-3", "0", "12T", ""):
 assert "ollama_ram_limit" in gy.config_problem(dict(gy.DEFAULTS, ollama_ram_limit="lots"))
 assert gy.config_problem(dict(gy.DEFAULTS, ollama_ram_limit="16")) is None
 gy.total_ram = lambda: int(31.2 * 2**30)
-unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m"))
+unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", backend="rocm"))
 assert f"MemoryMax={10 * 2**30}\n" in unit and "MemorySwapMax=0\n" in unit and "OOMScoreAdjust=800\n" in unit
-unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", ollama_ram_limit="off"))
+unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", backend="rocm", ollama_ram_limit="off"))
 assert "MemoryMax" not in unit and "MemorySwapMax=0" in unit and "OOMScoreAdjust=800" in unit
+unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", backend="vulkan"))
+assert "MemoryMax" not in unit, "auto: no ceiling where models may run partly from RAM on purpose"
+unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", backend="vulkan", ollama_ram_limit="12"))
+assert f"MemoryMax={12 * 2**30}" in unit, "an explicit limit applies everywhere"
+gy.CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+gy.CONFIG_FILE.write_text("ollama_ram_limit = 12\n")
+assert gy.load_config()["ollama_ram_limit"] == "12", "an unquoted number is read as a size"
+gy.CONFIG_FILE.unlink()
 assert 'ollama_ram_limit = "auto"' in gy.CONFIG_TEMPLATE and "allow_partial_gpu = false" in gy.CONFIG_TEMPLATE
 ok("Ollama's service: RAM ceiling (a third of RAM by default), no swap, stopped first if RAM runs out")
 
@@ -100,7 +108,7 @@ ok("an app that reloads the model so it spills gets it unloaded, and gpu-yield r
 # gpu-yield model refuses a model that doesn't fit, without switching
 gy.Ollama = lambda cfg: Stub(80)
 gy.subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=0)
-assert gy.pull_and_load(dict(gy.DEFAULTS, port=1, **rocm), "big:1") is False
+assert gy.pull_and_load(dict(gy.DEFAULTS, port=1, **rocm), "big:1") == "refused"
 assert gy.pull_and_load(dict(gy.DEFAULTS, port=1, backend="vulkan"), "big:1") is True
 ok("gpu-yield model won't switch to a model that doesn't fit (ROCm)")
 
@@ -108,7 +116,7 @@ ok("gpu-yield model won't switch to a model that doesn't fit (ROCm)")
 # --- Ollama stopped for going over its RAM limit: reported, and no endless reload loop
 journal = {"text": ""}
 gy.run = lambda cmd, **k: types.SimpleNamespace(returncode=0, stdout=journal["text"], stderr="")
-w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias=""))
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias="", **rocm))
 w.state, w.ollama = "ai", Stub()
 warms = []
 w.start_warm = lambda: warms.append(1)
@@ -121,4 +129,82 @@ w.check_loaded([]); w.check_loaded([])                       # again within 10 m
 assert warms == [1, 1], "must stop reloading a model that keeps getting killed"
 assert w.warm_status.startswith("failed:") and "keeps going over" in w.warm_status
 ok("an out-of-RAM stop is reported; if it repeats, gpu-yield stops reloading and says why")
+# --- from the review of these protections
+assert gy.spilled([{"size": 100, "size_vram": 0}]) == [], "CPU-only is a broken backend, not a spill"
+assert not gy.fits([]) and not gy.fits([{"size": 100, "size_vram": 99}]) and gy.fits([{"size": 1, "size_vram": 1}])
+gy.FIT_FILE.unlink(missing_ok=True)
+class Gone(Stub):
+    def loaded(self): return []                      # /api/ps had nothing to say
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias="", **rocm))
+w.state, w.ollama = "ai", Gone()
+w._warm_inner(w.warm_gen)
+assert gy.last_fit() == {}, "a fit is only recorded with evidence"
+ok("a model on the CPU only isn't treated as spilled; a fit is recorded only with evidence")
+
+# the spill check runs even while a load is failed or waiting to retry
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias="", **rocm))
+w.state, w.ollama = "ai", Stub(70)
+w.ollama.active = lambda: True
+w.ollama.ready = lambda: True
+w.warm_failed_at, w.warm_retry = gy.time.monotonic(), 300
+w.start_warm = lambda: None
+w.last_health, w.last_restart = 0, -1000
+w.health(gy.time.monotonic())
+assert ("/api/generate", {"model": "big:1", "keep_alive": 0}) in w.ollama.calls
+ok("a model that doesn't fit is unloaded even while gpu-yield's own load is failed or retrying")
+
+# an app that keeps loading something that doesn't fit gets the AI paused, with the reason
+gy.PAUSE_FILE.unlink(missing_ok=True)
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias="gpu-yield", **rocm))
+w.state, w.ollama = "ai", Stub()
+w.start_warm = lambda: None
+spill = [{"name": "gpu-yield:latest", "size": 100, "size_vram": 70, "context_length": 131072}]
+w.check_loaded(spill)
+assert not gy.PAUSE_FILE.exists(), "the first time, it's unloaded and reloaded"
+w.check_loaded(spill)
+assert gy.PAUSE_FILE.exists() and "keeps loading" in w.block_reason and "131072" in w.block_reason
+w.step({}, True, False, gy.time.monotonic())
+assert w.state == "paused" and w.standin.message == w.block_reason
+assert w.snapshot()["notice"] == w.block_reason
+w.standin.stop()
+gy.PAUSE_FILE.unlink()
+w.ollama.start = lambda: True
+w.step({}, False, False, gy.time.monotonic())
+assert w.block_reason == "" and not w.client_spills
+ok("an app that keeps loading a model that doesn't fit gets the AI paused, saying why, until resume")
+
+# a revert only goes to a model that's still downloaded
+gy.save_fit("deleted:1", 65536)
+w = warm(share=86, **rocm)                          # Stub's /api/tags has big:1 and small:1 only
+assert not list(w.actions.queue) and w.warm_status.startswith("failed:")
+gy.save_fit("small:1", 65536)
+w = warm(share=86, **rocm)
+w.deleting.add("small:1")
+w2 = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias="", **rocm))
+w2.state, w2.ollama = "ai", Stub(86)
+w2.deleting.add("small:1")
+w2._warm_inner(w2.warm_gen)
+assert not list(w2.actions.queue), "never back to a model being deleted"
+ok("going back only to a model that's still downloaded and not being deleted")
+
+# Linux stopping Ollama for its RAM limit during a load: retried once, then given up on
+journal["text"] = ""
+class Dies(Stub):
+    def warm(self, name=None):
+        raise ConnectionResetError("connection reset")
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias="", **rocm))
+w.state, w.ollama = "ai", Dies()
+journal["text"] = "Failed with result 'oom-kill'.\n"
+w._warm_inner(w.warm_gen)
+assert "RAM limit while loading" in w.warm_status and w.warm_retry == 300
+w._warm_inner(w.warm_gen)
+assert "keeps going over" in w.warm_status and w.warm_retry == 10**9
+ok("a RAM-limit stop while loading is reported, retried once, then given up on")
+
+# command line: a load that fails or doesn't fit isn't switched to
+class Boom(Stub):
+    def warm(self, name=None): raise RuntimeError("runner died")
+gy.Ollama = lambda cfg: Boom()
+assert gy.pull_and_load(dict(gy.DEFAULTS, port=1, backend="vulkan"), "big:1") == "refused"
+ok("gpu-yield model doesn't switch to a model that failed to load")
 print("protection tests passed")

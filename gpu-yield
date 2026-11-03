@@ -311,6 +311,9 @@ def config_problem(cfg):
 def repair_config(cfg, user):
     """Accept what older versions accepted, with a warning, instead of refusing to run:
     an upgrade must never turn a working config into one that keeps the AI off."""
+    if isinstance(cfg.get("ollama_ram_limit"), (int, float)) and \
+            not isinstance(cfg["ollama_ram_limit"], bool):
+        cfg["ollama_ram_limit"] = str(cfg["ollama_ram_limit"])      # `= 12` means "12"
     for key, default in DEFAULTS.items():
         value = cfg[key]
         if isinstance(default, (dict, str)) or type(value) is type(default) \
@@ -945,6 +948,15 @@ def ram_limit_bytes(setting):
     return int(float(m.group(1)) * 2**30)
 
 
+def effective_ram_limit(cfg):
+    """Bytes for Ollama's RAM ceiling, or None. "auto" applies only where models are kept
+    entirely in VRAM (ROCm with the fit guard): elsewhere part of a model may run from
+    RAM on purpose, and a ceiling would get it stopped or make it crawl."""
+    if str(cfg["ollama_ram_limit"]).strip().lower() == "auto" and not guards_gpu_fit(cfg):
+        return None
+    return ram_limit_bytes(cfg["ollama_ram_limit"]) or None
+
+
 def ollama_unit_text(cfg):
     env = {
         "OLLAMA_HOST": f"0.0.0.0:{cfg['port']}",
@@ -962,7 +974,7 @@ def ollama_unit_text(cfg):
                           for k, v in env.items())
     # RAM: a ceiling (Linux stops Ollama alone if it goes over), no swap (a model paged
     # out to disk would crawl and take the PC with it), and first in line if RAM runs out.
-    limit = ram_limit_bytes(cfg["ollama_ram_limit"])
+    limit = effective_ram_limit(cfg)
     ram_lines = (f"MemoryMax={limit}\n" if limit else "") + "MemorySwapMax=0\nOOMScoreAdjust=800\n"
     # BindsTo+After: Ollama may only run while the watcher is active. If the watcher dies
     # or crash-loops, Ollama is stopped instead of being left holding the GPU.
@@ -1107,7 +1119,13 @@ def guards_gpu_fit(cfg):
 
 def spilled(models):
     """Loaded models with part of them outside VRAM."""
-    return [m for m in models or [] if m.get("size") and m.get("size_vram", 0) < m["size"]]
+    return [m for m in models or [] if m.get("size") and 0 < m.get("size_vram", 0) < m["size"]]
+
+
+def fits(models):
+    """Evidence that everything loaded is entirely in VRAM."""
+    return bool(models) and all(m.get("size") and m.get("size_vram", 0) >= m["size"]
+                                for m in models)
 
 
 FIT_FILE = STATE_DIR / "last-fit.json"
@@ -2293,6 +2311,9 @@ class Watcher:
         self.oom_retried = False         # one automatic restart per out-of-memory streak
         self.vram_report = ""            # what was left on the GPU after the last restart
         self.restart_busy = False        # inside restart_ai
+        self.change_source = "the status page"   # who the next queued setting change is from
+        self.block_reason = ""           # why gpu-yield paused the AI itself
+        self.client_spills = {}          # (model, context) an app loaded that didn't fit -> times
         self.oom_checked = time.time()   # journal checked for out-of-memory kills up to here
         self.oom_kills = collections.deque(maxlen=5)
         self.restart_gen = None          # the load a restart started (its warm_gen)
@@ -2511,10 +2532,14 @@ class Watcher:
                 return self._fail(gen, f"failed: {model} is not downloaded "
                                        f"(run: gpu-yield model {model})", retry=30)
             detail = http_error_detail(e)
+            if self.ram_stop(gen):
+                return
             if OOM_RE.search(detail):
                 return self.out_of_memory(gen, model, detail)
             return self._fail(gen, f"failed: {detail}")
         except Exception as e:
+            if self.ram_stop(gen):
+                return
             return self._fail(gen, f"failed: {e}")
         if gen != self.warm_gen:
             return
@@ -2522,7 +2547,7 @@ class Watcher:
         share = gpu_share(loaded)
         if guards_gpu_fit(self.cfg) and spilled(loaded):
             return self.refuse_spill(gen, model, target, share)
-        if share is None or share >= 100:
+        if fits(loaded):
             save_fit(model, self.cfg["context_length"])
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
@@ -2548,19 +2573,27 @@ class Watcher:
                "unloaded: on ROCm, running part of a model from system RAM has stalled the "
                "graphics driver and shut down a PC")
         prev = last_fit()
+        try:
+            installed = [tag_name(m) for m in self.ollama.request("/api/tags", timeout=10)
+                         .get("models", [])]
+        except Exception:
+            installed = []
         back = {}
         if prev.get("model") and not same_model(prev["model"], model):
             back["model"] = prev["model"]
         if prev.get("context_length") and int(prev["context_length"]) != ctx:
             back["context_length"] = int(prev["context_length"])
-        if back:
-            self.event(f"{why}. Going back to {prev['model']} at context "
-                       f"{prev['context_length']}, which fit.", "error")
-            self.warm_status = "didn't fit in GPU memory; going back to the last model that did"
-            with self.model_lock:
+        with self.model_lock:
+            usable = back and any(same_model(prev["model"], m) for m in installed) and \
+                not any(same_model(prev["model"], d) for d in self.deleting)
+            if usable:
+                self.event(f"{why}. Going back to {prev['model']} at context "
+                           f"{prev['context_length']}, which fit.", "error")
+                self.warm_status = "didn't fit in GPU memory; going back to the last model that did"
+                self.change_source = "gpu-yield, going back to the last model that fit"
                 for key, value in back.items():
                     self.actions.put(({"model": "model", "context_length": "context"}[key], value))
-            return
+                return
         self.report_vram(None, (memory_readings() or {}).get("vram_used"), quiet=True)
         where = f" {self.vram_report}." if self.vram_report else ""
         self._fail(gen, f"failed: {why}.{where} Free some GPU memory, choose a smaller model, "
@@ -2569,16 +2602,39 @@ class Watcher:
 
     def note_ollama_exit(self):
         """Ollama (or the program running the model) ended unexpectedly: say if Linux
-        stopped it for going over its RAM limit. True if that keeps happening."""
+        stopped it for going over its RAM limit. "" if not, "once", or "repeated" if it
+        keeps happening (twice in 10 minutes)."""
         since, self.oom_checked = self.oom_checked, time.time()
         if not oom_killed_since(self.cfg["ollama_unit"], since - 5):
-            return False
-        limit = ram_limit_bytes(self.cfg["ollama_ram_limit"])
+            return ""
+        limit = effective_ram_limit(self.cfg)
         self.oom_kills.append(time.monotonic())
         self.event(f"Ollama went over its RAM limit ({size_text(limit) if limit else 'none set'}) "
                    "and Linux stopped it; the rest of the PC wasn't affected", "error")
         recent = [t for t in self.oom_kills if time.monotonic() - t < 600]
-        return len(recent) >= 2
+        return "repeated" if len(recent) >= 2 else "once"
+
+    def ram_stop(self, gen):
+        """After a failed load: if Linux stopped Ollama for its RAM limit, handle it here
+        (retry once later; give up if it repeats). True if it was that."""
+        seen = self.note_ollama_exit()
+        if seen == "repeated":
+            self.give_up_on_ram(gen)
+        elif seen == "once":
+            self._fail(gen, f"failed: Ollama went over its RAM limit while loading "
+                            f"{self.cfg['model']}; trying once more in 5 minutes", retry=300)
+        return bool(seen)
+
+    def give_up_on_ram(self, gen=None):
+        """Stop reloading a model that keeps going over Ollama's RAM limit."""
+        if gen is not None and gen != self.warm_gen:
+            return
+        self.warm_gen += 1
+        self.warm_status = (f"failed: {self.cfg['model']} keeps going over Ollama's RAM limit "
+                            "(see ollama_ram_limit); not loading it again until you change the "
+                            "model, the limit, or run gpu-yield restart")
+        self.warm_failed_at, self.warm_retry = time.monotonic(), 10**9
+        self.event(self.warm_status)
 
     def update_message(self, now):
         cd = int(self.cfg["cooldown_seconds"])
@@ -2593,8 +2649,8 @@ class Watcher:
                                     f"in about {left}s, plus model loading time.")
             self.standin.retry_after = left + 30
         elif self.state == "paused":
-            self.standin.message = (f"The AI server on {self.host} was paused manually "
-                                    "(gpu-yield pause).")
+            self.standin.message = self.block_reason or (
+                f"The AI server on {self.host} was paused manually (gpu-yield pause).")
             self.standin.retry_after = 600
 
     # --- main loop
@@ -2617,6 +2673,8 @@ class Watcher:
         elif self.state is None:
             self.go_on("no game running; starting Ollama")
         elif self.state == "paused":
+            self.block_reason = ""
+            self.client_spills.clear()
             self.go_on("resumed; starting Ollama")
         elif self.state == "ai":
             if slept and self.cfg["restart_after_suspend"]:
@@ -2649,16 +2707,61 @@ class Watcher:
                 self.go_on("Ollama stopped answering for 45s; restarting it")
             return
         self.ping_failures = 0
+        models = None
+        if guards_gpu_fit(self.cfg) and not self.warming:
+            # Whatever else is going on (a failed or retrying load included), a model that
+            # doesn't fit must not stay loaded: an app may have loaded one meanwhile.
+            models = self.ollama.loaded()
+            if spilled(models):
+                self.unload_spilled(models)
+                return
         if self.warming or not self.cfg["model"]:
             return
         if self.warm_failed_at is not None:
             if now - self.warm_failed_at > self.warm_retry:
                 self.start_warm()
             return
-        models = self.ollama.loaded()
+        if models is None:
+            models = self.ollama.loaded()
         if models is None:
             return
         self.check_loaded(models)
+
+    def unload_spilled(self, models):
+        """An app loaded a model, or a context, that doesn't fit in VRAM. Ollama only
+        unloads it once the app's current request finishes, so it can't be stopped from
+        running once; if the same thing is loaded again, the AI is paused instead, with
+        the reason, until the app is fixed and you resume."""
+        model, ctx = self.cfg["model"], int(self.cfg["context_length"])
+        now = time.monotonic()
+        repeat = []
+        for m in spilled(models):
+            name = m.get("name") or m.get("model") or "?"
+            key = (name, m.get("context_length"))
+            times = [t for t in self.client_spills.get(key, []) if now - t < 3600] + [now]
+            self.client_spills[key] = times[-5:]
+            if len(times) >= 2:
+                repeat.append(m)
+            try:
+                self.ollama.request("/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
+            except Exception:
+                pass
+            self.event(f"an app loaded {name} at context {m.get('context_length', '?')}, and "
+                       f"{100 - gpu_share([m])}% of it didn't fit in GPU memory; unloaded it, "
+                       "since on ROCm that has shut down this PC. Set the app to use "
+                       f"{self.cfg['alias'] or model} at context {ctx}", "error")
+        if repeat:
+            m = repeat[0]
+            self.block_reason = (f"The AI on {self.host} is paused: an app keeps loading "
+                                 f"{m.get('name')} at context {m.get('context_length', '?')}, which "
+                                 f"doesn't fit in GPU memory. Set the app to use "
+                                 f"{self.cfg['alias'] or model} at context {ctx}, then run "
+                                 "gpu-yield resume.")
+            self.event("paused the AI: " + self.block_reason, "error")
+            STATE_DIR.mkdir(parents=True, exist_ok=True)
+            PAUSE_FILE.touch()            # step() turns this into a pause on the next pass
+            return
+        self.start_warm()
 
     def check_loaded(self, models):
         model, ctx = self.cfg["model"], int(self.cfg["context_length"])
@@ -2668,32 +2771,14 @@ class Watcher:
             self.empty_checks += 1
             if self.empty_checks >= 2:
                 self.empty_checks = 0
-                if self.note_ollama_exit():
-                    self.warm_gen += 1
-                    self.warm_status = (f"failed: {model} keeps going over Ollama's RAM limit "
-                                        "(see ollama_ram_limit); not loading it again until you "
-                                        "change the model, the limit, or run gpu-yield restart")
-                    self.warm_failed_at, self.warm_retry = time.monotonic(), 10**9
-                    self.event(self.warm_status)
+                if self.note_ollama_exit() == "repeated":
+                    self.give_up_on_ram()
                     return
                 self.event(f"{model} is no longer loaded; loading it again")
                 self.start_warm()
             return
         if guards_gpu_fit(self.cfg) and spilled(models):
-            # Something else (an app asking for a different model or context) loaded a
-            # model that doesn't fit: unload it before it's put to work.
-            for m in spilled(models):
-                name = m.get("name") or m.get("model") or "?"
-                try:
-                    self.ollama.request("/api/generate", {"model": name, "keep_alive": 0}, timeout=60)
-                except Exception:
-                    pass
-                self.warn_once(("spill", name, m.get("context_length")),
-                               f"an app loaded {name} (context {m.get('context_length', '?')}) "
-                               f"with {100 - gpu_share([m])}% outside GPU memory; unloaded it, "
-                               "since on ROCm that has shut down this PC. Set the app to use "
-                               f"{self.cfg['alias'] or model} at context {ctx}")
-            self.start_warm()
+            self.unload_spilled(models)
             return
         self.empty_checks = 0
         trusted_alias = self.loaded_name if self.loaded_name and self.cfg["alias"] and \
@@ -3074,7 +3159,8 @@ class Watcher:
         self.oom_retried = False         # a new model or context gets its own retry
         self.warned.clear()
         ensure_ollama_unit(new)
-        self.event(", ".join(f"{k} set to {v}" for k, v in values.items()) + " (from the status page)")
+        source, self.change_source = self.change_source, "the status page"
+        self.event(", ".join(f"{k} set to {v}" for k, v in values.items()) + f" (by {source})")
         if self.state != "ai" or game_running(new):
             return                       # applied when the AI next comes on
         if "context_length" in values:
@@ -3194,7 +3280,8 @@ class Watcher:
             "model": self.cfg["model"],
             "context_length": self.cfg["context_length"],
             "model_status": self.warm_status if self.state == "ai" else "unloaded",
-            "notice": self.notice if self.state == "ai" else "",
+            "notice": self.notice if self.state == "ai" else
+                      self.block_reason if self.state == "paused" else "",
             "in_use": self.in_use,
             "last_used": self.last_used,
             "mac": self.mac,
@@ -3974,7 +4061,7 @@ def cmd_doctor(args):
     if mem:
         note("memory (from the driver, not Ollama): " + memory_line(mem))
     if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT:
-        limit = ram_limit_bytes(cfg["ollama_ram_limit"])
+        limit = effective_ram_limit(cfg)
         note(f"Ollama's RAM limit: {size_text(limit) if limit else 'none'}; kept out of swap, "
              "and stopped first if RAM runs out")
     note("models that don't fit in GPU memory: " + (
@@ -4200,7 +4287,8 @@ def choose_model(args):
 
 
 def pull_and_load(cfg, name):
-    """Download a model and load it into VRAM. Returns True if the download worked."""
+    """Download a model and load it into VRAM. True if it's ready to use; otherwise
+    "download" (the download failed) or "refused" (it didn't load, or didn't fit)."""
     managed = cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT
     exe = str(OLLAMA_BIN) if managed else (shutil.which("ollama") or "ollama")
     env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{cfg['port']}")
@@ -4215,7 +4303,7 @@ def pull_and_load(cfg, name):
         log(f"  {name} is already on this PC; not downloading it again")
     elif subprocess.run([exe, "pull", name], env=env).returncode:
         warn(f"download failed; check the name, then retry with: gpu-yield model {name}")
-        return False
+        return "download"
     log("  loading it into VRAM...")
     o = Ollama(dict(cfg, model=name))
     try:
@@ -4229,16 +4317,18 @@ def pull_and_load(cfg, name):
             except Exception:
                 pass
             warn(f"{name} at context {cfg['context_length']} doesn't fit in GPU memory "
-                 f"({share}% fit), so it was unloaded and not switched to. On ROCm, running "
-                 "part of a model from system RAM has stalled the driver and shut down a PC. "
-                 "Choose a smaller model or lower context_length (allow_partial_gpu = true "
-                 "overrides this). The current model reloads in a moment.")
-            return False
+                 f"({share}% fit), so it was unloaded. On ROCm, running part of a model from "
+                 "system RAM has stalled the driver and shut down a PC. Choose a smaller model, "
+                 "or lower context_length (allow_partial_gpu = true overrides this).")
+            return "refused"
+        if fits(loaded):
+            save_fit(name, cfg["context_length"])
         problem, msg = placement_note(o, name, share)
         if msg:
             (warn if problem else log)(("" if problem else "  ") + msg)
     except Exception as e:
-        warn(f"model downloaded but loading failed: {e}")
+        warn(f"{name} downloaded, but loading it failed ({e}), so it wasn't switched to")
+        return "refused"
     return True
 
 
@@ -4268,7 +4358,7 @@ def cmd_model(args):
         st = read_status() or {}
         die(f"Ollama isn't running right now ({STATE_TEXT.get(st.get('state'), 'unknown state')}). "
             "Try again when no game is running and gpu-yield isn't paused.")
-    if not pull_and_load(cfg, name):
+    if pull_and_load(cfg, name) is not True:
         sys.exit(1)
     alias = change_settings({"model": name})["alias"]
     user_systemctl("restart", WATCHER_UNIT)   # the watcher picks up the new model
@@ -4472,13 +4562,21 @@ def cmd_setup(args):
         warn(f"Ollama isn't up (state: {STATE_TEXT.get(st.get('state'))}). "
              f"Download the model later with: gpu-yield model {target}")
         failed = bool(new_model)
-    elif pull_and_load(cfg, target):
-        if new_model:
-            cfg = change_settings({"model": new_model})
-            user_systemctl("restart", WATCHER_UNIT)
-    elif new_model:
-        failed = True
-        warn(f"kept {cfg['model'] or 'no model'}; try again with: gpu-yield model {new_model}")
+    else:
+        result = pull_and_load(cfg, target)
+        if result is True:
+            if new_model:
+                cfg = change_settings({"model": new_model})
+                user_systemctl("restart", WATCHER_UNIT)
+        else:
+            failed = True
+            if new_model:
+                warn(f"kept {cfg['model'] or 'no model'}" + (
+                    f"; try again with: gpu-yield model {new_model}" if result == "download"
+                    else "; choose a model that fits with: gpu-yield model"))
+            elif result == "refused":
+                warn(f"your current model, {target}, doesn't fit; choose a smaller one with: "
+                     "gpu-yield model")
 
     log("8/8 Done\n")
     print(hermes_snippet(cfg))

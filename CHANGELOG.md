@@ -3,8 +3,9 @@
 `gpu-yield update` shows the entries between your version and the new one.
 
 ## 1.12.0 (2026-11-02)
-- On ROCm, a model that doesn't fit entirely in the graphics card's memory is unloaded as soon as it loads, and gpu-yield goes back to the last model and context that fit, saying why in the recent events. Running part of a model from system RAM through ROCm stalled the driver and shut down the example PC twice. This covers model switches, context changes that make the model too big, and an app loading a different model or context. `gpu-yield model` refuses such a model without switching. `allow_partial_gpu = true` turns the check off; on Vulkan it only warns, as before.
-- Ollama's service gets a RAM ceiling (`ollama_ram_limit`, a third of RAM by default) and is kept out of swap. If it goes over, Linux stops Ollama alone instead of the whole PC slowing to a crawl; gpu-yield reloads the model and says what happened, and stops reloading if it keeps happening. If RAM runs out anyway, Linux stops Ollama before Steam, Gaming Mode or a game.
+- On ROCm, a model that doesn't fit entirely in the graphics card's memory is unloaded as soon as it loads, and gpu-yield goes back to the last model and context that fit, if that model is still downloaded, saying why in the recent events. Running part of a model from system RAM through ROCm stalled the driver and shut down the example PC twice. This covers model switches and context changes that make the model too big. `gpu-yield model` refuses such a model, and one that fails to load, without switching. `allow_partial_gpu = true` turns the check off; on Vulkan it only warns, as before.
+- If an app loads a model or context that doesn't fit, it's unloaded once the app's request finishes, and gpu-yield reloads its own. If the app does it again, gpu-yield pauses the AI, and the stand-in and status page say why, until you fix the app and run `gpu-yield resume`.
+- On ROCm, Ollama's service gets a RAM ceiling (`ollama_ram_limit`, a third of RAM by default), and it is always kept out of swap. If it goes over, Linux stops Ollama alone instead of the whole PC slowing to a crawl; gpu-yield says so, retries once, and stops reloading if it keeps happening. If RAM runs out anyway, Linux stops Ollama before Steam, Gaming Mode or a game.
 - `doctor` shows both protections.
 
 ## 1.11.2 (2026-11-02)

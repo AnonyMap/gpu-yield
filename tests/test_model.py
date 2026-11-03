@@ -75,7 +75,7 @@ gy.Ollama = Tags
 gy.placement_note = lambda *a: (False, "")
 cfg = dict(gy.DEFAULTS, port=1)
 assert gy.pull_and_load(cfg, "muse-glimmer-text") and not runs, runs
-assert gy.pull_and_load(cfg, "qwen3.5:9b") is False and runs and runs[0][1:] == ["pull", "qwen3.5:9b"]
+assert gy.pull_and_load(cfg, "qwen3.5:9b") == "download" and runs and runs[0][1:] == ["pull", "qwen3.5:9b"]
 gy.subprocess.run = real_run
 ok("gpu-yield model uses a model already on the PC (e.g. made with ollama create) without downloading")
 print("model tests passed")
