@@ -210,10 +210,68 @@ gy.Path = real_conf
 assert not any("MHz" in m for k, m in checks if k == "bad"), "a comment mentioning MHz is fine"
 ok("doctor: 6.18 before .18 gets the note; pages_limit read with other options; MHz in a comment is fine")
 
+# --- 1.13.1: Ollama must be allowed to use an integrated GPU, or it runs on the CPU
+assert 'Environment="OLLAMA_IGPU_ENABLE=1"' in gy.ollama_unit_text(dict(gy.DEFAULTS, model="m"))
+unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", ollama_env={"OLLAMA_IGPU_ENABLE": "0"}))
+assert "OLLAMA_IGPU_ENABLE=0" in unit and "OLLAMA_IGPU_ENABLE=1" not in unit, "your own choice wins"
+ok("shared-memory chip: Ollama is told to use the integrated GPU (OLLAMA_IGPU_ENABLE=1)")
+
+# Ollama's own log: what it found since its last start, and integrated GPUs it dropped
+old_start = ('time=2026-11-03T19:00:00 level=INFO source=routes.go:1 msg="server config" env="map[]"\n'
+             'time=2026-11-03T19:00:01 level=INFO source=types.go:60 msg="inference compute" id=0 '
+             'library=Vulkan name=Vulkan0 description="old run" type=iGPU total="9 GiB" available="9 GiB"\n')
+cpu_only = ('time=2026-11-03T20:40:00 level=INFO source=routes.go:1 msg="server config" '
+            'env="map[OLLAMA_VULKAN:true]"\n'
+            'time=2026-11-03T20:40:01 level=INFO source=runner.go:405 msg="dropping integrated GPU; '
+            'to enable, set OLLAMA_IGPU_ENABLE=1" id=0 library=Vulkan compute=0.0 name=Vulkan0 '
+            'description="AMD BC-250 (RADV GFX1013)" pci_id=0000:01:00.0\n'
+            'time=2026-11-03T20:40:01 level=INFO source=types.go:60 msg="inference compute" id=cpu '
+            'library=cpu compute="" name=cpu description=cpu libdirs=ollama driver="" pci_id="" '
+            'type="" total="15.5 GiB" available="12.0 GiB"\n')
+on_gpu = ('time=2026-11-03T20:50:00 level=INFO source=routes.go:1 msg="server config" env="map[]"\n'
+          'time=2026-11-03T20:50:01 level=INFO source=types.go:60 msg="inference compute" id=0 '
+          'library=Vulkan compute=0.0 name=Vulkan0 description="AMD BC-250 (RADV GFX1013)\x1b]0;x\x07" '
+          'libdirs=ollama,vulkan driver=0.0 pci_id=0000:01:00.0 type=iGPU total="12.3 GiB" '
+          'available="12.3 GiB"\n')
+journal = {"text": ""}
+real_run = gy.run
+gy.run = lambda cmd, *a, **k: (types.SimpleNamespace(returncode=0, stdout=journal["text"], stderr="")
+                               if cmd[0] == "journalctl" else real_run(cmd, *a, **k))
+journal["text"] = old_start + cpu_only
+found = gy.ollama_devices(gy.MANAGED_OLLAMA_UNIT)
+assert [d["description"] for d in found["dropped"]] == ["AMD BC-250 (RADV GFX1013)"], found
+assert [d["library"] for d in found["devices"]] == ["cpu"], "only the latest start counts"
+assert gy.describe_devices(found) == ["CPU only"]
+
+
+class CpuStub:
+    def __init__(self, cfg): self.cfg, self.unit = cfg, cfg["ollama_unit"]
+    def is_moe(self, m): return False
+
+
+problem, msg = gy.placement_note(CpuStub(dict(gy.DEFAULTS)), "m", 0)
+assert problem and "integrated" in msg and "env.OLLAMA_IGPU_ENABLE 1" in msg, msg
+assert "--backend vulkan" not in msg
+problem, msg = gy.placement_note(CpuStub(dict(gy.DEFAULTS, ollama_env={"OLLAMA_IGPU_ENABLE": "0"})), "m", 0)
+assert "set to off" in msg, msg
+journal["text"] = old_start                          # nothing dropped, Vulkan in use
+problem, msg = gy.placement_note(CpuStub(dict(gy.DEFAULTS, backend="vulkan")), "m", 0)
+assert "--backend vulkan" not in msg and "doctor" in msg, "no advice to switch to what's in use"
+journal["text"] = cpu_only + on_gpu
+found = gy.ollama_devices(gy.MANAGED_OLLAMA_UNIT)
+assert not found["dropped"] and gy.describe_devices(found) == \
+    ["Vulkan AMD BC-250 (RADV GFX1013)]0;x, iGPU: 12.3 GiB free of 12.3 GiB"], gy.describe_devices(found)
+journal["text"] = ""
+assert gy.ollama_devices(gy.MANAGED_OLLAMA_UNIT) is None
+gy.run = real_run
+ok("Ollama's log: the GPUs it found, an ignored integrated GPU, and advice that fits")
+
 # --- nothing changes on an ordinary graphics card
 (dev / "device").write_text("0x747e\n")              # an RX 7800 XT
 (dev / "mem_info_vram_total").write_text(f"{16 * GiB}\n")
 assert not gy.is_bc250() and not gy.shared_memory_gpu() and not gy.memory_readings()["shared"]
 assert "OLLAMA_KV_CACHE_TYPE" not in gy.ollama_unit_text(dict(gy.DEFAULTS, model="m"))
+assert "OLLAMA_IGPU_ENABLE" not in gy.ollama_unit_text(dict(gy.DEFAULTS, model="m")), \
+    "next to a graphics card, the processor's own graphics stay out"
 ok("an ordinary graphics card is untouched: no shared-memory mode, no BC-250 defaults")
 print("BC-250 tests passed")

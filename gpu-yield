@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.13.0"
+VERSION = "1.13.1"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -970,6 +970,12 @@ def ollama_unit_text(cfg):
     # 2) must never use q4_0, which can wreck their output.
     if is_bc250() and "OLLAMA_KV_CACHE_TYPE" not in cfg["ollama_env"]:
         env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
+    # Shared-memory chips (BC-250, APUs) report themselves as integrated GPUs, which Ollama
+    # drops unless told otherwise ("dropping integrated GPU"), running everything on the
+    # CPU. Here that GPU is the only one, so admit it. Not on PCs with a graphics card:
+    # admitting the processor's own graphics there would split models across both.
+    if shared_memory_gpu():
+        env["OLLAMA_IGPU_ENABLE"] = "1"
     # Until the ROCm download is installed (gpu-yield setup --reinstall), keep using Vulkan
     # rather than silently falling back to the CPU.
     if resolve_backend(cfg) == "vulkan" or backend_installed(cfg) is False:
@@ -1166,14 +1172,77 @@ def oom_killed_since(unit, since):
     return bool(re.search(r"killed by the OOM killer|oom-kill", r.stdout or "", re.I))
 
 
+_LOG_FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)')
+
+
+def ollama_devices(unit):
+    """What Ollama's own startup log says it found, since it last started:
+    {"devices": [{library, name, description, type, total, available}], "dropped": [...]}
+    ("dropped": integrated GPUs it ignored), or None if the log can't be read."""
+    try:
+        r = run(["journalctl", "--user", "-u", unit, "-b", "-o", "cat", "-q", "--no-pager",
+                 "-n", "3000"], timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    lines = (r.stdout or "").splitlines()
+    if not lines:
+        return None
+    starts = [i for i, ln in enumerate(lines) if 'msg="server config"' in ln]
+    if starts:
+        lines = lines[starts[-1]:]
+    found = {"devices": [], "dropped": []}
+    for ln in lines:
+        kind = "devices" if 'msg="inference compute"' in ln else \
+            "dropped" if "dropping integrated GPU" in ln else None
+        if not kind:
+            continue
+        fields = {k: clean_text(v[1:-1] if v.startswith('"') else v)[:120]
+                  for k, v in _LOG_FIELD.findall(ln)}
+        found[kind].append({k: fields.get(k, "") for k in
+                            ("library", "name", "description", "type", "total", "available")})
+    return found
+
+
+def describe_devices(found):
+    """One line per device Ollama found, for doctor."""
+    out = []
+    for d in found["devices"]:
+        if d["library"].lower() == "cpu":
+            out.append("CPU only")
+            continue
+        what = d["description"] or d["name"] or "?"
+        kind = f", {d['type']}" if d["type"] else ""
+        room = f": {d['available']} free of {d['total']}" if d["total"] else ""
+        out.append(f"{d['library']} {what}{kind}{room}")
+    return out
+
+
+def cpu_only_advice(ollama):
+    """Why Ollama put nothing on the GPU, from its own log, and what to do about it."""
+    cfg = ollama.cfg
+    found = ollama_devices(ollama.unit) if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT else None
+    if found and found["dropped"]:
+        if str(cfg["ollama_env"].get("OLLAMA_IGPU_ENABLE", "")).strip().lower() in \
+                ("0", "false", "no", "off"):
+            return ("Ollama ignored the GPU because it's an integrated one and "
+                    "OLLAMA_IGPU_ENABLE is set to off. Turn it on: "
+                    "gpu-yield config env.OLLAMA_IGPU_ENABLE 1")
+        return ("Ollama ignored the GPU because it's an integrated one. Let it use it: "
+                "gpu-yield config env.OLLAMA_IGPU_ENABLE 1")
+    if resolve_backend(cfg) == "vulkan":
+        return ("Ollama found no usable GPU through Vulkan. Run gpu-yield doctor: it shows "
+                "what Ollama found, and checks the Vulkan driver")
+    return ("Run gpu-yield doctor; if it doesn't show a fix, try the other backend: "
+            "gpu-yield setup --backend vulkan --reinstall")
+
+
 def placement_note(ollama, model, share):
     """(is_problem, message) describing how much of the model is in VRAM."""
     if share is None or share >= 100:
         return False, ""
     if share == 0:
         return True, ("the model is running entirely on the CPU, so the GPU backend isn't "
-                      "working. Run gpu-yield doctor; if it doesn't show a fix, try the other "
-                      "backend: gpu-yield setup --backend vulkan --reinstall")
+                      "working. " + cpu_only_advice(ollama))
     if ollama.is_moe(model):
         return False, (f"{100 - share}% of this mixture-of-experts model is in system RAM. "
                        "That's expected for models bigger than VRAM: expert weights go to RAM "
@@ -4325,6 +4394,19 @@ def cmd_doctor(args):
         else:
             bad("/dev/kfd missing or not accessible: ROCm will fall back to CPU. "
                 "Try backend = \"vulkan\" or add yourself to the render group")
+    found = ollama_devices(MANAGED_OLLAMA_UNIT) if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT \
+        else None
+    if found and (found["devices"] or found["dropped"]):
+        gpus_seen = [d for d in found["devices"] if d["library"].lower() != "cpu"]
+        (ok if gpus_seen else bad)("Ollama found at its last start: "
+                                   + ("; ".join(describe_devices(found)) or "nothing"))
+        for d in found["dropped"]:
+            what = d["description"] or d["name"] or "an integrated GPU"
+            msg = f"Ollama ignored {what} because it's integrated"
+            if gpus_seen:
+                note(msg + " (normal next to a graphics card)")
+            else:
+                bad(msg + ": gpu-yield config env.OLLAMA_IGPU_ENABLE 1")
     renders = list(Path("/dev/dri").glob("renderD*"))
     if renders and all(os.access(r, os.R_OK | os.W_OK) for r in renders):
         ok("GPU render node accessible")
