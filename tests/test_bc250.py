@@ -211,9 +211,22 @@ assert not any("MHz" in m for k, m in checks if k == "bad"), "a comment mentioni
 ok("doctor: 6.18 before .18 gets the note; pages_limit read with other options; MHz in a comment is fine")
 
 # --- 1.13.1: Ollama must be allowed to use an integrated GPU, or it runs on the CPU
+pci = Path(tempfile.mkdtemp())
+def pci_gpus(*classes):
+    for d in pci.glob("*"):
+        (d / "class").unlink(); d.rmdir()
+    for i, c in enumerate(classes):
+        (pci / f"0000:0{i}:00.0").mkdir()
+        (pci / f"0000:0{i}:00.0/class").write_text(c + "\n")
+gy.PCI_DIR = pci
+pci_gpus("0x030000", "0x020000", "0x060400")          # the board's GPU, a network card, a bridge
 assert 'Environment="OLLAMA_IGPU_ENABLE=1"' in gy.ollama_unit_text(dict(gy.DEFAULTS, model="m"))
 unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", ollama_env={"OLLAMA_IGPU_ENABLE": "0"}))
 assert "OLLAMA_IGPU_ENABLE=0" in unit and "OLLAMA_IGPU_ENABLE=1" not in unit, "your own choice wins"
+for value, off in (("0", True), ("f", True), ("False", True), (" 'false' ", True),
+                   ("no", False), ("off", False), ("1", False), ("", False)):
+    assert gy.igpu_turned_off(dict(gy.DEFAULTS, ollama_env={"OLLAMA_IGPU_ENABLE": value})) == off, \
+        value                                         # Go's ParseBool: "no"/"off" read as on
 ok("shared-memory chip: Ollama is told to use the integrated GPU (OLLAMA_IGPU_ENABLE=1)")
 
 # Ollama's own log: what it found since its last start, and integrated GPUs it dropped
@@ -264,6 +277,8 @@ assert not found["dropped"] and gy.describe_devices(found) == \
 journal["text"] = ""
 assert gy.ollama_devices(gy.MANAGED_OLLAMA_UNIT) is None
 gy.run = real_run
+r = load().run(["printf", "bad \\377 byte"])   # the real run(); this file stubs gy.run            # invalid UTF-8 from a runner's output
+assert r.returncode == 0 and "\ufffd" in r.stdout, r
 ok("Ollama's log: the GPUs it found, an ignored integrated GPU, and advice that fits")
 
 # --- nothing changes on an ordinary graphics card
@@ -271,7 +286,13 @@ ok("Ollama's log: the GPUs it found, an ignored integrated GPU, and advice that 
 (dev / "mem_info_vram_total").write_text(f"{16 * GiB}\n")
 assert not gy.is_bc250() and not gy.shared_memory_gpu() and not gy.memory_readings()["shared"]
 assert "OLLAMA_KV_CACHE_TYPE" not in gy.ollama_unit_text(dict(gy.DEFAULTS, model="m"))
+pci_gpus("0x030000", "0x030000")                    # a graphics card plus the processor's graphics
 assert "OLLAMA_IGPU_ENABLE" not in gy.ollama_unit_text(dict(gy.DEFAULTS, model="m")), \
     "next to a graphics card, the processor's own graphics stay out"
+pci_gpus("0x030000")                                 # an APU with 4 GB of BIOS graphics memory
+(dev / "mem_info_vram_total").write_text(f"{4 * GiB}\n")
+assert not gy.shared_memory_gpu()
+assert 'OLLAMA_IGPU_ENABLE=1' in gy.ollama_unit_text(dict(gy.DEFAULTS, model="m")), \
+    "the only GPU is admitted whatever its BIOS memory slice"
 ok("an ordinary graphics card is untouched: no shared-memory mode, no BC-250 defaults")
 print("BC-250 tests passed")

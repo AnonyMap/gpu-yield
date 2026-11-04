@@ -246,6 +246,7 @@ def die(msg):
 def run(cmd, check=False, quiet=True, **kw):
     if quiet:
         kw.setdefault("capture_output", True)
+    kw.setdefault("errors", "replace")      # logs can hold bytes that aren't valid UTF-8
     return subprocess.run(cmd, text=True, check=check, **kw)
 
 
@@ -891,6 +892,7 @@ def command_name(argv):
 ROCM_TARGETS = {"gfx906", "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "gfx1101",
                 "gfx1102", "gfx1151", "gfx1200", "gfx1201"}
 KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
+PCI_DIR = Path("/sys/bus/pci/devices")
 
 
 def gpu_targets():
@@ -970,11 +972,11 @@ def ollama_unit_text(cfg):
     # 2) must never use q4_0, which can wreck their output.
     if is_bc250() and "OLLAMA_KV_CACHE_TYPE" not in cfg["ollama_env"]:
         env["OLLAMA_KV_CACHE_TYPE"] = "q8_0"
-    # Shared-memory chips (BC-250, APUs) report themselves as integrated GPUs, which Ollama
-    # drops unless told otherwise ("dropping integrated GPU"), running everything on the
-    # CPU. Here that GPU is the only one, so admit it. Not on PCs with a graphics card:
-    # admitting the processor's own graphics there would split models across both.
-    if shared_memory_gpu():
+    # The BC-250 and APUs report themselves as integrated GPUs, which Ollama drops unless
+    # told otherwise ("dropping integrated GPU"), running everything on the CPU. When it's
+    # the PC's only GPU, admit it. Not on PCs with a graphics card as well: admitting the
+    # processor's own graphics there would split models across both.
+    if is_bc250() or only_one_gpu():
         env["OLLAMA_IGPU_ENABLE"] = "1"
     # Until the ROCm download is installed (gpu-yield setup --reinstall), keep using Vulkan
     # rather than silently falling back to the CPU.
@@ -1173,15 +1175,20 @@ def oom_killed_since(unit, since):
 
 
 _LOG_FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)')
+OLLAMA_START_LINES = "server config|inference compute|dropping integrated GPU"
 
 
 def ollama_devices(unit):
     """What Ollama's own startup log says it found, since it last started:
     {"devices": [{library, name, description, type, total, available}], "dropped": [...]}
     ("dropped": integrated GPUs it ignored), or None if the log can't be read."""
+    # Ollama logs every HTTP request, about 1800 lines an hour from gpu-yield's own checks,
+    # so ask journalctl for just the startup lines rather than the last N of everything.
+    base = ["journalctl", "--user", "-u", unit, "-b", "-o", "cat", "-q", "--no-pager"]
     try:
-        r = run(["journalctl", "--user", "-u", unit, "-b", "-o", "cat", "-q", "--no-pager",
-                 "-n", "3000"], timeout=15)
+        r = run(base + ["-g", OLLAMA_START_LINES, "-n", "500"], timeout=15)
+        if r.returncode and not r.stdout:      # journalctl built without pattern support
+            r = run(base + ["-n", "100000"], timeout=30)
     except (OSError, subprocess.TimeoutExpired):
         return None
     lines = (r.stdout or "").splitlines()
@@ -1217,13 +1224,31 @@ def describe_devices(found):
     return out
 
 
+def igpu_turned_off(cfg):
+    """True if OLLAMA_IGPU_ENABLE is set to a value Ollama reads as false. Ollama strips
+    spaces and quotes, then uses Go's ParseBool: only these mean false, and anything it
+    can't read counts as true."""
+    value = str(cfg["ollama_env"].get("OLLAMA_IGPU_ENABLE", "")).strip().strip("\"'")
+    return value in ("0", "f", "F", "false", "FALSE", "False")
+
+
+def only_one_gpu():
+    """True if the PC has a single graphics device of any make (read from the PCI bus, so
+    a card whose driver shows no screen device still counts)."""
+    return sum(_read_text(d / "class").strip().startswith("0x03")
+               for d in PCI_DIR.glob("*")) == 1
+
+
 def cpu_only_advice(ollama):
     """Why Ollama put nothing on the GPU, from its own log, and what to do about it."""
     cfg = ollama.cfg
-    found = ollama_devices(ollama.unit) if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT else None
+    try:
+        found = ollama_devices(ollama.unit) if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT \
+            else None
+    except Exception:
+        found = None
     if found and found["dropped"]:
-        if str(cfg["ollama_env"].get("OLLAMA_IGPU_ENABLE", "")).strip().lower() in \
-                ("0", "false", "no", "off"):
+        if igpu_turned_off(cfg):
             return ("Ollama ignored the GPU because it's an integrated one and "
                     "OLLAMA_IGPU_ENABLE is set to off. Turn it on: "
                     "gpu-yield config env.OLLAMA_IGPU_ENABLE 1")
@@ -4394,8 +4419,11 @@ def cmd_doctor(args):
         else:
             bad("/dev/kfd missing or not accessible: ROCm will fall back to CPU. "
                 "Try backend = \"vulkan\" or add yourself to the render group")
-    found = ollama_devices(MANAGED_OLLAMA_UNIT) if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT \
-        else None
+    try:
+        found = ollama_devices(MANAGED_OLLAMA_UNIT) if cfg["ollama_unit"] == MANAGED_OLLAMA_UNIT \
+            else None
+    except Exception:
+        found = None
     if found and (found["devices"] or found["dropped"]):
         gpus_seen = [d for d in found["devices"] if d["library"].lower() != "cpu"]
         (ok if gpus_seen else bad)("Ollama found at its last start: "

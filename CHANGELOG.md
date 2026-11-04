@@ -3,7 +3,7 @@
 `gpu-yield update` shows the entries between your version and the new one.
 
 ## 1.13.1 (2026-11-03)
-- Fix: on the BC-250 and other shared-memory chips, Ollama ran models entirely on the processor. These chips report themselves as integrated GPUs, and Ollama ignores those unless `OLLAMA_IGPU_ENABLE=1` is set, which gpu-yield now does for them. It isn't set on PCs with a graphics card. Your own `env.OLLAMA_IGPU_ENABLE` setting still wins.
+- Fix: on the BC-250 and other shared-memory chips, Ollama ran models entirely on the processor. These chips report themselves as integrated GPUs, and Ollama ignores those unless `OLLAMA_IGPU_ENABLE=1` is set. gpu-yield now sets it when the PC's only GPU is one of these, including APUs with a large BIOS graphics slice. It isn't set on PCs that also have a graphics card. Your own `env.OLLAMA_IGPU_ENABLE` setting still wins.
 - `doctor` shows which GPUs Ollama found at its last start and how much memory it thinks each has free, from Ollama's own log, and flags an integrated GPU that Ollama ignored.
 - When a model runs entirely on the processor, the advice now comes from Ollama's log. It no longer tells you to switch to Vulkan when you're already using it.
 

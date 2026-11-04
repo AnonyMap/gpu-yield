@@ -243,7 +243,7 @@ Some chips have no graphics memory of their own: the GPU borrows system memory i
 - **A fit check for the shared pool.** Model and system draw on the same memory, and running it out freezes the whole board. So gpu-yield refuses a model whose file is bigger than the pool minus about 3 GB, before loading it; that's about 12.5 GB on a 16 GB BC-250. It also unloads a model that leaves the rest of the PC less than 0.75 GB once loaded. Either way it goes back to the last model that fit. `allow_partial_gpu = true` turns this off.
 - **Restart reports** count each program's borrowed memory, so they name what's really using it.
 - **The model picker** measures models against the shared pool.
-- **Ollama is allowed to use the GPU.** These chips report themselves as integrated GPUs, which Ollama ignores by default and runs everything on the processor instead. gpu-yield sets `OLLAMA_IGPU_ENABLE=1` for them. On a PC with a graphics card it doesn't, so Ollama won't split models between the card and the processor's own graphics.
+- **Ollama is allowed to use the GPU.** These chips report themselves as integrated GPUs, which Ollama ignores by default and runs everything on the processor instead. gpu-yield sets `OLLAMA_IGPU_ENABLE=1` when it's the PC's only GPU (on a BC-250, always). On a PC that also has a graphics card it doesn't, so Ollama won't split models between the card and the processor's own graphics.
 
 On a **BC-250** (detected by its chip ID), two more things happen:
 
