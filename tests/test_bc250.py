@@ -138,7 +138,7 @@ def low_memory_watcher(loaded, available, own=12.5, **cfg):
     w.ollama.active = w.ollama.ready = lambda: True
     w.ollama.loaded = lambda: loaded
     w.start_warm = lambda: None
-    w.own_load, w.last_restart = ("big:1", 65536, int(own * GiB)), -1000
+    w.own_load, w.last_restart = ("big:1", 65536, int(own * GiB), w.load_key()), -1000
     return w
 
 
@@ -214,10 +214,10 @@ ok("our own load is never blamed; unknown sizes blame nothing; stale readings an
 
 # --- 1.13.3: memory audit
 unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m"))
-for line in ('LLAMA_ARG_CACHE_RAM=256', 'LLAMA_ARG_CTX_CHECKPOINTS=4', 'LLAMA_ARG_LOAD_MODE=dio'):
+for line in ('LLAMA_ARG_CACHE_RAM=512', 'LLAMA_ARG_CTX_CHECKPOINTS=4', 'LLAMA_ARG_LOAD_MODE=dio'):
     assert line in unit, line
 unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", ollama_env={"LLAMA_ARG_CACHE_RAM": "1024"}))
-assert "LLAMA_ARG_CACHE_RAM=1024" in unit and "LLAMA_ARG_CACHE_RAM=256" not in unit
+assert "LLAMA_ARG_CACHE_RAM=1024" in unit and "LLAMA_ARG_CACHE_RAM=512" not in unit
 ok("shared chip: llama-server's RAM prompt cache capped, few context snapshots, direct-I/O loads")
 
 # giving up after repeated out-of-memory stops must not leave the health checks switched off
@@ -234,14 +234,35 @@ w = low_memory_watcher(other, 0.3)
 w.own_load = None
 check(w)
 assert "may be the cause" in w.warm_status and not w.client_spills, w.warm_status
-huge = [{"name": "qwen3:32b", "size": int(13.5 * GiB), "size_vram": int(13.5 * GiB), "context_length": 65536}]
+huge = [{"name": "qwen3:32b", "size": int(15 * GiB), "size_vram": int(15 * GiB), "context_length": 65536}]
 w = low_memory_watcher(huge, 0.3)
 w.own_load = None
 check(w)
 assert ("qwen3:32b", 65536) in w.client_spills, "bigger than the shared budget: blamed"
 w = low_memory_watcher(other, 0.3)
-w.own_load = ("other:1", 65536, int(5 * GiB))        # from a different model: not comparable
+w.own_load = ("other:1", 65536, int(5 * GiB), w.load_key())        # from a different model: not comparable
 assert w.own_size() is None
+# a 13.5 GiB footprint is what gpu-yield itself accepts (12 GiB file + context): not blamed
+w = low_memory_watcher([dict(huge[0], size=int(13.5 * GiB))], 0.3)
+w.own_load = None
+assert w.bigger_than_ours(w.ollama.loaded()[0]) is None
+# our own model at a smaller context is never the cause, known size or not
+w.own_load = None
+assert w.bigger_than_ours({"name": "big:1", "size": int(11 * GiB), "context_length": 8192}) is False
+# a remembered size from other Ollama settings doesn't count
+w = low_memory_watcher([], 0.6)
+w.cfg["ollama_env"] = {"OLLAMA_KV_CACHE_TYPE": "f16"}
+assert w.own_size() is None
+# given up: low memory unloads but doesn't reschedule, and an app's unload doesn't reload
+w = low_memory_watcher(other, 0.3)
+w.own_load, w.warm_failed_at, w.warm_retry = None, gy.time.monotonic(), 10**9
+started = []
+w.start_warm = lambda: started.append(1)
+check(w)
+assert w.warm_retry == 10**9 and not started, "the give-up stands"
+w.client_spills.clear()
+w.unload_spilled(huge, huge, why="test")
+assert not started
 ok("low memory with no load of ours to compare: honest message; an oversized app load still blamed")
 
 proc["/sys/module/ttm/parameters/page_pool_size"] = "0\n"

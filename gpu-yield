@@ -982,7 +982,9 @@ def ollama_unit_text(cfg):
     # environment) keeps a prompt cache in ordinary RAM, by default up to 8 GiB, plus up
     # to 32 context snapshots per conversation. There, RAM is the GPU's memory too, and a
     # BC-250 has about 2 GB to spare once the model is loaded, so the cache alone can run
-    # the board out over hours of agent traffic. Keep it to about one saved conversation.
+    # the board out over hours of agent traffic. 512 MiB holds one Muse Glimmer
+    # conversation at 64K (about 7 KB a token at q8_0); a saved state bigger than the cap
+    # is just skipped, so models with bigger context memory get no cache rather than more.
     # And load the file with direct I/O, as Ollama itself does for integrated CUDA and ROCm
     # GPUs, so a reload doesn't also push the whole file through the page cache.
     if shared_memory_gpu():
@@ -1337,7 +1339,7 @@ def tilde(path):
 
 
 DRM_DIR = Path("/sys/class/drm")
-SHARED_PROMPT_CACHE_MIB = 256      # llama-server's RAM prompt cache on shared-memory chips
+SHARED_PROMPT_CACHE_MIB = 512      # llama-server's RAM prompt cache on shared-memory chips
 SHARED_VRAM_BELOW = 2 * 2**30      # a fixed GPU slice this small means shared memory
 SHARED_OS_RESERVE = 3 * 2**30      # shared memory kept back for Linux itself
 SHARED_MIN_FREE = 3 * 2**30 // 4   # less than this available after a load: too big
@@ -1359,14 +1361,21 @@ def mem_available():
     return int(m.group(1)) * 1024 if m else None
 
 
-def shared_budget():
-    """Biggest model file a shared-memory chip can take: all memory minus room for Linux
-    and the model's context (the BC-250 health check's own lines: ~12.5 GB of 16)."""
+def shared_pool():
+    """All the memory a shared-memory chip's GPU and Linux share: RAM plus any BIOS slice
+    over 512 MB (which sits outside MemTotal)."""
     total = total_ram()
     if not total:
         return None
     vram = (memory_readings() or {}).get("vram_total") or 0
-    return total - SHARED_OS_RESERVE + max(0, vram - 2**29)   # a slice over 512 MB adds room
+    return total + max(0, vram - 2**29)
+
+
+def shared_budget():
+    """Biggest model file a shared-memory chip can take: all memory minus room for Linux
+    and the model's context (the BC-250 health check's own lines: ~12.5 GB of 16)."""
+    pool = shared_pool()
+    return pool - SHARED_OS_RESERVE if pool else None
 
 
 def is_bc250():
@@ -2792,7 +2801,7 @@ class Watcher:
         mine = [m for m in loaded or [] if same_model(m.get("name") or m.get("model") or "", target)
                 and (not m.get("context_length") or int(m["context_length"]) == ctx)]
         if mine and mine[0].get("size"):
-            self.own_load = (model, ctx, mine[0]["size"])
+            self.own_load = (model, ctx, mine[0]["size"], self.load_key())
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
         self.warm_status = f"ready ({model}{named}{where})"
@@ -3001,13 +3010,22 @@ class Watcher:
             return
         self.check_loaded(models)
 
+    def given_up(self):
+        """True after gpu-yield stopped reloading its model for running out of memory."""
+        return self.warm_failed_at is not None and self.warm_retry >= 10**9
+
     def own_size(self):
         """Bytes gpu-yield's own model took at its last successful load, if that load was of
         the current model and context; else None."""
         rec = self.own_load
-        if rec and rec[0] == self.cfg["model"] and rec[1] == int(self.cfg["context_length"]):
+        if rec and rec[0] == self.cfg["model"] and rec[1] == int(self.cfg["context_length"]) \
+                and rec[3] == self.load_key():
             return rec[2]
         return None
+
+    def load_key(self):
+        """What else decides a load's size: Ollama's settings (context storage and so on)."""
+        return json.dumps(self.cfg["ollama_env"], sort_keys=True)
 
     def bigger_than_ours(self, m):
         """True if an app's load uses more memory than gpu-yield's own model and context,
@@ -3022,11 +3040,11 @@ class Watcher:
         size, own = m.get("size"), self.own_size()
         if own and size:
             return size > own * 1.02                    # Ollama's figures wobble a little
-        if is_ours and got is not None and got > ctx:
-            return True                                 # our model at a larger context
-        budget = shared_budget()
-        if size and budget and size > budget:
-            return True                                 # more than any model may take here
+        if is_ours and got is not None:
+            return got > ctx                            # our model, at a larger or smaller context
+        pool = shared_pool()
+        if size and pool and size > pool - SHARED_MIN_FREE:
+            return True                                 # more than the whole board can hold
         return None
 
     def shared_memory_low(self, models, left):
@@ -3052,13 +3070,18 @@ class Watcher:
         apps = [m for m in models
                 if not any(same_model(m.get("name") or m.get("model") or "", n) for n in ours)
                 or (m.get("context_length") and int(m["context_length"]) != ctx)]
-        unsure = any(v is None for m, v in verdicts if m in apps)
-        whose = ((f"{apps[0].get('name')} at context {apps[0].get('context_length', '?')}, "
-                  "loaded by an app, may be the cause: there's no load of gpu-yield's own "
-                  "model to compare it with. ") if unsure else
-                 (f"{apps[0].get('name')} at context {apps[0].get('context_length', '?')}, loaded "
-                  "by an app, uses no more memory than gpu-yield's own setup, so it isn't the "
-                  "cause. ")) if apps else ""
+        unsure = [m for m, v in verdicts if v is None and m in apps]
+        app = unsure[0] if unsure else apps[0] if apps else None
+        whose = ((f"{app.get('name')} at context {app.get('context_length', '?')}, loaded by an "
+                  "app, may be the cause: there's no load of gpu-yield's own model to compare "
+                  "it with. ") if unsure else
+                 (f"{app.get('name')} at context {app.get('context_length', '?')}, loaded by an "
+                  "app, uses no more memory than gpu-yield's own setup, so it isn't the "
+                  "cause. ")) if app else ""
+        if self.given_up():              # stay given up: say what happened, don't reschedule
+            self.event(f"only {size_text(left)} of memory was left for the rest of the PC, so "
+                       f"the loaded model was unloaded. Using memory: {hogs}", "error")
+            return
         self.warm_gen += 1
         self.warm_status = (f"failed: only {size_text(left)} of memory was left for the rest of "
                             f"the PC, so the model was unloaded to keep the board from freezing. "
@@ -3107,7 +3130,8 @@ class Watcher:
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             PAUSE_FILE.touch()            # step() turns this into a pause on the next pass
             return
-        self.start_warm()
+        if not self.given_up():
+            self.start_warm()
 
     def check_loaded(self, models):
         model, ctx = self.cfg["model"], int(self.cfg["context_length"])
@@ -4980,6 +5004,16 @@ def cmd_config(args):
     if key == "control_password" and args.value and len(args.value) < 8:
         die("use at least 8 characters for the control password; nothing changed")
     if key.startswith("env."):
+        # llama-server stops on a value it can't read, and then no model loads at all.
+        name, value = key[4:], args.value.strip()
+        if value and name in ("LLAMA_ARG_CACHE_RAM", "LLAMA_ARG_CTX_CHECKPOINTS") and \
+                not re.fullmatch(r"-?\d+", value):
+            die(f"{name} must be a whole number (MiB for the cache; -1 means no limit); "
+                "nothing changed")
+        if value and name == "LLAMA_ARG_LOAD_MODE" and \
+                value not in ("auto", "none", "mmap", "mlock", "mmap+mlock", "dio"):
+            die("LLAMA_ARG_LOAD_MODE must be one of auto, none, mmap, mlock, mmap+mlock, dio; "
+                "nothing changed")
         cfg = change_settings(env=(key[4:], args.value))
     else:
         try:

@@ -82,6 +82,10 @@ assert config("backend", "metal") != 0 and gy.CONFIG_FILE.read_text() == before
 assert config("cooldown_seconds", "soon") != 0 and gy.CONFIG_FILE.read_text() == before
 assert config("nonsense", "1") != 0 and config("model", "x") != 0
 assert "# Model kept loaded" in gy.CONFIG_FILE.read_text()
+assert config("env.LLAMA_ARG_CACHE_RAM", "lots") != 0 and gy.CONFIG_FILE.read_text() == before
+assert config("env.LLAMA_ARG_LOAD_MODE", "fast") != 0 and gy.CONFIG_FILE.read_text() == before
+assert config("env.LLAMA_ARG_CACHE_RAM", "1024") == 0
+assert config("env.LLAMA_ARG_CACHE_RAM", "") == 0
 ok("config command sets values by type, edits Ollama variables, refuses bad values unchanged")
 
 # --- changelog
