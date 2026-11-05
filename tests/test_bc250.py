@@ -128,6 +128,61 @@ assert w.warm_status.startswith("failed: only") and w.warm_retry == 300 and not 
 proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {3 * 2**20} kB\n"
 ok("shared pool running low: an app's oversized load is unloaded; its own model waits 5 minutes")
 
+# 1.13.2, Demeter's report: an app's *smaller* context, memory low for another reason. It
+# must not be blamed, and the AI must not be paused, however often it happens.
+def low_memory_watcher(loaded, available, own=12.5, **cfg):
+    proc["/proc/meminfo"] = (f"MemTotal: {int(15.5 * 2**20)} kB\n"
+                             f"MemAvailable: {int(available * 2**20)} kB\n")
+    w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias="gpu-yield", **cfg))
+    w.state, w.ollama = "ai", Stub(int(11.4 * GiB))
+    w.ollama.active = w.ollama.ready = lambda: True
+    w.ollama.loaded = lambda: loaded
+    w.start_warm = lambda: None
+    w.own_size, w.last_restart = int(own * GiB), -1000
+    return w
+
+
+def check(w):
+    w.last_health = 0
+    w.health(gy.time.monotonic())
+
+
+gy.PAUSE_FILE.unlink(missing_ok=True)
+smaller = [{"name": "big:1", "size": int(12.1 * GiB), "size_vram": int(12.1 * GiB),
+            "context_length": 16384}]
+w = low_memory_watcher(smaller, 0.6)
+check(w)
+assert not w.ollama.calls, "one low reading is not enough"
+check(w)
+assert ("/api/generate", {"model": "big:1", "keep_alive": 0}) in w.ollama.calls, "still unloaded"
+assert "isn't the cause" in w.warm_status and "16384" in w.warm_status and "Using memory:" in \
+    w.warm_status, w.warm_status
+for _ in range(6):                                   # again and again: still no pause
+    w.warm_failed_at = None
+    check(w)
+assert not gy.PAUSE_FILE.exists() and not w.block_reason and not w.client_spills
+w = low_memory_watcher(smaller, 0.6)
+check(w)
+proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {3 * 2**20} kB\n"
+check(w)                                             # recovered: the count starts over
+proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {int(0.6 * 2**20)} kB\n"
+check(w)
+assert not w.ollama.calls, "readings must be in a row"
+ok("an app's smaller context isn't blamed for low memory, never pauses the AI; one reading isn't enough")
+
+# a load that really is bigger than ours: unloaded, then paused on a repeat, with remote resume
+bigger = [{"name": "big:1", "size": int(13.6 * GiB), "size_vram": int(13.6 * GiB),
+           "context_length": 131072}]
+w = low_memory_watcher(bigger, 0.6, control_password="longenough", status_port=11435)
+check(w); check(w)
+assert "131072" in w.events[0]["text"] and not gy.PAUSE_FILE.exists()
+check(w); check(w)
+assert gy.PAUSE_FILE.exists() and "leave its context unset" in w.block_reason and \
+    "Resume on http://" in w.block_reason, w.block_reason
+gy.PAUSE_FILE.unlink()
+assert "GPU" in gy.memory_users()
+ok("a load bigger than gpu-yield's own still pauses on a repeat; the notice says how to resume remotely")
+
 gy.Ollama = lambda c: Stub(int(13.9 * GiB))
 assert gy.pull_and_load(dict(gy.DEFAULTS, port=1), "big:1") == "refused"
 ok("gpu-yield model refuses a model too big for the shared pool, without loading it")

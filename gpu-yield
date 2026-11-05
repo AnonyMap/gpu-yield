@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.13.1"
+VERSION = "1.13.2"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -1176,6 +1176,28 @@ def oom_killed_since(unit, since):
 
 _LOG_FIELD = re.compile(r'(\w+)=("(?:[^"\\]|\\.)*"|\S*)')
 OLLAMA_START_LINES = "server config|inference compute|dropping integrated GPU"
+
+
+def memory_users(count=3):
+    """What's using memory, for low-memory messages: the GPU's share (the model, which
+    process lists don't show) and the biggest programs. E.g. "GPU 12.1 GB; cargo 3.2 GB"."""
+    parts = []
+    used = gpu_used(memory_readings())
+    if used:
+        parts.append(f"GPU {size_text(used)}")
+    procs = []
+    for d in Path("/proc").glob("[0-9]*"):
+        status = _read_text(d / "status")
+        rss = re.search(r"^VmRSS:\s+(\d+) kB", status, re.M)
+        name = re.search(r"^Name:\s+(.*)$", status, re.M)
+        if rss and name:
+            procs.append((int(rss.group(1)) * 1024, clean_text(name.group(1))[:30]))
+    totals = {}
+    for rss, name in procs:                       # many rustc or chrome processes add up
+        totals[name] = totals.get(name, 0) + rss
+    parts += [f"{n} {size_text(b)}" for n, b in
+              sorted(totals.items(), key=lambda x: -x[1])[:count]]
+    return "; ".join(parts) or "unknown"
 
 
 def ollama_devices(unit):
@@ -2491,6 +2513,8 @@ class Watcher:
         self.restart_busy = False        # inside restart_ai
         self.change_source = "the status page"   # who the next queued setting change is from
         self.block_reason = ""           # why gpu-yield paused the AI itself
+        self.own_size = None             # bytes our model took at its last load (Ollama's figure)
+        self.low_memory_checks = 0       # low-memory readings in a row (shared-memory chips)
         self.client_spills = {}          # (model, context) an app loaded that didn't fit -> times
         self.oom_checked = time.time()   # journal checked for out-of-memory kills up to here
         self.oom_kills = collections.deque(maxlen=5)
@@ -2747,6 +2771,7 @@ class Watcher:
                     "on a shared-memory board, running out freezes everything"))
         if fits(loaded):
             save_fit(model, self.cfg["context_length"])
+        self.own_size = max((m.get("size") or 0 for m in loaded or []), default=0) or None
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
         self.warm_status = f"ready ({model}{named}{where})"
@@ -2923,8 +2948,15 @@ class Watcher:
             models = self.ollama.loaded()
             left = mem_available()
             if models and left is not None and left < SHARED_MIN_FREE:
-                self.shared_memory_low(models, left)
-                return
+                # One reading can be a passing moment, such as during a load: act on two
+                # in a row (15 s apart), or at once if memory is critically low.
+                self.low_memory_checks += 1
+                if self.low_memory_checks >= 2 or left < SHARED_MIN_FREE // 2:
+                    self.low_memory_checks = 0
+                    self.shared_memory_low(models, left)
+                    return
+            else:
+                self.low_memory_checks = 0
         if self.warming or not self.cfg["model"]:
             return
         if self.warm_failed_at is not None:
@@ -2937,29 +2969,47 @@ class Watcher:
             return
         self.check_loaded(models)
 
+    def bigger_than_ours(self, m):
+        """True if an app's load uses more memory than gpu-yield's own model and context,
+        the setup that already passed the memory check. Smaller loads can't be the cause."""
+        model, ctx = self.cfg["model"], int(self.cfg["context_length"])
+        size = m.get("size")
+        if self.own_size and size:
+            return size > self.own_size * 1.02          # Ollama's figures wobble a little
+        ours = [n for n in (model, self.cfg["alias"]) if n]
+        if not any(same_model(m.get("name") or m.get("model") or "", n) for n in ours):
+            return True                                 # another model, size unknown
+        return bool(m.get("context_length")) and int(m["context_length"]) > ctx
+
     def shared_memory_low(self, models, left):
         """Shared-memory chip, and the rest of the PC is nearly out of memory with a model
-        loaded. An app's different model or context is handled like a model that doesn't
-        fit (unloaded; the AI paused if it keeps happening). If it's gpu-yield's own model,
-        something else grew: unload it to keep the board alive, and retry in 5 minutes."""
+        loaded. An app's load that needs more memory than gpu-yield's own setup is handled
+        like a model that doesn't fit (unloaded; the AI paused if it keeps happening).
+        Otherwise something else used the memory: unload the model to keep the board
+        alive, say what's using memory, and retry in 5 minutes. No pause, no blame."""
         model, ctx = self.cfg["model"], int(self.cfg["context_length"])
-        ours = [n for n in (model, self.cfg["alias"]) if n]
-        others = [m for m in models
-                  if not any(same_model(m.get("name") or m.get("model") or "", n) for n in ours)
-                  or (m.get("context_length") and int(m["context_length"]) != ctx)]
-        if others:
-            return self.unload_spilled(models, others, why=(
-                f"left the rest of the PC only {size_text(left)} of memory"))
+        hogs = memory_users()
+        bigger = [m for m in models if self.bigger_than_ours(m)]
+        if bigger:
+            return self.unload_spilled(models, bigger, why=(
+                f"left the rest of the PC only {size_text(left)} of memory ({hogs})"))
         for m in models:
             try:
                 self.ollama.request("/api/generate", {"model": m.get("name"), "keep_alive": 0},
                                     timeout=60)
             except Exception:
                 pass
+        ours = [n for n in (model, self.cfg["alias"]) if n]
+        apps = [m for m in models
+                if not any(same_model(m.get("name") or m.get("model") or "", n) for n in ours)
+                or (m.get("context_length") and int(m["context_length"]) != ctx)]
+        whose = (f"{apps[0].get('name')} at context {apps[0].get('context_length', '?')}, loaded "
+                 f"by an app, uses no more memory than gpu-yield's own setup, so it isn't the "
+                 f"cause. ") if apps else ""
         self.warm_gen += 1
         self.warm_status = (f"failed: only {size_text(left)} of memory was left for the rest of "
-                            f"the PC, so {model} was unloaded to keep the board from freezing; "
-                            "trying again in 5 minutes")
+                            f"the PC, so the model was unloaded to keep the board from freezing. "
+                            f"{whose}Using memory: {hogs}. Trying again in 5 minutes")
         self.warm_failed_at, self.warm_retry = time.monotonic(), 300
         self.event(self.warm_status, "error")
 
@@ -2991,11 +3041,15 @@ class Watcher:
                        "error")
         if repeat:
             m = repeat[0]
+            needs = (f"needs more memory than gpu-yield's own setup and leaves this board too "
+                     f"little" if why else "doesn't fit in GPU memory")
+            remote = (f", or press Resume on http://{self.host}:{self.cfg['status_port']}/"
+                      if self.cfg["control_password"] and page_port(self.cfg) else "")
             self.block_reason = (f"The AI on {self.host} is paused: an app keeps loading "
                                  f"{m.get('name')} at context {m.get('context_length', '?')}, which "
-                                 f"doesn't fit in {'shared' if why else 'GPU'} memory. Set the app to use "
-                                 f"{self.cfg['alias'] or model} at context {ctx}, then run "
-                                 "gpu-yield resume.")
+                                 f"{needs}. Set the app to use {self.cfg['alias'] or model} at "
+                                 f"context {ctx}, or leave its context unset, then resume: "
+                                 f"gpu-yield resume on {self.host}{remote}.")
             self.event("paused the AI: " + self.block_reason, "error")
             STATE_DIR.mkdir(parents=True, exist_ok=True)
             PAUSE_FILE.touch()            # step() turns this into a pause on the next pass
@@ -3019,10 +3073,6 @@ class Watcher:
         if guards_gpu_fit(self.cfg) and spilled(models):
             self.unload_spilled(models)
             return
-        if guards_shared_fit(self.cfg):
-            left = mem_available()
-            if left is not None and left < SHARED_MIN_FREE:
-                return self.shared_memory_low(models, left)
         self.empty_checks = 0
         trusted_alias = self.loaded_name if self.loaded_name and self.cfg["alias"] and \
             same_model(self.loaded_name, self.cfg["alias"]) else None

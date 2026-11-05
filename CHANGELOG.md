@@ -2,6 +2,13 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.13.2 (2026-11-04)
+Fixes for a bug report from a BC-250: the AI was paused for hours, blaming an app's context that was *smaller* than gpu-yield's own.
+- On a shared-memory chip, when memory runs low, an app's load is blamed only if it uses more memory than gpu-yield's own model and context, by Ollama's own figures. Those already passed the memory check, so a smaller context can't be the cause. Otherwise the model is still unloaded to keep the board from freezing, but nothing is blamed, the AI isn't paused, and gpu-yield tries again in 5 minutes.
+- Low-memory messages now say what is using the memory: the GPU's share and the biggest programs.
+- One low reading no longer counts: it takes two in a row, 15 s apart, unless memory is critically low (under about 0.4 GB).
+- The pause notice says how to resume from another device (Resume on the status page, when controls are on), and that leaving the app's context unset works too.
+
 ## 1.13.1 (2026-11-03)
 - Fix: on the BC-250 and other shared-memory chips, Ollama ran models entirely on the processor. These chips report themselves as integrated GPUs, and Ollama ignores those unless `OLLAMA_IGPU_ENABLE=1` is set. gpu-yield now sets it when the PC's only GPU is one of these, including APUs with a large BIOS graphics slice. It isn't set on PCs that also have a graphics card. Your own `env.OLLAMA_IGPU_ENABLE` setting still wins.
 - `doctor` shows which GPUs Ollama found at its last start and how much memory it thinks each has free, from Ollama's own log, and flags an integrated GPU that Ollama ignored.
