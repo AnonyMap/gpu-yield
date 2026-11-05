@@ -2514,7 +2514,7 @@ class Watcher:
         self.change_source = "the status page"   # who the next queued setting change is from
         self.block_reason = ""           # why gpu-yield paused the AI itself
         self.own_size = None             # bytes our model took at its last load (Ollama's figure)
-        self.low_memory_checks = 0       # low-memory readings in a row (shared-memory chips)
+        self.low_memory_at = None        # when the last low-memory reading was (shared chips)
         self.client_spills = {}          # (model, context) an app loaded that didn't fit -> times
         self.oom_checked = time.time()   # journal checked for out-of-memory kills up to here
         self.oom_kills = collections.deque(maxlen=5)
@@ -2682,6 +2682,7 @@ class Watcher:
 
     def _warm_inner(self, gen):
         model = self.cfg["model"]
+        self.own_size = None                # until this load (of this config) succeeds
         self.warm_status = "starting Ollama"
         if not self.ollama.wait_ready(90, self.stop_evt):
             return self._fail(gen, "failed: Ollama did not answer within 90s")
@@ -2771,7 +2772,11 @@ class Watcher:
                     "on a shared-memory board, running out freezes everything"))
         if fits(loaded):
             save_fit(model, self.cfg["context_length"])
-        self.own_size = max((m.get("size") or 0 for m in loaded or []), default=0) or None
+        # Our own load only: an app's queued request may already have reloaded it differently.
+        ctx = int(self.cfg["context_length"])
+        mine = [m for m in loaded or [] if same_model(m.get("name") or m.get("model") or "", target)
+                and (not m.get("context_length") or int(m["context_length"]) == ctx)]
+        self.own_size = (mine[0].get("size") or None) if mine else None
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
         self.warm_status = f"ready ({model}{named}{where})"
@@ -2944,19 +2949,21 @@ class Watcher:
             if spilled(models):
                 self.unload_spilled(models)
                 return
-        elif guards_shared_fit(self.cfg) and not self.warming:
-            models = self.ollama.loaded()
+        if guards_shared_fit(self.cfg) and not self.warming:    # an APU on ROCm gets both
+            if models is None:
+                models = self.ollama.loaded()
             left = mem_available()
             if models and left is not None and left < SHARED_MIN_FREE:
                 # One reading can be a passing moment, such as during a load: act on two
-                # in a row (15 s apart), or at once if memory is critically low.
-                self.low_memory_checks += 1
-                if self.low_memory_checks >= 2 or left < SHARED_MIN_FREE // 2:
-                    self.low_memory_checks = 0
+                # in a row (this check and the previous one, 15 s apart), or at once if
+                # memory is critically low.
+                prev, self.low_memory_at = self.low_memory_at, now
+                if (prev is not None and now - prev <= 40) or left < SHARED_MIN_FREE // 2:
+                    self.low_memory_at = None
                     self.shared_memory_low(models, left)
                     return
             else:
-                self.low_memory_checks = 0
+                self.low_memory_at = None
         if self.warming or not self.cfg["model"]:
             return
         if self.warm_failed_at is not None:
@@ -2973,13 +2980,17 @@ class Watcher:
         """True if an app's load uses more memory than gpu-yield's own model and context,
         the setup that already passed the memory check. Smaller loads can't be the cause."""
         model, ctx = self.cfg["model"], int(self.cfg["context_length"])
+        ours = [n for n in (model, self.cfg["alias"]) if n]
+        is_ours = any(same_model(m.get("name") or m.get("model") or "", n) for n in ours)
+        got = int(m["context_length"]) if m.get("context_length") else None
+        if is_ours and got in (None, ctx):
+            return False                                # gpu-yield's own load
         size = m.get("size")
         if self.own_size and size:
             return size > self.own_size * 1.02          # Ollama's figures wobble a little
-        ours = [n for n in (model, self.cfg["alias"]) if n]
-        if not any(same_model(m.get("name") or m.get("model") or "", n) for n in ours):
-            return True                                 # another model, size unknown
-        return bool(m.get("context_length")) and int(m["context_length"]) > ctx
+        # Our size is unknown (our own load didn't happen or was refused): blame only what
+        # is certainly bigger, our model at a larger context. Never a guess.
+        return is_ours and got is not None and got > ctx
 
     def shared_memory_low(self, models, left):
         """Shared-memory chip, and the rest of the PC is nearly out of memory with a model

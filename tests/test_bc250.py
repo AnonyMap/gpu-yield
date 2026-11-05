@@ -183,6 +183,35 @@ gy.PAUSE_FILE.unlink()
 assert "GPU" in gy.memory_users()
 ok("a load bigger than gpu-yield's own still pauses on a repeat; the notice says how to resume remotely")
 
+# review of 1.13.2: our own load is never blamed; unknown sizes blame nothing; stale readings
+w = low_memory_watcher([], 0.6, own=8.0)              # own_size from a smaller app reload
+ours_full = {"name": "gpu-yield:latest", "size": int(12.5 * GiB), "context_length": 65536}
+assert not w.bigger_than_ours(ours_full), "gpu-yield's own model at its own context"
+w.own_size = None
+assert not w.bigger_than_ours({"name": "nomic-embed-text", "size": int(0.3 * GiB)})
+assert w.bigger_than_ours({"name": "big:1", "size": 1, "context_length": 131072})
+w = low_memory_watcher(smaller, 0.6)
+w.low_memory_at = gy.time.monotonic() - 600           # a reading from before a game
+check(w)
+assert not w.ollama.calls, "an old low reading doesn't count toward two in a row"
+real_gpu_fit = gy.guards_gpu_fit
+gy.guards_gpu_fit = lambda c: True                    # an APU on ROCm: both checks apply
+w = low_memory_watcher(smaller, 0.6)
+check(w); check(w)
+gy.guards_gpu_fit = real_gpu_fit
+assert ("/api/generate", {"model": "big:1", "keep_alive": 0}) in w.ollama.calls
+# own_size is recorded only from our own load at our own context
+w = warm(11.4, 3.0)
+assert w.own_size == int(11.4 * GiB), w.own_size
+proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {3 * 2**20} kB\n"
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias=""))
+w.state, w.ollama = "ai", Stub(int(11.4 * GiB))
+w.ollama.loaded = lambda: [{"name": "big:1", "size": int(11 * GiB), "size_vram": int(11 * GiB),
+                            "context_length": 8192}]     # an app's request got in first
+w._warm_inner(w.warm_gen)
+assert w.own_size is None
+ok("our own load is never blamed; unknown sizes blame nothing; stale readings and ROCm APUs handled")
+
 gy.Ollama = lambda c: Stub(int(13.9 * GiB))
 assert gy.pull_and_load(dict(gy.DEFAULTS, port=1), "big:1") == "refused"
 ok("gpu-yield model refuses a model too big for the shared pool, without loading it")
