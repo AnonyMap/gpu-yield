@@ -2,6 +2,18 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.13.3 (2026-11-04)
+Fixes from an audit of memory handling in gpu-yield, Ollama and the BC-250's kernel and driver.
+- **Shared-memory chips: llama-server's prompt cache is capped.** The program Ollama runs each model in keeps finished conversations in ordinary RAM so it can resume them without re-reading, by default up to 8 GiB, plus up to 32 context snapshots per conversation. On a BC-250 that RAM is the GPU's memory too, with about 2 GB to spare once a 12 GB model is loaded, so hours of agent traffic could run the board low no matter what context apps asked for. gpu-yield now caps the cache at 256 MiB, about one saved conversation, and keeps 4 snapshots. Switching between several long conversations may mean re-reading a prompt more often. Change it with `gpu-yield config env.LLAMA_ARG_CACHE_RAM 512`.
+- **Shared-memory chips: models load with direct I/O.** Ollama does this itself for integrated CUDA and ROCm GPUs, but not for Vulkan. Each reload no longer pushes the whole file through the page cache as well.
+- **Fix: after giving up on a model that kept running out of memory, gpu-yield stopped checking what apps loaded,** including the fit and shared-memory checks, until the next restart, model change or game.
+- **Out-of-memory messages are accurate when there is no RAM limit,** as on a BC-250. They used to say Ollama "went over its RAM limit (none set)" and point to `ollama_ram_limit`. They now say the PC ran out of memory, and what was using it.
+- **When memory runs low with no load of gpu-yield's own to compare against,** the message says it can't tell whether the app's model is the cause, instead of clearing it. A load bigger than any model may take on the board is still blamed. gpu-yield now remembers the size of its last successful load of the current model and context, instead of forgetting it at every reload.
+- `doctor` on a BC-250 notes TTM's pool of freed GPU memory. Linux counts it as in use until it's needed, by default up to half the memory, so free memory can read low after a model unloads. The note suggests `ttm.page_pool_size=262144`.
+- Readings on shared-memory chips: "used by the GPU" no longer adds the fixed BIOS slice, which isn't part of the shared pool. The status page no longer repeats the same numbers as a separate RAM row. A BIOS slice over 512 MB now counts toward the model budget.
+- Wording on shared-memory chips: `doctor` no longer says models that don't fit are "allowed with a warning", the model list tags oversized models "too big" instead of "> VRAM", and `glimmer-text` says such builds are refused instead of "would run from system RAM". `glimmer-text` counts a bigger BIOS slice like gpu-yield does.
+- "What's using memory" lists programs by their own memory, not memory-mapped files, so a mapped model file isn't counted twice.
+
 ## 1.13.2 (2026-11-04)
 Fixes for a bug report from a BC-250: the AI was paused for hours, blaming an app's context that was *smaller* than gpu-yield's own.
 - On a shared-memory chip, when memory runs low, an app's load is blamed only if it uses more memory than gpu-yield's own model and context, by Ollama's own figures. Those already passed the memory check, so a smaller context can't be the cause. Otherwise the model is still unloaded to keep the board from freezing, but nothing is blamed, the AI isn't paused, and gpu-yield tries again in 5 minutes.

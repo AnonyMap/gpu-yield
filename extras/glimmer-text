@@ -180,8 +180,10 @@ def gpu_info(drm=Path("/sys/class/drm"), meminfo=Path("/proc/meminfo")):
     if vram < 2 * GIB or device == BC250_DEVICE:
         m = re.search(r"^MemTotal:\s+(\d+) kB", _read(meminfo), re.M)
         total = int(m.group(1)) * 1024 if m else 0
+        # A BIOS slice over 512 MB is GPU memory outside MemTotal (gpu-yield counts it too).
+        extra = max(0, vram - GIB // 2)
         return {"kind": "apu", "vram": vram, "device": device,
-                "budget": max(0, total - APU_OS_RESERVE) if total else None}
+                "budget": max(0, total + extra - APU_OS_RESERVE) if total else None}
     return {"kind": "dgpu", "vram": vram, "device": device, "budget": vram - DGPU_HEADROOM}
 
 
@@ -350,7 +352,9 @@ def print_listing(repo, entries, info, ctx, kv):
         mark = "  (split into parts: not supported)" if e["split"] else ""
         log(f"  {e['quant']:<14} {gib(e['size']):>8}   {e['verdict']:<9}  {describe(e['quant'])}{mark}")
     log("\nfits = room to spare; tight = loads, but little room for anything else; "
-        "won't fit = part of it would run from system RAM.")
+        + ("won't fit = too big for the shared memory: gpu-yield refuses or unloads it, "
+           "since running out freezes the board." if info["kind"] == "apu" else
+           "won't fit = part of it would run from system RAM."))
 
 
 # ------------------------------------------------------------------- download
@@ -604,10 +608,13 @@ def cmd_install(args, interactive=None):
         die(f"{entry['quant']} is split into several files, which Ollama can't import "
             "directly; choose a single-file build")
     if entry["verdict"] == "won't fit" and not args.force:
+        why = ("On a shared-memory board, running the memory out freezes it, so gpu-yield "
+               "refuses or unloads such a model." if info["kind"] == "apu" else
+               "Part of it would run from system RAM: slow, and on ROCm that has crashed a PC "
+               "(gpu-yield 1.12 refuses such a model anyway).")
         die(f"{entry['quant']} needs about {gib(entry['need'])}, more than this PC has for a "
-            f"model ({gib(info['budget'])}). Part of it would run from system RAM: slow, and on "
-            "ROCm that has crashed a PC (gpu-yield 1.12 refuses such a model anyway). Choose a "
-            "smaller build, or use --force to download it regardless.")
+            f"model ({gib(info['budget'])}). {why} Choose a smaller build, or use --force to "
+            "download it regardless.")
     if entry["verdict"] == "tight":
         warn(f"{entry['quant']} is a tight fit; close other GPU-heavy programs while it loads")
     name = args.name or f"muse-glimmer-text-{entry['quant'].lower()}"

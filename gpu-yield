@@ -57,7 +57,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.13.2"
+VERSION = "1.13.3"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -978,6 +978,17 @@ def ollama_unit_text(cfg):
     # processor's own graphics there would split models across both.
     if is_bc250() or only_one_gpu():
         env["OLLAMA_IGPU_ENABLE"] = "1"
+    # Shared-memory chips: the program that runs the model (llama-server, inheriting this
+    # environment) keeps a prompt cache in ordinary RAM, by default up to 8 GiB, plus up
+    # to 32 context snapshots per conversation. There, RAM is the GPU's memory too, and a
+    # BC-250 has about 2 GB to spare once the model is loaded, so the cache alone can run
+    # the board out over hours of agent traffic. Keep it to about one saved conversation.
+    # And load the file with direct I/O, as Ollama itself does for integrated CUDA and ROCm
+    # GPUs, so a reload doesn't also push the whole file through the page cache.
+    if shared_memory_gpu():
+        env["LLAMA_ARG_CACHE_RAM"] = str(SHARED_PROMPT_CACHE_MIB)
+        env["LLAMA_ARG_CTX_CHECKPOINTS"] = "4"
+        env["LLAMA_ARG_LOAD_MODE"] = "dio"
     # Until the ROCm download is installed (gpu-yield setup --reinstall), keep using Vulkan
     # rather than silently falling back to the CPU.
     if resolve_backend(cfg) == "vulkan" or backend_installed(cfg) is False:
@@ -1188,7 +1199,7 @@ def memory_users(count=3):
     procs = []
     for d in Path("/proc").glob("[0-9]*"):
         status = _read_text(d / "status")
-        rss = re.search(r"^VmRSS:\s+(\d+) kB", status, re.M)
+        rss = re.search(r"^RssAnon:\s+(\d+) kB", status, re.M)
         name = re.search(r"^Name:\s+(.*)$", status, re.M)
         if rss and name:
             procs.append((int(rss.group(1)) * 1024, clean_text(name.group(1))[:30]))
@@ -1326,6 +1337,7 @@ def tilde(path):
 
 
 DRM_DIR = Path("/sys/class/drm")
+SHARED_PROMPT_CACHE_MIB = 256      # llama-server's RAM prompt cache on shared-memory chips
 SHARED_VRAM_BELOW = 2 * 2**30      # a fixed GPU slice this small means shared memory
 SHARED_OS_RESERVE = 3 * 2**30      # shared memory kept back for Linux itself
 SHARED_MIN_FREE = 3 * 2**30 // 4   # less than this available after a load: too big
@@ -1351,7 +1363,10 @@ def shared_budget():
     """Biggest model file a shared-memory chip can take: all memory minus room for Linux
     and the model's context (the BC-250 health check's own lines: ~12.5 GB of 16)."""
     total = total_ram()
-    return total - SHARED_OS_RESERVE if total else None
+    if not total:
+        return None
+    vram = (memory_readings() or {}).get("vram_total") or 0
+    return total - SHARED_OS_RESERVE + max(0, vram - 2**29)   # a slice over 512 MB adds room
 
 
 def is_bc250():
@@ -1534,7 +1549,7 @@ def memory_line(m):
     g = lambda b: f"{b / 2**30:.1f}"      # GiB: how cards and RAM are sold ("16 GB")
     if m.get("shared") and m.get("ram_total"):
         return (f"shared memory {g(m['ram_used'])} / {g(m['ram_total'])} GB, "
-                f"{g(gpu_used(m) or 0)} GB of it used by the GPU")
+                f"{g(m.get('gtt_used') or 0)} GB of it used by the GPU")
     parts = []
     if m.get("vram_total"):
         parts.append(f"GPU {g(m['vram_used'])} / {g(m['vram_total'])} GB")
@@ -1974,10 +1989,10 @@ function renderStatus(s) {
   if (s.model && s.alias) rows.push(["Apps use", s.alias + " (always the loaded model)"]);
   const m = s.memory;
   if (m && m.shared && m.ram_total) rows.push(["Shared memory", gb1(m.ram_used) + " / " + gb1(m.ram_total)
-    + " GB, " + gb1(m.gpu_used || 0) + " GB of it used by the GPU"]);
+    + " GB, " + gb1(m.gtt_used || 0) + " GB of it used by the GPU"]);
   else if (m && m.vram_total) rows.push(["GPU memory", gb1(m.vram_used) + " / " + gb1(m.vram_total) + " GB"
     + (m.gtt_used > 1073741824 ? " (+" + gb1(m.gtt_used) + " GB of RAM mapped for the GPU)" : "")]);
-  if (m && m.ram_total) rows.push(["RAM", gb1(m.ram_used) + " / " + gb1(m.ram_total) + " GB"]);
+  if (m && m.ram_total && !m.shared) rows.push(["RAM", gb1(m.ram_used) + " / " + gb1(m.ram_total) + " GB"]);
   if (s.in_use) rows.push(["In use", "yes, right now"]);
   else if (s.last_used) rows.push(["Last used", ago(s.last_used) + " ago"]);
   if (s.since) rows.push(["Since", ago(s.since) + " ago"]);
@@ -2056,7 +2071,7 @@ function drawModels(s) {
     list.replaceChildren(...models.models.map(m => {
       const inUse = same(m.name, s.model);
       const tags = [el("span", { class: "tag" }, gb(m.size))];
-      if (models.vram_gb && m.size / 1073741824 > models.vram_gb) tags.push(el("span", { class: "tag", title: "Bigger than this PC's video memory; part of it runs from system RAM" }, "> VRAM"));
+      if (models.vram_gb && m.size / 1073741824 > models.vram_gb) tags.push(el("span", { class: "tag", title: models.shared ? "Bigger than a model may take in this board's shared memory; gpu-yield refuses it" : "Bigger than this PC's video memory; part of it runs from system RAM" }, models.shared ? "too big" : "> VRAM"));
       if (inUse) tags.push(el("span", { class: "tag on" }, "in use"));
       return el("li", {}, el("span", { class: "name" }, m.name), ...tags,
         inUse ? "" : el("button", { type: "button", disabled: busy, onclick: () => act("model", { name: m.name }, "Switching to " + m.name + "…") }, "Use"),
@@ -2513,7 +2528,7 @@ class Watcher:
         self.restart_busy = False        # inside restart_ai
         self.change_source = "the status page"   # who the next queued setting change is from
         self.block_reason = ""           # why gpu-yield paused the AI itself
-        self.own_size = None             # bytes our model took at its last load (Ollama's figure)
+        self.own_load = None             # (model, context, bytes) of our last successful load
         self.low_memory_at = None        # when the last low-memory reading was (shared chips)
         self.client_spills = {}          # (model, context) an app loaded that didn't fit -> times
         self.oom_checked = time.time()   # journal checked for out-of-memory kills up to here
@@ -2661,6 +2676,7 @@ class Watcher:
     def start_warm(self):
         self.warm_gen += 1
         self.warm_failed_at = None
+        self.low_memory_at = None
         self.warming = True
         threading.Thread(target=self._warm, args=(self.warm_gen,), name="warmup",
                          daemon=True).start()
@@ -2682,7 +2698,6 @@ class Watcher:
 
     def _warm_inner(self, gen):
         model = self.cfg["model"]
-        self.own_size = None                # until this load (of this config) succeeds
         self.warm_status = "starting Ollama"
         if not self.ollama.wait_ready(90, self.stop_evt):
             return self._fail(gen, "failed: Ollama did not answer within 90s")
@@ -2776,7 +2791,8 @@ class Watcher:
         ctx = int(self.cfg["context_length"])
         mine = [m for m in loaded or [] if same_model(m.get("name") or m.get("model") or "", target)
                 and (not m.get("context_length") or int(m["context_length"]) == ctx)]
-        self.own_size = (mine[0].get("size") or None) if mine else None
+        if mine and mine[0].get("size"):
+            self.own_load = (model, ctx, mine[0]["size"])
         where = f", {share}% on GPU" if share is not None else ""
         named = f" as {target}" if target != model else ""
         self.warm_status = f"ready ({model}{named}{where})"
@@ -2843,8 +2859,12 @@ class Watcher:
             return ""
         limit = effective_ram_limit(self.cfg)
         self.oom_kills.append(time.monotonic())
-        self.event(f"Ollama went over its RAM limit ({size_text(limit) if limit else 'none set'}) "
-                   "and Linux stopped it; the rest of the PC wasn't affected", "error")
+        if limit:
+            self.event(f"Ollama went over its RAM limit ({size_text(limit)}) and Linux stopped "
+                       "it; the rest of the PC wasn't affected", "error")
+        else:
+            self.event("the PC ran out of memory and Linux stopped Ollama, first in line as "
+                       f"set up; using memory: {memory_users()}", "error")
         recent = [t for t in self.oom_kills if time.monotonic() - t < 600]
         return "repeated" if len(recent) >= 2 else "once"
 
@@ -2855,7 +2875,9 @@ class Watcher:
         if seen == "repeated":
             self.give_up_on_ram(gen)
         elif seen == "once":
-            self._fail(gen, f"failed: Ollama went over its RAM limit while loading "
+            what = ("went over its RAM limit" if effective_ram_limit(self.cfg)
+                    else "was stopped by Linux for lack of memory")
+            self._fail(gen, f"failed: Ollama {what} while loading "
                             f"{self.cfg['model']}; trying once more in 5 minutes", retry=300)
         return bool(seen)
 
@@ -2864,9 +2886,12 @@ class Watcher:
         if gen is not None and gen != self.warm_gen:
             return
         self.warm_gen += 1
-        self.warm_status = (f"failed: {self.cfg['model']} keeps going over Ollama's RAM limit "
-                            "(see ollama_ram_limit); not loading it again until you change the "
-                            "model, the limit, or run gpu-yield restart")
+        self.warming = False             # this ends the load cycle; health checks resume
+        what = ("keeps going over Ollama's RAM limit (see ollama_ram_limit)"
+                if effective_ram_limit(self.cfg) else
+                "keeps running the PC out of memory, so Linux keeps stopping Ollama")
+        self.warm_status = (f"failed: {self.cfg['model']} {what}; not loading it again until "
+                            "you change the model or context, or run gpu-yield restart")
         self.warm_failed_at, self.warm_retry = time.monotonic(), 10**9
         self.event(self.warm_status)
 
@@ -2976,21 +3001,33 @@ class Watcher:
             return
         self.check_loaded(models)
 
+    def own_size(self):
+        """Bytes gpu-yield's own model took at its last successful load, if that load was of
+        the current model and context; else None."""
+        rec = self.own_load
+        if rec and rec[0] == self.cfg["model"] and rec[1] == int(self.cfg["context_length"]):
+            return rec[2]
+        return None
+
     def bigger_than_ours(self, m):
         """True if an app's load uses more memory than gpu-yield's own model and context,
-        the setup that already passed the memory check. Smaller loads can't be the cause."""
+        the setup that already passed the memory check; False if it uses no more, so it
+        can't be the cause; None if there's nothing to compare with."""
         model, ctx = self.cfg["model"], int(self.cfg["context_length"])
         ours = [n for n in (model, self.cfg["alias"]) if n]
         is_ours = any(same_model(m.get("name") or m.get("model") or "", n) for n in ours)
         got = int(m["context_length"]) if m.get("context_length") else None
         if is_ours and got in (None, ctx):
             return False                                # gpu-yield's own load
-        size = m.get("size")
-        if self.own_size and size:
-            return size > self.own_size * 1.02          # Ollama's figures wobble a little
-        # Our size is unknown (our own load didn't happen or was refused): blame only what
-        # is certainly bigger, our model at a larger context. Never a guess.
-        return is_ours and got is not None and got > ctx
+        size, own = m.get("size"), self.own_size()
+        if own and size:
+            return size > own * 1.02                    # Ollama's figures wobble a little
+        if is_ours and got is not None and got > ctx:
+            return True                                 # our model at a larger context
+        budget = shared_budget()
+        if size and budget and size > budget:
+            return True                                 # more than any model may take here
+        return None
 
     def shared_memory_low(self, models, left):
         """Shared-memory chip, and the rest of the PC is nearly out of memory with a model
@@ -3000,7 +3037,8 @@ class Watcher:
         alive, say what's using memory, and retry in 5 minutes. No pause, no blame."""
         model, ctx = self.cfg["model"], int(self.cfg["context_length"])
         hogs = memory_users()
-        bigger = [m for m in models if self.bigger_than_ours(m)]
+        verdicts = [(m, self.bigger_than_ours(m)) for m in models]
+        bigger = [m for m, v in verdicts if v]
         if bigger:
             return self.unload_spilled(models, bigger, why=(
                 f"left the rest of the PC only {size_text(left)} of memory ({hogs})"))
@@ -3014,9 +3052,13 @@ class Watcher:
         apps = [m for m in models
                 if not any(same_model(m.get("name") or m.get("model") or "", n) for n in ours)
                 or (m.get("context_length") and int(m["context_length"]) != ctx)]
-        whose = (f"{apps[0].get('name')} at context {apps[0].get('context_length', '?')}, loaded "
-                 f"by an app, uses no more memory than gpu-yield's own setup, so it isn't the "
-                 f"cause. ") if apps else ""
+        unsure = any(v is None for m, v in verdicts if m in apps)
+        whose = ((f"{apps[0].get('name')} at context {apps[0].get('context_length', '?')}, "
+                  "loaded by an app, may be the cause: there's no load of gpu-yield's own "
+                  "model to compare it with. ") if unsure else
+                 (f"{apps[0].get('name')} at context {apps[0].get('context_length', '?')}, loaded "
+                  "by an app, uses no more memory than gpu-yield's own setup, so it isn't the "
+                  "cause. ")) if apps else ""
         self.warm_gen += 1
         self.warm_status = (f"failed: only {size_text(left)} of memory was left for the rest of "
                             f"the PC, so the model was unloaded to keep the board from freezing. "
@@ -3376,7 +3418,7 @@ class Watcher:
             vram = shared_budget() / 2**30   # what a model file can use on a shared chip
         return {"models": self.models_cache["models"], "available": available,
                 "disk_free": models_free_space(store), "models_dir": tilde(store),
-                "vram_gb": round(vram, 1) if vram else None}
+                "vram_gb": round(vram, 1) if vram else None, "shared": shared_memory_gpu()}
 
     def download_list(self):
         now = time.monotonic()
@@ -4328,6 +4370,17 @@ def bc250_checks(cfg, ollama=None):
             f"{k} ({v})" for k, v in sources.items()) + "; the tmpfiles.d setting wins last. "
             "Make them all 4194304")
 
+    # TTM keeps GPU memory that was freed in a pool for reuse, by default up to half of RAM.
+    # Linux frees it when memory runs short, but until then counts it as used, so after a
+    # model unloads the board looks fuller than it is (and gpu-yield's low-memory check
+    # can act on that). A 1 GiB pool keeps the reuse without the false alarm.
+    pool = _read_text(Path("/sys/module/ttm/parameters/page_pool_size")).strip()
+    if pool.isdigit() and (int(pool) == 0 or int(pool) > 262144):
+        size = f"{size_text(int(pool) * 4096)}" if int(pool) else "half the memory (the default)"
+        add("note", f"TTM may keep up to {size} of freed GPU memory pooled, which Linux reports "
+                    "as in use until it's needed. To keep free-memory readings honest, add "
+                    "ttm.page_pool_size=262144 (1 GiB) to the kernel options")
+
     mem = memory_readings() or {}
     if mem.get("vram_total", 0) > 1.1e9:
         add("bad", f"the BIOS gives the GPU a fixed {size_text(mem['vram_total'])}, leaving "
@@ -4514,6 +4567,10 @@ def cmd_doctor(args):
                 share = gpu_share(models)
                 ctx = models[0].get("context_length")
                 problem, msg = placement_note(o, models[0].get("name"), share)
+                if msg and shared_memory_gpu() and share:
+                    msg = (f"{100 - share}% of it runs on the CPU, because Ollama sees less GPU "
+                           "memory than the board has; it will be slow. Check the GPU memory "
+                           "limit (ttm.pages_limit) above")
                 (bad if problem else ok)(f"{models[0].get('name')} loaded, {share}% on GPU"
                                          + (f", context {ctx}" if ctx else ""))
                 if msg:
@@ -4536,6 +4593,8 @@ def cmd_doctor(args):
     note("models that don't fit in GPU memory: " + (
         "unloaded (ROCm); gpu-yield goes back to the last model that fit" if guards_gpu_fit(cfg)
         else "allowed (allow_partial_gpu = true)" if cfg["allow_partial_gpu"]
+        else "refused or unloaded (shared memory: running it out freezes the board)"
+        if guards_shared_fit(cfg)
         else "allowed with a warning (Vulkan: it only costs speed)"))
     holders = vram_holders()
     if holders:

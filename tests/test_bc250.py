@@ -32,7 +32,7 @@ real_glob = Path.glob
 m = gy.memory_readings()
 assert m["shared"] and m["gpu_used"] == 100 * 2**20 + 11 * GiB
 assert gy.is_bc250() and gy.shared_memory_gpu()
-assert gy.memory_line(m) == "shared memory 12.5 / 15.5 GB, 11.1 GB of it used by the GPU", gy.memory_line(m)
+assert gy.memory_line(m) == "shared memory 12.5 / 15.5 GB, 11.0 GB of it used by the GPU", gy.memory_line(m)
 assert gy.shared_budget() == int(15.5 * GiB) - 3 * GiB
 gy.Path = Path
 ok("shared-memory chip: the GPU's use of the shared pool is read and shown as such")
@@ -138,7 +138,7 @@ def low_memory_watcher(loaded, available, own=12.5, **cfg):
     w.ollama.active = w.ollama.ready = lambda: True
     w.ollama.loaded = lambda: loaded
     w.start_warm = lambda: None
-    w.own_size, w.last_restart = int(own * GiB), -1000
+    w.own_load, w.last_restart = ("big:1", 65536, int(own * GiB)), -1000
     return w
 
 
@@ -187,7 +187,7 @@ ok("a load bigger than gpu-yield's own still pauses on a repeat; the notice says
 w = low_memory_watcher([], 0.6, own=8.0)              # own_size from a smaller app reload
 ours_full = {"name": "gpu-yield:latest", "size": int(12.5 * GiB), "context_length": 65536}
 assert not w.bigger_than_ours(ours_full), "gpu-yield's own model at its own context"
-w.own_size = None
+w.own_load = None
 assert not w.bigger_than_ours({"name": "nomic-embed-text", "size": int(0.3 * GiB)})
 assert w.bigger_than_ours({"name": "big:1", "size": 1, "context_length": 131072})
 w = low_memory_watcher(smaller, 0.6)
@@ -202,15 +202,54 @@ gy.guards_gpu_fit = real_gpu_fit
 assert ("/api/generate", {"model": "big:1", "keep_alive": 0}) in w.ollama.calls
 # own_size is recorded only from our own load at our own context
 w = warm(11.4, 3.0)
-assert w.own_size == int(11.4 * GiB), w.own_size
+assert w.own_size() == int(11.4 * GiB), w.own_load
 proc["/proc/meminfo"] = f"MemTotal: {int(15.5 * 2**20)} kB\nMemAvailable: {3 * 2**20} kB\n"
 w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1", alias=""))
 w.state, w.ollama = "ai", Stub(int(11.4 * GiB))
 w.ollama.loaded = lambda: [{"name": "big:1", "size": int(11 * GiB), "size_vram": int(11 * GiB),
                             "context_length": 8192}]     # an app's request got in first
 w._warm_inner(w.warm_gen)
-assert w.own_size is None
+assert w.own_size() is None
 ok("our own load is never blamed; unknown sizes blame nothing; stale readings and ROCm APUs handled")
+
+# --- 1.13.3: memory audit
+unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m"))
+for line in ('LLAMA_ARG_CACHE_RAM=256', 'LLAMA_ARG_CTX_CHECKPOINTS=4', 'LLAMA_ARG_LOAD_MODE=dio'):
+    assert line in unit, line
+unit = gy.ollama_unit_text(dict(gy.DEFAULTS, model="m", ollama_env={"LLAMA_ARG_CACHE_RAM": "1024"}))
+assert "LLAMA_ARG_CACHE_RAM=1024" in unit and "LLAMA_ARG_CACHE_RAM=256" not in unit
+ok("shared chip: llama-server's RAM prompt cache capped, few context snapshots, direct-I/O loads")
+
+# giving up after repeated out-of-memory stops must not leave the health checks switched off
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, model="big:1"))
+w.warming = True
+w.give_up_on_ram(w.warm_gen)
+assert not w.warming and w.warm_retry == 10**9
+assert "Linux keeps stopping Ollama" in w.warm_status and "ollama_ram_limit" not in w.warm_status
+ok("giving up on a load leaves the memory checks running; no RAM-limit talk when there is none")
+
+# nothing to compare with: say so, and blame only what's bigger than any model may take
+other = [{"name": "qwen3:14b", "size": int(9 * GiB), "size_vram": int(9 * GiB), "context_length": 65536}]
+w = low_memory_watcher(other, 0.3)
+w.own_load = None
+check(w)
+assert "may be the cause" in w.warm_status and not w.client_spills, w.warm_status
+huge = [{"name": "qwen3:32b", "size": int(13.5 * GiB), "size_vram": int(13.5 * GiB), "context_length": 65536}]
+w = low_memory_watcher(huge, 0.3)
+w.own_load = None
+check(w)
+assert ("qwen3:32b", 65536) in w.client_spills, "bigger than the shared budget: blamed"
+w = low_memory_watcher(other, 0.3)
+w.own_load = ("other:1", 65536, int(5 * GiB))        # from a different model: not comparable
+assert w.own_size() is None
+ok("low memory with no load of ours to compare: honest message; an oversized app load still blamed")
+
+proc["/sys/module/ttm/parameters/page_pool_size"] = "0\n"
+assert any(k == "note" and "ttm.page_pool_size=262144" in m for k, m in gy.bc250_checks(dict(gy.DEFAULTS)))
+proc["/sys/module/ttm/parameters/page_pool_size"] = "262144\n"
+assert not any("page_pool_size" in m for k, m in gy.bc250_checks(dict(gy.DEFAULTS)))
+del proc["/sys/module/ttm/parameters/page_pool_size"]
+ok("doctor notes TTM's pool of freed GPU memory, which Linux counts as in use")
 
 gy.Ollama = lambda c: Stub(int(13.9 * GiB))
 assert gy.pull_and_load(dict(gy.DEFAULTS, port=1), "big:1") == "refused"
