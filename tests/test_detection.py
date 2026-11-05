@@ -112,9 +112,13 @@ assert 0 <= gy.process_age(os.getpid()) < 600 and gy.process_age(999999999) == 0
 ok("a Windows program outside Steam must keep running 5 s before the AI stops (only while it's on)")
 
 # extra_processes also matches the short name `ps -e` shows (15 chars)
-import shutil, subprocess
-exe = home / "averyverylongnativegame"; shutil.copy("/bin/sleep", exe)
-long_name = subprocess.Popen([str(exe), "60"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+import subprocess, sys
+# A link to this Python, not a copy of /bin/sleep: where coreutils is one program that picks
+# the tool by its own name (uutils, as on newer Ubuntu), a renamed copy exits at once. The
+# kernel names the process after the link, and Python finds its library through it.
+exe = home / "averyverylongnativegame"; exe.symlink_to(Path(sys.executable).resolve())
+long_name = subprocess.Popen([str(exe), "-c", "import time; time.sleep(60)"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 assert labels(extra_processes=["averyverylongna"]) == ["averyverylongnativegame"]
 long_name.kill(); long_name.wait()
 ok("extra_processes matches the truncated name ps shows")

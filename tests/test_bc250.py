@@ -311,6 +311,7 @@ gy.os.uname = lambda: types.SimpleNamespace(release="6.17.9-200.fc43.x86_64")
 cfg = dict(gy.DEFAULTS, model="glimmer", ollama_env={"OLLAMA_KV_CACHE_TYPE": "q4_0",
                                                      "HSA_OVERRIDE_GFX_VERSION": "10.3.0"})
 proc["/sys/module/ttm/parameters/pages_limit"] = "1048576\n"
+gy.JOURNAL_DIR = Path(tempfile.mkdtemp())             # no persistent journal, whatever this PC has
 
 
 class Show:

@@ -893,6 +893,7 @@ ROCM_TARGETS = {"gfx906", "gfx908", "gfx90a", "gfx942", "gfx1030", "gfx1100", "g
                 "gfx1102", "gfx1151", "gfx1200", "gfx1201"}
 KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
 PCI_DIR = Path("/sys/bus/pci/devices")
+JOURNAL_DIR = Path("/var/log/journal")   # present when the journal survives reboots
 
 
 def gpu_targets():
@@ -4478,7 +4479,7 @@ def bc250_checks(cfg, ollama=None):
     if zram > 4 * 2**30:
         add("note", f"zram is {size_text(zram)}: it lives in the same 16 GB as the model. "
                     "About 2 GB is plenty")
-    if not any(Path("/var/log/journal").glob("*")):
+    if not any(JOURNAL_DIR.glob("*")):
         add("bad", "the system journal isn't kept across reboots, so a crash leaves no evidence: "
                    "sudo mkdir -p /var/log/journal && sudo systemctl restart systemd-journald")
 
