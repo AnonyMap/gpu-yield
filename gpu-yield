@@ -2197,7 +2197,9 @@ def public_snapshot(snap, hint):
     name this PC by something other than its own name or address."""
     out = {k: snap[k] for k in PUBLIC_FIELDS if k in (snap or {})}
     out["redacted"] = True
-    out["notice"] = "Details are hidden under this name. " + hint
+    out["notice"] = ("Only the AI's availability is shown under this name, since another name "
+                     "could belong to a website. For details and controls, open "
+                     + hint.split("opened as ", 1)[-1].split(", since", 1)[0] + ".")
     return out
 
 

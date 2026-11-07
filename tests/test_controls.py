@@ -197,12 +197,12 @@ public = json.loads(status_as("evil.example"))
 assert "ai_available" in public and "state" in public, public
 for secret in ("mac", "host", "games", "events", "memory", "model"):
     assert secret not in public, (secret, public)
-assert "details are hidden" in public["notice"].lower()
+assert "only the ai's availability" in public["notice"].lower() and ".local:" in public["notice"]
 assert '"mac"' in status_as(f"{me}.home") or "mac" in json.loads(status_as(f"{me}.home"))
 page = status_as("evil.example", "/")
 import re as _re
 embedded = json.loads(_re.search(r'<script id="initial" type="application/json">(.*?)</script>', page, _re.S).group(1))
-assert set(embedded) <= set(gy.PUBLIC_FIELDS) | {"notice"}, embedded
+assert set(embedded) <= set(gy.PUBLIC_FIELDS) | {"notice", "redacted"}, embedded
 ok("requests under a host name that isn't this PC's are refused (DNS rebinding); "
    "status under such a name says only whether the AI can be used")
 
