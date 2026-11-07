@@ -308,4 +308,101 @@ with contextlib.redirect_stdout(io.StringIO()):
     assert attempt(gy.cmd_wake, types.SimpleNamespace(target="pc", no_wait=False)) == 1
 assert time.monotonic() - t < 2
 ok("wake: a model that failed to load ends the wait at once with exit code 1")
+# --- 1.13.4 security audit
+
+# lockouts: a full table never forgets an active lockout; many devices guessing together
+# are slowed, but devices that gave the right password keep working
+w = gy.Watcher(dict(gy.DEFAULTS, port=1, control_password="rightpassword"))
+w.event = lambda *a, **k: None
+for _ in range(10):
+    w.api("auth", {}, "wrong", client="10.0.0.1")
+assert w.api("auth", {}, "wrong", client="10.0.0.1")[0] == 429
+w.api("auth", {}, "rightpassword", client="10.0.0.9")          # the owner's phone
+for i in range(1100):
+    w.api("auth", {}, "wrong", client=f"10.1.{i // 250}.{i % 250}")
+assert w.api("auth", {}, "wrong", client="10.0.0.1")[0] == 429, "the lockout survived"
+assert len(w.failures) <= 1000
+code, reply = w.api("auth", {}, "wrong", client="10.2.0.1")
+assert code == 429 and "network" in reply["error"], reply
+assert w.api("auth", {}, "rightpassword", client="10.0.0.9")[0] == 200, "the owner still gets in"
+ok("lockouts: a flood of addresses can't wipe them; network-wide guessing is slowed, not the owner")
+
+# model names: Ollama's long forms are the same model
+for alt in ("library/qwen3:14b", "registry.ollama.ai/library/qwen3:14b", "LIBRARY/Qwen3:14b"):
+    assert gy.same_model(alt, "qwen3:14b"), alt
+assert gy.same_model("library/assistant", "assistant:latest")
+assert not gy.same_model("someone/qwen3:14b", "qwen3:14b")
+ok("deleting by Ollama's long name forms can't get round the in-use check")
+
+# Ollama settings can't add lines to its service file
+for env, bad in (({"FOO": "x\nExecStartPre=/bin/true"}, "line break"), ({"BAD KEY": "1"}, "valid"),
+                 ({"X=Y": "1"}, "valid")):
+    problem = gy.config_problem(dict(gy.DEFAULTS, ollama_env=env))
+    assert problem and bad in problem, problem
+assert gy.config_problem(dict(gy.DEFAULTS, ollama_env={"OLLAMA_KV_CACHE_TYPE": "q8_0"})) is None
+ok("Ollama settings with line breaks or odd names are refused")
+
+# secrets aren't accepted on the command line
+with contextlib.redirect_stderr(io.StringIO()) as err:
+    assert attempt(gy.cmd_config, types.SimpleNamespace(key="control_password", value="hunter2hunter2")) != 0
+assert "prompt" in err.getvalue()
+ok("passwords and tokens are only taken at a prompt, not from the command line")
+
+# the update token never follows a redirect to another host or to plain HTTP
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+seen = {}
+class Hop(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        seen[self.headers.get("Host")] = self.headers.get("Authorization")
+        if self.path == "/start":
+            self.send_response(302); self.send_header("Location", f"http://localhost:{port}/end")
+            self.send_header("Content-Length", "0"); self.end_headers(); return
+        self.send_response(200); self.send_header("Content-Length", "2"); self.end_headers(); self.wfile.write(b"ok")
+hop = ThreadingHTTPServer(("127.0.0.1", 0), Hop); port = hop.server_address[1]
+threading.Thread(target=hop.serve_forever, daemon=True).start()
+req = urllib.request.Request(f"http://127.0.0.1:{port}/start", headers={"Authorization": "Bearer ghp_SECRET"})
+assert urllib.request.build_opener(gy._SafeRedirect).open(req, timeout=5).read() == b"ok"
+assert seen[f"127.0.0.1:{port}"] == "Bearer ghp_SECRET" and seen[f"localhost:{port}"] is None, seen
+hop.shutdown()
+class Down(gy._SafeRedirect): pass
+req = urllib.request.Request("https://example.invalid/x")
+try:
+    Down().redirect_request(req, None, 302, "Found", {}, "http://example.invalid/y")
+    raise AssertionError("followed a redirect from HTTPS to HTTP")
+except urllib.error.HTTPError:
+    pass
+ok("the GitHub token isn't carried to another host, and HTTPS never drops to HTTP")
+
+# Ollama installs: the release is found by version, from the redirect
+class Rel(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_HEAD(self):
+        self.send_response(302); self.send_header("Location", "https://github.com/ollama/ollama/releases/tag/v0.40.15")
+        self.send_header("Content-Length", "0"); self.end_headers()
+rel = ThreadingHTTPServer(("127.0.0.1", 0), Rel)
+threading.Thread(target=rel.serve_forever, daemon=True).start()
+real = gy.OLLAMA_RELEASES
+gy.OLLAMA_RELEASES = f"http://127.0.0.1:{rel.server_address[1]}"
+assert gy.ollama_download_base() == f"{gy.OLLAMA_RELEASES}/download/v0.40.15"
+rel.shutdown(); rel.server_close()
+assert gy.ollama_download_base() == f"{gy.OLLAMA_RELEASES}/latest/download", "unreachable: latest"
+gy.OLLAMA_RELEASES = real
+ok("Ollama downloads come from one release, by version, with that release's checksums")
+
+# the firewall limits Ollama's IPv6 side to local addresses (a fresh copy: this file
+# stubbed open_firewall out earlier)
+gy = load()
+cmds = []
+gy.run = lambda cmd, *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="")
+gy.lan_address = lambda: ("192.168.1.5", "192.168.1.0/24")
+gy.sudo = lambda cmd: cmds.append(cmd) or True
+with contextlib.redirect_stdout(io.StringIO()):
+    gy.open_firewall(dict(gy.DEFAULTS), types.SimpleNamespace(yes=True))
+rules = [c[2] for c in cmds if c[:2] == ["firewall-cmd", "--permanent"]]
+assert any('family="ipv6" source address="fe80::/10"' in r and "accept" in r for r in rules), cmds
+assert any('family="ipv6" source address="fc00::/7"' in r and "accept" in r for r in rules)
+assert any('family="ipv6" port port="11434"' in r and r.endswith("reject") for r in rules), rules
+ok("firewall: Ollama's port answers only local IPv6 addresses")
 print("security and review-fix tests passed")

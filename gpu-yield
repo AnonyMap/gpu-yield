@@ -29,6 +29,7 @@ Logs:  journalctl --user -u gpu-yield -u gpu-yield-ollama -f
 
 import argparse
 import collections
+import hashlib
 import hmac
 import html
 import http.client
@@ -57,7 +58,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.13.3"
+VERSION = "1.13.4"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -91,7 +92,7 @@ OLLAMA_BIN = OLLAMA_DIR / "bin/ollama"
 WATCHER_UNIT = "gpu-yield.service"
 MANAGED_OLLAMA_UNIT = "gpu-yield-ollama.service"
 AUTOUPDATE_UNIT = "gpu-yield-autoupdate"
-DOWNLOAD_BASE = "https://ollama.com/download"
+OLLAMA_RELEASES = "https://github.com/ollama/ollama/releases"
 
 DEFAULTS = {
     "model": "",
@@ -297,6 +298,12 @@ def config_problem(cfg):
     for key in WHOLE_NUMBERS:
         if isinstance(cfg[key], float) and not cfg[key].is_integer():
             return f"{key} must be a whole number, not {cfg[key]}"
+    for k, v in (cfg["ollama_env"] or {}).items():
+        # These go into the Ollama service file: a line break would add a line of its own.
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", str(k)):
+            return f"ollama_env: {str(k)[:40]!r} isn't a valid environment variable name"
+        if re.search(r"[\x00-\x1f\x7f]", str(v)):
+            return f"ollama_env: {k} contains a line break or control character"
     if page_port(cfg) == cfg["port"]:
         return "status_port must differ from port"
     if ram_limit_bytes(cfg["ollama_ram_limit"]) is False:
@@ -1663,9 +1670,12 @@ def tag_name(m):
 
 
 def same_model(a, b):
-    """Ollama reports "qwen3.5" as "qwen3.5:latest"; treat the two as the same model."""
+    """Ollama reports "qwen3.5" as "qwen3.5:latest", and also accepts it as
+    "library/qwen3.5" or "registry.ollama.ai/library/qwen3.5": all the same model."""
     def norm(n):
         n = n.strip().lower()
+        n = re.sub(r"^registry\.ollama\.ai/", "", n)
+        n = re.sub(r"^library/", "", n)
         return n if ":" in n.rsplit("/", 1)[-1] else n + ":latest"
     return norm(a) == norm(b)
 
@@ -2174,6 +2184,17 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) refr
 MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*(:[A-Za-z0-9._-]+)?")
 
 
+PUBLIC_FIELDS = ("state", "ai_available", "retry_after", "cooldown_remaining", "version", "port")
+
+
+def public_snapshot(snap, hint):
+    """Only what a client needs to decide whether to call the AI now: for requests that
+    name this PC by something other than its own name or address."""
+    out = {k: snap[k] for k in PUBLIC_FIELDS if k in (snap or {})}
+    out["notice"] = "Details are hidden under this name. " + hint
+    return out
+
+
 def normalize_model_name(text):
     """Accept an Ollama name, a Hugging Face repo, or either site's URL; return what
     `ollama pull` expects (hf.co/user/repo[:quant] for Hugging Face)."""
@@ -2247,6 +2268,11 @@ class StatusServer:
                         snap = owner.watcher.snapshot()
                     except Exception as e:
                         snap = {"state": "error", "error": str(e)}
+                    # A website can get a browser to fetch this page under a name it controls
+                    # (DNS rebinding) and read the reply. Under a name that isn't this PC's,
+                    # answer only whether the AI can be used, not what's on the PC.
+                    if not owner.host_allowed(self.headers.get("Host", "")):
+                        snap = public_snapshot(snap, owner.host_hint())
                 if path in ("/status", "/status.json"):
                     self._send(200, snap)
                 elif path == "/":
@@ -2283,7 +2309,7 @@ class StatusServer:
                     data = json.loads(self.rfile.read(length) or b"{}")
                     if not isinstance(data, dict):
                         raise ValueError
-                except ValueError:
+                except (ValueError, RecursionError):      # RecursionError: absurdly nested
                     return self._send(400, {"error": "bad JSON"})
                 # The page percent-encodes the password so any characters survive HTTP headers.
                 password = urllib.parse.unquote(self.headers.get("X-GPU-Yield-Password", ""))
@@ -2295,8 +2321,9 @@ class StatusServer:
             def do_OPTIONS(self):
                 self._send(405, {"error": "cross-site requests aren't allowed"})
 
-        # IPv4 only, like Ollama's port: `gpu-yield firewall` limits IPv4 to your network,
-        # but IPv6 addresses are often reachable from the internet with no NAT in between.
+        # IPv4 only: `gpu-yield firewall` limits IPv4 to your network, but IPv6 addresses
+        # are often reachable from the internet with no NAT in between. (Ollama itself
+        # listens on IPv6 too; `gpu-yield firewall` limits that to local addresses.)
         try:
             server = PageServer(("0.0.0.0", self.port), Handler)
         except OSError as e:
@@ -2524,6 +2551,9 @@ class Watcher:
         self.dl_lock = threading.Lock()
         self.auth_lock = threading.Lock()
         self.failures = {}               # device -> wrong passwords and lockout
+        self.recent_failures = collections.deque(maxlen=200)  # times of wrong passwords
+        self.trusted = {}                # devices that gave the right password -> when
+        self.lock_event_at = -1e9        # last lockout event (they're rate-limited)
         self.models_cache = {"models": [], "at": 0.0}
         self.wine_since = None
         self.last_used = None
@@ -3214,6 +3244,8 @@ class Watcher:
     MAX_FAILURES = 10           # wrong passwords per device before it's locked out
     LOCK_SECONDS = 60           # first lockout; doubles each time, up to MAX_LOCK
     MAX_LOCK = 3600
+    NETWORK_FAILURES = 100      # wrong passwords from all devices in 10 minutes before
+    NETWORK_LOCK = 600          # new devices are refused for this long
 
     def api(self, action, data, password, client="local"):
         secret = self.cfg["control_password"]
@@ -3228,12 +3260,26 @@ class Watcher:
             if rec and rec["until"] > now:
                 return 429, {"error": f"Too many wrong passwords from this device. Try again "
                                       f"in {int(rec['until'] - now) + 1} s."}
+            # Many devices (or one using many addresses) guessing together: refuse devices
+            # that haven't given the right password lately, so the owner's still work.
+            recent = [t for t in self.recent_failures if now - t < 600]
+            if len(recent) >= self.NETWORK_FAILURES and client not in self.trusted:
+                wait = int(recent[-self.NETWORK_FAILURES] + self.NETWORK_LOCK - now) + 1
+                if wait > 0:
+                    return 429, {"error": "Too many wrong passwords on this network lately. "
+                                          f"Try again in {wait} s."}
             if not hmac.compare_digest(str(password).encode(), secret.encode()):
-                if len(self.failures) > 1000:          # bounded, whatever the network does
-                    for ip in [ip for ip, r in self.failures.items() if r["until"] < now - 86400]:
+                self.recent_failures.append(now)
+                if client not in self.failures and len(self.failures) >= 1000:
+                    # Bounded, whatever the network does: forget the oldest records that
+                    # aren't locked out now. Never forget an active lockout.
+                    idle = sorted((r["last"], ip) for ip, r in self.failures.items()
+                                  if r["until"] <= now)
+                    for _, ip in idle[:max(1, len(idle) // 4)]:
                         del self.failures[ip]
-                    if len(self.failures) > 1000:
-                        self.failures.clear()
+                    if len(self.failures) >= 1000:
+                        return 429, {"error": "Too many devices are guessing the password. "
+                                              "Try again later."}
                 rec = self.failures.setdefault(client, {"count": 0, "locks": 0, "until": 0.0,
                                                         "last": now})
                 if now - rec["last"] > 600:          # an occasional typo doesn't add up
@@ -3243,10 +3289,15 @@ class Watcher:
                 if rec["count"] >= self.MAX_FAILURES:
                     lock = min(self.MAX_LOCK, self.LOCK_SECONDS * 2 ** rec["locks"])
                     rec.update(count=0, locks=rec["locks"] + 1, until=now + lock)
-                    self.event(f"status page: too many wrong control passwords from {client}; "
-                               f"that device is locked out for {ago(lock)}")
+                    if now - self.lock_event_at > 600:   # many devices can't flood the events
+                        self.lock_event_at = now
+                        self.event(f"status page: too many wrong control passwords from "
+                                   f"{client}; that device is locked out for {ago(lock)}")
                 return 403, {"error": "Wrong password"}
             self.failures.pop(client, None)
+            self.trusted[client] = now
+            if len(self.trusted) > 32:
+                del self.trusted[min(self.trusted, key=self.trusted.get)]
         handler = getattr(self, "_api_" + action.replace("-", "_"), None) \
             if re.fullmatch(r"[a-z_-]+", action) else None
         if handler is None:
@@ -4630,6 +4681,15 @@ def cmd_doctor(args):
         ports = " and ".join(str(p) for p in (cfg["port"], page_port(cfg)) if p)
         note(f"firewalld is active; ports {ports} must be open to {net or 'your LAN'} "
              "(gpu-yield firewall does this)")
+        # Ollama answers on IPv6 too. Reading the rules usually works without sudo.
+        rules = run(["firewall-cmd", "--list-rich-rules"])
+        has_v6 = any('family="ipv6"' in r and f'port="{cfg["port"]}"' in r and "reject" in r
+                     for r in rules.stdout.splitlines())
+        global_v6 = run(["ip", "-6", "addr", "show", "scope", "global"]).stdout.strip()
+        if rules.returncode == 0 and not has_v6 and global_v6:
+            bad(f"Ollama's port {cfg['port']} also answers on this PC's IPv6 addresses, which "
+                "can be reachable from outside your network: run gpu-yield firewall to limit "
+                "it to local addresses")
     note(f"Hermes base_url: http://{ip or '<this-pc-ip>'}:{cfg['port']}/v1")
     if page_port(cfg):
         note(f"status page: http://{ip or socket.gethostname()}:{cfg['status_port']}/")
@@ -4684,6 +4744,46 @@ def download(url, dest):
     return dest
 
 
+def ollama_download_base():
+    """The download folder of Ollama's latest release, by version number, so the packages
+    and the checksums that vouch for them come from the same release."""
+    class NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *a, **k):
+            return None
+    req = urllib.request.Request(f"{OLLAMA_RELEASES}/latest", method="HEAD",
+                                 headers={"User-Agent": f"{APP}/{VERSION}"})
+    try:
+        urllib.request.build_opener(NoRedirect).open(req, timeout=30).close()
+    except urllib.error.HTTPError as e:
+        m = re.search(r"/releases/tag/(v[\w.+-]+)$", e.headers.get("Location") or "")
+        if e.code in (301, 302, 303, 307, 308) and m:
+            return f"{OLLAMA_RELEASES}/download/{m.group(1)}"
+    except OSError:
+        pass
+    return f"{OLLAMA_RELEASES}/latest/download"
+
+
+def published_checksums(base):
+    """{file name: sha256} from the release's sha256sum.txt."""
+    req = urllib.request.Request(f"{base}/sha256sum.txt", headers={"User-Agent": f"{APP}/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        text = r.read(1 << 20).decode("utf-8", "replace")
+    sums = {}
+    for line in text.splitlines():
+        m = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(?:\./)?(\S+)", line.strip())
+        if m:
+            sums[m.group(2)] = m.group(1).lower()
+    return sums
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 20):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def install_ollama(backend):
     """Download and unpack Ollama next to the current install, then swap it in.
 
@@ -4705,10 +4805,17 @@ def install_ollama(backend):
     keep = "the current Ollama install was left as it was" if OLLAMA_DIR.exists() else \
            "nothing was installed"
     try:
+        base = ollama_download_base()
+        sums = published_checksums(base)
         for pkg in packages:
             archive = CACHE_DIR / pkg
             try:
-                download(f"{DOWNLOAD_BASE}/{pkg}", archive)
+                if pkg not in sums:
+                    raise OSError(f"the release lists no checksum for {pkg}")
+                download(f"{base}/{pkg}", archive)
+                if sha256_file(archive) != sums[pkg]:
+                    raise OSError(f"{pkg} doesn't match its published checksum "
+                                  "(a damaged or altered download)")
                 r = run(["tar", "--zstd", "-xf", str(archive), "-C", str(staging)])
                 if r.returncode:
                     raise OSError(f"could not unpack {pkg}: {r.stderr.strip()[-300:]}")
@@ -4768,6 +4875,14 @@ def open_firewall(cfg, args):
     for port in ports:
         rule = (f'rule family="ipv4" source address="{net}" '
                 f'port port="{port}" protocol="tcp" accept')
+        done &= sudo(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"])
+    # Ollama listens on IPv6 as well (its 0.0.0.0 means both), and IPv6 addresses can be
+    # reachable from the internet. Allow only local IPv6 (link-local and private), first,
+    # then refuse the rest; Fedora's desktop zone otherwise lets high ports through.
+    for rule in (*(f'rule priority="-10" family="ipv6" source address="{src}" '
+                   f'port port="{cfg["port"]}" protocol="tcp" accept'
+                   for src in ("fe80::/10", "fc00::/7")),
+                 f'rule priority="-9" family="ipv6" port port="{cfg["port"]}" protocol="tcp" reject'):
         done &= sudo(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"])
     if done:
         sudo(["firewall-cmd", "--reload"])
@@ -4989,6 +5104,10 @@ def cmd_config(args):
         die(f"use: gpu-yield model {args.value}   (it downloads the model as well)")
     if key == "ollama_env" or (key not in DEFAULTS and not key.startswith("env.")):
         die(f"unknown setting {key!r}; run gpu-yield config to list them")
+    if key in SECRET_SETTINGS and args.value not in ("-", ""):
+        # On the command line, other users can see it while it runs, and it's kept in
+        # your shell history.
+        die(f"type it at a prompt instead: gpu-yield config {key} -   (nothing changed)")
     if key in SECRET_SETTINGS and args.value == "-":
         # Typed at a prompt, so it stays out of shell history and process listings.
         import getpass
@@ -5233,16 +5352,35 @@ def declared_version(source):
     return m.group(1).decode() if m else None
 
 
-def github_get(cfg, path, raw=False, timeout=30):
+class _SafeRedirect(urllib.request.HTTPRedirectHandler):
+    """Follow redirects without carrying the token to another host, and never from
+    HTTPS down to plain HTTP."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old, new = urllib.parse.urlsplit(req.full_url), urllib.parse.urlsplit(newurl)
+        if old.scheme == "https" and new.scheme != "https":
+            raise urllib.error.HTTPError(newurl, code, "refused a redirect to plain HTTP",
+                                         headers, fp)
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None and new.hostname != old.hostname:
+            for h in ("Authorization", "authorization"):
+                new_req.headers.pop(h, None)
+                new_req.unredirected_hdrs.pop(h, None)
+        return new_req
+
+
+def github_get(cfg, path, raw=False, timeout=30, auth=True):
+    """GET from GitHub's API. The token (for a private update repo) is sent only when
+    `auth`, and only to GitHub's API itself."""
     headers = {
         "User-Agent": f"{APP}/{VERSION}",
         "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",
         "X-GitHub-Api-Version": "2022-11-28",
     }
-    if cfg["github_token"]:
+    if auth and cfg["github_token"]:
         headers["Authorization"] = f"Bearer {cfg['github_token']}"
     req = urllib.request.Request(GITHUB_API + path, headers=headers)
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    opener = urllib.request.build_opener(_SafeRedirect)
+    with opener.open(req, timeout=timeout) as r:
         return r.read()
 
 
@@ -5351,7 +5489,8 @@ def ollama_versions(cfg):
         m = re.search(r"(\d+\.\d+\.\d+)", run([str(OLLAMA_BIN), "--version"]).stdout)
         installed = m.group(1) if m else None
     try:
-        latest = json.loads(github_get(cfg, "/repos/ollama/ollama/releases/latest"))["tag_name"].lstrip("v")
+        latest = json.loads(github_get(cfg, "/repos/ollama/ollama/releases/latest",
+                                       auth=False))["tag_name"].lstrip("v")
     except Exception:
         pass
     return installed, latest

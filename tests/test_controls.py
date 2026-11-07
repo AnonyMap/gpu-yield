@@ -188,7 +188,32 @@ assert call_host("/api/auth", f"{me}.home:{PAGE_PORT}", {}) == 200
 assert call_host("/api/auth", f"{me.upper()}", {}) == 200
 assert call_host("/api/auth", "192.168.1.23", {}) == 200 and call_host("/api/auth", "[fd00::5]:11435", {}) == 200
 assert call_host("/status", "evil.example") == 200, "the read-only status stays public"
-ok("requests under a host name that isn't this PC's are refused (DNS rebinding)")
+def status_as(host, path="/status"):
+    c = http.client.HTTPConnection("127.0.0.1", PAGE_PORT, timeout=5)
+    c.putrequest("GET", path, skip_host=True); c.putheader("Host", host); c.endheaders()
+    r = c.getresponse(); body = r.read().decode(); c.close()
+    return body
+public = json.loads(status_as("evil.example"))
+assert "ai_available" in public and "state" in public, public
+for secret in ("mac", "host", "games", "events", "memory", "model"):
+    assert secret not in public, (secret, public)
+assert "details are hidden" in public["notice"].lower()
+assert '"mac"' in status_as(f"{me}.home") or "mac" in json.loads(status_as(f"{me}.home"))
+page = status_as("evil.example", "/")
+import re as _re
+embedded = json.loads(_re.search(r'<script id="initial" type="application/json">(.*?)</script>', page, _re.S).group(1))
+assert set(embedded) <= set(gy.PUBLIC_FIELDS) | {"notice"}, embedded
+ok("requests under a host name that isn't this PC's are refused (DNS rebinding); "
+   "status under such a name says only whether the AI can be used")
+
+# deeply nested JSON: a 400, not a dropped connection and a traceback
+c = http.client.HTTPConnection("127.0.0.1", PAGE_PORT, timeout=5)
+data = b"[" * 8000 + b"]" * 8000
+c.putrequest("POST", "/api/auth", skip_host=True); c.putheader("Host", "127.0.0.1")
+c.putheader("Content-Type", "application/json"); c.putheader("Content-Length", str(len(data)))
+c.endheaders(data); r = c.getresponse(); r.read(); c.close()
+assert r.status == 400, r.status
+ok("absurdly nested JSON gets a 400")
 
 # Any password characters work (the page percent-encodes them)
 import urllib.parse

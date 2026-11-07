@@ -20,8 +20,7 @@ You need:
 On the gaming PC, in a terminal (in Desktop Mode or over SSH):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/AnonyMap/gpu-yield/main/gpu-yield -o /tmp/gpu-yield
-python3 /tmp/gpu-yield setup
+d=$(mktemp -d) && curl -fsSL https://raw.githubusercontent.com/AnonyMap/gpu-yield/main/gpu-yield -o "$d/gpu-yield" && python3 "$d/gpu-yield" setup
 ```
 
 Setup asks a few questions, then installs everything into your home folder. Nothing is added to the system image. It:
@@ -229,7 +228,9 @@ The model reloads once after an update.
 
 ## Concerns and limits
 
-- **Ollama has no password.** Anyone who can reach port 11434 can use the AI. Setup opens it to your local network only; never forward it on your router.
+- **Ollama has no password.** Anyone who can reach port 11434 can use the AI. Setup opens it to your local network only, for IPv4 and IPv6; never forward it on your router.
+- **Updates are trusted on GitHub alone.** Updates come from this repository over HTTPS and are checked for damage, but they aren't signed. Anyone who took over the repository could ship an update, and with `auto_update` on it would install within a day. Leave automatic updates off if that matters to you, and read the [changelog](CHANGELOG.md) before updating. Ollama downloads are checked against the checksums Ollama publishes with each release.
+- **Other people with accounts on the PC** can make gpu-yield think a game is running, which keeps the AI off. That's by design, since their games need the GPU too.
 - **Short gaps.** Connections are refused for under a second each time the AI stops or starts.
 - **Native Linux games outside Steam** have to be added to `extra_processes`.
 - **Hardware coverage:**

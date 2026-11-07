@@ -24,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -204,6 +205,9 @@ NAME_RE = re.compile(r"[a-z0-9][a-z0-9._-]{0,79}(:[A-Za-z0-9._-]{1,40})?")
 QUANT_RE = re.compile(r"(?:(?:AD|UD)-)?(?:IQ\d(?:_[A-Z0-9]+)*|Q\d(?:_[A-Z0-9]+)*|BF16|F16|F32|"
                       r"MXFP\d\w*|NVFP\d\w*)$", re.I)
 SPLIT_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
+# A file path from the repo listing: plain names only. A repo controls these, and they end
+# up in the Modelfile, in file names on this PC and on the terminal.
+PATH_PART_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,180}")
 
 
 def validate_repo(repo):
@@ -235,6 +239,8 @@ def hf_api_list(repo):
             if not nxt or not nxt.group(1).startswith(HF + "/api/"):
                 break
             url = nxt.group(1)
+        else:
+            warn("the repo's file list is very long; only the first 20 pages were read")
     except urllib.error.HTTPError as e:
         if e.code in (401, 404):
             die(f"Hugging Face has no public repo {repo}")
@@ -268,7 +274,8 @@ def quant_entries(listing):
             continue
         path = str(item.get("path", ""))
         low = path.lower()
-        if not low.endswith(".gguf") or ".." in path:
+        if not low.endswith(".gguf") or ".." in path or len(path) > 400 or \
+                not all(PATH_PART_RE.fullmatch(part) for part in path.split("/")):
             continue
         name = path.rsplit("/", 1)[-1].lower()
         if name.startswith("mmproj") or "dflash" in name or "mmproj" in name:
@@ -398,20 +405,51 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+class LocalFileError(Exception):
+    """Writing the download on this PC failed: retrying the network won't help."""
+
+
+def open_part(part, append):
+    """Open the partial download without following a link someone else put there."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | (os.O_APPEND if append else os.O_TRUNC)
+    try:
+        return os.fdopen(os.open(part, flags, 0o644), "ab" if append else "wb")
+    except OSError as e:
+        raise LocalFileError(e) from e
+
+
 def download(url, final, size, sha256, retries=6):
     """Download to final + ".part", continuing a partial file, and check the SHA256.
-    Returns the final path. A dropped connection is retried; Ctrl-C keeps the .part."""
+    Returns (path, ours): ours is False for an identical file that was already there and
+    isn't this script's, which must then be left alone. A dropped connection is
+    retried; Ctrl-C keeps the .part."""
     global current_part
     final = Path(final)
     part = final.with_name(final.name + ".part")
-    if final.exists() and size and final.stat().st_size == size:
-        # Finished earlier (an import that failed or was interrupted): reuse it if intact.
+    marker = final.with_name(final.name + ".glimmer-text")   # "this script made these"
+    if not sha256 or not re.fullmatch(r"[0-9a-fA-F]{64}", sha256) or not size:
+        die("Hugging Face gave no checksum or size for this file, so a download couldn't be "
+            "checked; choose another build")
+    ours = marker.exists()
+    if final.exists() or final.is_symlink():
+        if final.is_symlink() or not final.is_file() or final.stat().st_size != size:
+            die(f"{final} already exists and isn't this build; move it, or use --dir")
         log("  already downloaded; checking it's intact...")
-        if not sha256 or sha256_file(final).lower() == sha256.lower():
-            return final
+        if sha256_file(final).lower() == sha256.lower():
+            return final, ours
+        if not ours:
+            die(f"{final} already exists and isn't this build; move it, or use --dir")
         bad = final.with_name(final.name + ".bad")
         final.replace(bad)
         warn(f"the earlier download didn't match the checksum; set it aside as {bad}")
+    if (part.exists() or part.is_symlink()) and not ours:
+        die(f"{part} already exists and wasn't started by glimmer-text; move it, or use --dir")
+    try:
+        fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+        os.write(fd, b"downloaded by glimmer-text\n")
+        os.close(fd)
+    except OSError as e:
+        die(f"can't write in {final.parent}: {e.strerror}")
     current_part = part
     attempt = 0
     while True:
@@ -423,15 +461,23 @@ def download(url, final, size, sha256, retries=6):
             with http_get(url, headers, timeout=60) as r:
                 if have and r.status != 206:      # server ignored the range: start over
                     have = 0
-                mode = "ab" if have else "wb"
+                if have:                          # it must continue exactly where we stopped
+                    m = re.match(r"bytes (\d+)-", r.headers.get("Content-Range") or "")
+                    if not m or int(m.group(1)) != have:
+                        have = 0
+                        raise http.client.HTTPException("the server resumed at the wrong place")
                 last = 0.0
-                with open(part, mode) as out:
+                with open_part(part, append=bool(have)) as out:
                     while True:
                         chunk = r.read(4 * 2**20)
                         if not chunk:
                             break
-                        out.write(chunk)
+                        try:
+                            out.write(chunk)
+                        except OSError as e:
+                            raise LocalFileError(e) from e
                         have += len(chunk)
+                        attempt = 0               # progress: a later drop starts the count anew
                         now = time.monotonic()
                         if now - last > 1:
                             last = now
@@ -442,6 +488,14 @@ def download(url, final, size, sha256, retries=6):
             if not size or have >= size:
                 break
             raise http.client.IncompleteRead(b"")
+        except LocalFileError as e:
+            err = next((x for x in (e.__cause__, *e.args) if isinstance(x, OSError)), None)
+            print()
+            if err is not None and err.errno in (errno.ENOSPC, errno.EDQUOT):
+                die(f"the disk is full; free some space and run the same command again to "
+                    f"continue ({part} is kept)")
+            die(f"couldn't write the download to {part}: "
+                f"{err.strerror if err is not None and err.strerror else e}")
         except urllib.error.HTTPError as e:
             if e.code == 416 and size and have >= size:
                 break
@@ -451,11 +505,8 @@ def download(url, final, size, sha256, retries=6):
             if e.code in (401, 403, 404):
                 die(f"Hugging Face refused the download ({e.code}); the file may have moved")
             attempt += 1
+            warn(f"Hugging Face answered {e.code}; retrying")
         except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
-            if isinstance(e, OSError) and e.errno in (errno.ENOSPC, errno.EDQUOT):
-                print()
-                die(f"the disk is full; free some space and run the same command again to "
-                    f"continue ({part} is kept)")
             attempt += 1
             print()
             warn(f"download interrupted ({getattr(e, 'reason', e)}); retrying")
@@ -464,20 +515,17 @@ def download(url, final, size, sha256, retries=6):
                 f"({part} is kept)")
         time.sleep(min(30, 2 ** attempt))
     log("  checking the file's SHA256 (this takes a moment for a big file)...")
-    if sha256:
-        got = sha256_file(part)
-        if got.lower() != sha256.lower():
-            bad = part.with_name(part.name + ".bad")
-            part.replace(bad)
-            current_part = None
-            die(f"the downloaded file doesn't match Hugging Face's checksum (got {got[:12]}..., "
-                f"expected {sha256[:12]}...). It was set aside as {bad}; run again to "
-                "download it fresh.")
-    else:
-        warn("Hugging Face gave no checksum for this file, so it couldn't be verified")
+    got = sha256_file(part)
+    if got.lower() != sha256.lower():
+        bad = part.with_name(part.name + ".bad")
+        part.replace(bad)
+        current_part = None
+        die(f"the downloaded file doesn't match Hugging Face's checksum (got {got[:12]}..., "
+            f"expected {sha256[:12]}...). It was set aside as {bad}; run again to "
+            "download it fresh.")
     part.replace(final)
     current_part = None
-    return final
+    return final, True
 
 
 # --------------------------------------------------------------------- Ollama
@@ -519,13 +567,17 @@ def check_ollama_ready(port):
 def create_model(name, gguf, port):
     """Import the GGUF into Ollama with a one-line recipe: just the file, no image part.
     Ollama reads the chat format from the file itself."""
-    modelfile = Path(gguf).with_suffix(".Modelfile")
-    modelfile.write_text(f"FROM {Path(gguf).resolve()}\n")
+    source = str(Path(gguf).resolve())
+    if re.search(r"[\x00-\x1f\x7f]", source):
+        die(f"the download's path has a line break or control character in it: {source!r}")
+    folder = Path(tempfile.mkdtemp(prefix="glimmer-text-"))     # private (0700), fresh
+    modelfile = folder / "Modelfile"
+    modelfile.write_text(f"FROM {source}\n")
     env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{port}")
     try:
         r = subprocess.run([ollama_bin(), "create", name, "-f", str(modelfile)], env=env)
     finally:
-        modelfile.unlink(missing_ok=True)
+        shutil.rmtree(folder, ignore_errors=True)
     if r.returncode:
         die(f"ollama create failed (exit {r.returncode}); the downloaded file is kept at {gguf}")
 
@@ -623,7 +675,12 @@ def cmd_install(args, interactive=None):
     port = ollama_port(cfg)
     check_ollama_ready(port)                    # before a 12 GB download, not after
     download_dir = Path(args.dir).expanduser() if args.dir else home() / "Downloads"
-    download_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        download_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        die(f"can't use {download_dir} for the download: {e.strerror or e}")
+    if not download_dir.is_dir():
+        die(f"{download_dir} isn't a folder")
     check_disk(entry, download_dir, ollama_models_dir(cfg))
     previous = cfg.get("model") if isinstance(cfg.get("model"), str) else ""
 
@@ -631,13 +688,15 @@ def cmd_install(args, interactive=None):
     url = f"{HF}/{urllib.parse.quote(repo, safe='/')}/resolve/main/" \
           f"{urllib.parse.quote(entry['path'], safe='/')}"
     log(f"\nDownloading {filename} ({gib(entry['size'])}) from {repo}...")
-    gguf = download(url, download_dir / filename, entry["size"], entry["sha256"])
+    gguf, ours = download(url, download_dir / filename, entry["size"], entry["sha256"])
     log(f"Importing it into Ollama as {name} (text only)...")
     create_model(name, gguf, port)
-    if args.keep:
-        log(f"  kept the downloaded file: {gguf}")
+    if args.keep or not ours:
+        log(f"  kept the downloaded file: {gguf}" if ours else
+            f"  left {gguf} where it was: it was there before, so it's yours")
     else:
         gguf.unlink(missing_ok=True)             # Ollama has its own copy now
+        gguf.with_name(gguf.name + ".glimmer-text").unlink(missing_ok=True)
     where = "not loaded (--no-load)"
     if not args.no_load:
         log(f"Loading {name}...")
@@ -659,7 +718,10 @@ def cmd_remove(args):
     if not NAME_RE.fullmatch(name) or not name.startswith("muse-glimmer-text"):
         die("glimmer-text only removes models it created (named muse-glimmer-text-...); "
             "use ollama rm for others")
-    if cfg.get("model") == name:
+    def tagged(n):
+        n = str(n or "").strip().lower()
+        return n if ":" in n else n + ":latest"
+    if cfg.get("model") and tagged(cfg.get("model")) == tagged(name):
         die(f"{name} is gpu-yield's current model; switch to another first (gpu-yield model)")
     env = dict(os.environ, OLLAMA_HOST=f"127.0.0.1:{ollama_port(cfg)}")
     r = subprocess.run([ollama_bin(), "rm", name], env=env)

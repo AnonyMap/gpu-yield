@@ -163,6 +163,8 @@ class Files(BaseHTTPRequestHandler):
         body = BLOB[start:]
         self.send_response(206 if rng else 200)
         self.send_header("Content-Length", str(len(body)))
+        if rng:
+            self.send_header("Content-Range", f"bytes {start}-{len(BLOB) - 1}/{len(BLOB)}")
         self.end_headers()
         if served["drop_once"]:                      # a dropped connection mid-file
             served["drop_once"] = False
@@ -178,9 +180,10 @@ threading.Thread(target=srv.serve_forever, daemon=True).start()
 url = f"http://127.0.0.1:{srv.server_address[1]}/file.gguf"
 d = Path(tempfile.mkdtemp())
 (d / "model.gguf.part").write_bytes(BLOB[:500_000])         # an earlier, interrupted run
+(d / "model.gguf.glimmer-text").write_text("downloaded by glimmer-text\n")
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-    final = gt.download(url, d / "model.gguf", len(BLOB), SHA)
-assert final.read_bytes() == BLOB and not (d / "model.gguf.part").exists()
+    final, ours = gt.download(url, d / "model.gguf", len(BLOB), SHA)
+assert ours and final.read_bytes() == BLOB and not (d / "model.gguf.part").exists()
 assert served["ranges"][0] == "bytes=500000-" and len(served["ranges"]) >= 2, served["ranges"]
 ok("download continues a partial file, survives a dropped connection, and checks the SHA256")
 
@@ -205,7 +208,7 @@ made = {}
 def fake_download(url_, final, size, sha):
     made["url"] = url_
     Path(final).write_bytes(b"GGUF")
-    return Path(final)
+    return Path(final), True
 gt.download = fake_download
 real_run = gt.subprocess.run
 def run(cmd, **k):
@@ -226,8 +229,8 @@ assert code == 0, err
 dl = d / "Muse-Glimmer-30B-AD-IQ3_XXS.gguf"
 assert made["url"].endswith("/AtomicChat/Muse-Glimmer-30B-GGUF/resolve/main/Muse-Glimmer-30B-AD-IQ3_XXS.gguf")
 assert made["modelfile"] == f"FROM {dl.resolve()}\n" and made["env"] == "127.0.0.1:11500"
-assert calls[0] == [str(HOME / ".local/opt/ollama/bin/ollama"), "create", "muse-glimmer-text-ad-iq3_xxs",
-                    "-f", str(dl.with_suffix(".Modelfile"))]
+assert calls[0][:4] == [str(HOME / ".local/opt/ollama/bin/ollama"), "create", "muse-glimmer-text-ad-iq3_xxs", "-f"]
+assert not Path(calls[0][4]).exists() and Path(calls[0][4]).parent != d, "a private, removed folder"
 assert calls[1] == [str(HOME / ".local/bin/gpu-yield"), "model", "muse-glimmer-text-ad-iq3_xxs"]
 assert not dl.exists(), "the download is deleted once Ollama has its own copy"
 assert "gpu-yield model qwen3.5:9b" in out.getvalue(), "says how to switch back"
@@ -294,7 +297,7 @@ d2 = Path(tempfile.mkdtemp())
 (d2 / "model.gguf").write_bytes(BLOB)
 served["ranges"].clear()
 with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-    assert g2.download(url, d2 / "model.gguf", len(BLOB), SHA) == d2 / "model.gguf"
+    assert g2.download(url, d2 / "model.gguf", len(BLOB), SHA) == (d2 / "model.gguf", False)
 assert served["ranges"] == [], "must not download it again"
 g2.free_space = lambda path: (int(20e9), 1)                  # 20 GB free, 12.2 GB file already here
 (d2 / "x.gguf").write_bytes(b"")
@@ -315,7 +318,9 @@ def full_open(path, mode="r", *a, **k):
         raise OSError(28, "No space left on device")
     return real_open(path, mode, *a, **k)
 g2.open = full_open
-code, err = attempt(g2.download, url, d2 / "full.gguf", 100, None)
+g2.open_part = lambda part, append: (_ for _ in ()).throw(
+    g2.LocalFileError(OSError(28, "No space left on device")))
+code, err = attempt(g2.download, url, d2 / "full.gguf", 100, "a" * 64)
 del g2.open
 assert code == 1 and "disk is full" in err and "retrying" not in err, err
 ok("a full disk stops the download at once instead of retrying it as a network drop")
@@ -344,4 +349,50 @@ assert g2.kv_cache_type({"model": "m"}, g2.BC250_DEVICE) == "q8_0"
 assert g2.kv_cache_type({}, g2.BC250_DEVICE) == "f16", "without gpu-yield, Ollama's own default"
 assert g2.kv_cache_type({"ollama_env": {"OLLAMA_KV_CACHE_TYPE": "f16"}}, g2.BC250_DEVICE) == "f16"
 ok("BC-250 at any BIOS setting counts as shared memory, and plans for gpu-yield's q8_0 default")
+# --- 1.13.4 security audit
+g3spec = importlib.util.spec_from_loader("glimmer_text3", importlib.machinery.SourceFileLoader("glimmer_text3", str(SCRIPT)))
+g3 = importlib.util.module_from_spec(g3spec); g3spec.loader.exec_module(g3)
+g3.time.sleep = lambda s: None
+d3 = Path(tempfile.mkdtemp())
+# a file of yours with the build's name is never overwritten or deleted
+(d3 / "model.gguf").write_bytes(b"my own file")
+code, err = attempt(g3.download, url, d3 / "model.gguf", len(BLOB), SHA)
+assert code == 1 and "isn't this build" in err and (d3 / "model.gguf").read_bytes() == b"my own file"
+# a partial file this script didn't start is left alone
+(d3 / "other.gguf.part").write_bytes(b"someone else's")
+code, err = attempt(g3.download, url, d3 / "other.gguf", len(BLOB), SHA)
+assert code == 1 and "wasn't started by glimmer-text" in err
+# a planted link isn't followed when writing
+victim = d3 / "victim"; victim.write_bytes(b"precious")
+(d3 / "linked.gguf.glimmer-text").write_text("x")
+(d3 / "linked.gguf.part").symlink_to(victim)
+served["drop_once"] = False
+with contextlib.redirect_stdout(io.StringIO()):
+    code, err = attempt(g3.download, url, d3 / "linked.gguf", len(BLOB), SHA)
+assert victim.read_bytes() == b"precious" and code == 1 and "couldn't write" in err, err
+# no checksum, no download
+code, err = attempt(g3.download, url, d3 / "nosum.gguf", len(BLOB), "")
+assert code == 1 and "no checksum" in err
+ok("never overwrites or deletes a file it didn't download, doesn't follow planted links, needs a checksum")
+
+# names from the listing: plain file names only (no line breaks or escape codes)
+odd = [{"type": "file", "path": n, "size": 10, "lfs": {"oid": "a" * 64, "size": 10}} for n in (
+    "x\nSYSTEM evil\nM-Q4_K_M.gguf", "\x1b]0;title\x07M-Q4_K_M.gguf", "a" * 300 + "-Q4_K_M.gguf",
+    "sub/ok-Q4_K_M.gguf", "-dash-Q4_K_M.gguf")]
+assert [e["path"] for e in g3.quant_entries(odd)] == ["sub/ok-Q4_K_M.gguf"]
+ok("file names with line breaks, escape codes or odd characters are left out of the listing")
+
+# remove: a tag doesn't get round the in-use check
+g3.gy_config = lambda: {"model": "muse-glimmer-text-q4_k_m"}
+code, err = attempt(g3.cmd_remove, types.SimpleNamespace(name="muse-glimmer-text-q4_k_m:latest"))
+assert code == 1 and "current model" in err
+ok("remove refuses gpu-yield's current model with or without a tag")
+
+# local write errors aren't retried as network drops
+g3.open_part = lambda part, append: (_ for _ in ()).throw(g3.LocalFileError(OSError(13, "Permission denied")))
+(d3 / "ro.gguf.glimmer-text").write_text("x")
+served["ranges"].clear()
+code, err = attempt(g3.download, url, d3 / "ro.gguf", len(BLOB), SHA)
+assert code == 1 and "Permission denied" in err and len(served["ranges"]) == 1, (err, served["ranges"])
+ok("a folder it can't write to stops at once with the reason")
 print("glimmer-text tests passed")

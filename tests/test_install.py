@@ -1,5 +1,5 @@
 """Installing and updating Ollama: a failed download must never remove a working install."""
-import io, os, shutil, subprocess, sys, tarfile, threading
+import hashlib, io, os, shutil, subprocess, sys, tarfile, threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from _util import load, ok
 if not shutil.which("zstd"):
@@ -18,16 +18,22 @@ def ollama_pkg(ver):
                      ("lib/ollama/libggml-base.so", b"x", 0o644)])
 ROCM = make_pkg([("lib/ollama/rocm/librocblas.so", b"r", 0o644)])
 serve = {}
+sums_override = {}
+def checksums():
+    lines = [f"{sums_override.get(n) or hashlib.sha256(d).hexdigest()}  ./{n}" for n, (d, _) in serve.items()
+             if sums_override.get(n) != "missing"]
+    return ("\n".join(lines) + "\n").encode()
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
     def do_GET(self):
-        name = self.path.rsplit("/", 1)[-1]; mode = serve.get(name)
+        name = self.path.rsplit("/", 1)[-1]
+        mode = (checksums(), False) if name == "sha256sum.txt" else serve.get(name)
         if mode is None: self.send_response(404); self.end_headers(); return
         data, trunc = mode
         self.send_response(200); self.send_header("Content-Length", str(len(data))); self.end_headers()
         self.wfile.write(data[: len(data)//2] if trunc else data)
 srv = ThreadingHTTPServer(("127.0.0.1", 0), H); threading.Thread(target=srv.serve_forever, daemon=True).start()
-gy.DOWNLOAD_BASE = f"http://127.0.0.1:{srv.server_port}"
+gy.ollama_download_base = lambda: f"http://127.0.0.1:{srv.server_port}/download/v0.41.0"
 
 def run(label, expect_exit):
     try:
@@ -49,6 +55,11 @@ assert run("rocm truncated", True).endswith("0.40.10")
 serve["ollama-linux-amd64.tar.zst"] = (b"not a zstd archive", False); serve["ollama-linux-amd64-rocm.tar.zst"] = (ROCM, False)
 assert run("corrupt archive", True).endswith("0.40.10")
 serve["ollama-linux-amd64.tar.zst"] = (ollama_pkg("0.41.0"), False)
+sums_override["ollama-linux-amd64.tar.zst"] = "0" * 64        # altered on the way
+assert run("checksum mismatch", True).endswith("0.40.10")
+sums_override["ollama-linux-amd64.tar.zst"] = "missing"
+assert run("no published checksum", True).endswith("0.40.10")
+sums_override.clear()
 (gy.OLLAMA_DIR / "lib/ollama/stale-from-old-version.so").write_bytes(b"old")
 assert run("good update", False).endswith("0.41.0")
 assert not (gy.OLLAMA_DIR / "lib/ollama/stale-from-old-version.so").exists(), "old libraries leaked into new install"

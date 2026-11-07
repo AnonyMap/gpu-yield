@@ -2,6 +2,32 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.13.4 (2026-11-07)
+Security and bug fixes from an audit of the status page, the parts that run on the PC, and glimmer-text. Nothing was high severity.
+
+**Status page**
+- **A website can no longer read the PC's details through your browser.** Through DNS rebinding, a website could get a browser to fetch the status page under a name the website controls and read the reply: the PC's name, network card address, games, models and events. The controls were already protected. Under a name that isn't the PC's own name or IP address, `/status` and the page now say only whether the AI can be used.
+- **Password guessing from many addresses is contained.** A flood of guesses from over 1,000 addresses used to wipe every lockout. Now active lockouts are never forgotten. After 100 wrong passwords in 10 minutes across the whole network, new devices are refused for 10 minutes, while devices that recently gave the right password keep working. Lockout events can't flood the recent-events list.
+- **Absurdly nested JSON gets a 400.** It used to drop the connection and write a traceback to the log.
+- **Deleting by Ollama's long name forms** (`library/qwen3:14b`, `registry.ollama.ai/library/...`) can't get round the check that protects the model in use and the fixed name for apps.
+
+**On the PC**
+- **Ollama's port is limited to local addresses on IPv6 too.** Ollama listens on IPv6 as well as IPv4. `gpu-yield firewall` used to limit only IPv4, and Fedora's desktop firewall lets high ports through. It now allows local IPv6 addresses (link-local and private) and refuses the rest. `doctor` flags a PC with public IPv6 addresses that doesn't have the rule yet. **Run `gpu-yield firewall` once** to add it.
+- **Ollama downloads are checked against the checksums Ollama publishes.** Each download comes from one release, by version number, from GitHub. A package that doesn't match is refused and the working install is kept.
+- **The GitHub token** (only used for private forks) is never carried by a redirect to another host, and a redirect from HTTPS down to plain HTTP is refused. It's no longer sent when checking Ollama's releases.
+- **Ollama settings can't add lines to its service file.** `env.NAME` values with line breaks, and names that aren't valid environment variable names, are refused.
+- **Passwords and tokens are only taken at a prompt** (`gpu-yield config control_password -`), not on the command line, where other users could see them while it runs and they'd stay in your shell history.
+- **The install command in the README uses a private temporary folder.** Another user on the PC could plant a file at the old `/tmp/gpu-yield` path.
+
+**glimmer-text**
+- **It never overwrites or deletes a file it didn't download.** A file of yours with the build's name in the download folder used to be replaced, or reused and then deleted. It now stops with a message.
+- **Planted links aren't followed when writing**, and the Modelfile is written in a private folder of its own.
+- **Repo file names must be plain names.** Names with line breaks, escape codes or odd characters are left out, so they can't add lines to the Modelfile or write to your terminal.
+- **Every download needs a checksum.** A file without one is refused. A resumed download must continue exactly where it stopped.
+- **`remove` refuses gpu-yield's current model** with or without a `:latest` tag.
+- **Problems writing to the download folder stop at once with the reason**, instead of being retried as network drops. A bad `--dir` is a message, not a traceback.
+- **Retries:** the retry count starts over whenever the download makes progress, and retries after a server error are announced.
+
 ## 1.13.3 (2026-11-04)
 Fixes from an audit of memory handling in gpu-yield, Ollama and the BC-250's kernel and driver.
 - **Shared-memory chips: llama-server's prompt cache is capped.** The program Ollama runs each model in keeps finished conversations in ordinary RAM so it can resume them without re-reading, by default up to 8 GiB, plus up to 32 context snapshots per conversation. On a BC-250 that RAM is the GPU's memory too, with about 2 GB to spare once a 12 GB model is loaded, so hours of agent traffic could run the board low no matter what context apps asked for. gpu-yield now caps the cache at 512 MiB, which holds one Muse Glimmer conversation at 64K (about 7 KB a token), and keeps 4 snapshots. A saved conversation bigger than the cap is simply not kept, so models with bigger context memory get little cache. Switching between several long conversations may mean re-reading a prompt more often. Change it with `gpu-yield config env.LLAMA_ARG_CACHE_RAM N` (MiB); values llama-server can't read are refused, since they'd stop every model from loading.
