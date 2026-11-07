@@ -175,7 +175,15 @@ class Files(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
 
-srv = ThreadingHTTPServer(("127.0.0.1", 0), Files)
+class QuietServer(ThreadingHTTPServer):
+    """A dropped connection is the point of some of these tests: don't print it (a
+    traceback still being written at exit can crash Python's shutdown)."""
+    daemon_threads = True
+    def handle_error(self, request, client_address):
+        pass
+
+
+srv = QuietServer(("127.0.0.1", 0), Files)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 url = f"http://127.0.0.1:{srv.server_address[1]}/file.gguf"
 d = Path(tempfile.mkdtemp())
@@ -384,7 +392,7 @@ class Wrong(Files):
             self.end_headers(); self.wfile.write(BLOB); return
         self.send_response(200); self.send_header("Content-Length", str(len(BLOB)))
         self.end_headers(); self.wfile.write(BLOB)
-wsrv = ThreadingHTTPServer(("127.0.0.1", 0), Wrong)
+wsrv = QuietServer(("127.0.0.1", 0), Wrong)
 threading.Thread(target=wsrv.serve_forever, daemon=True).start()
 (d3 / "resume.gguf.glimmer-text").write_text("x")
 (d3 / "resume.gguf.part").write_bytes(BLOB[:1000])
@@ -417,4 +425,5 @@ served["ranges"].clear()
 code, err = attempt(g3.download, url, d3 / "ro.gguf", len(BLOB), SHA)
 assert code == 1 and "Permission denied" in err and len(served["ranges"]) == 1, (err, served["ranges"])
 ok("a folder it can't write to stops at once with the reason")
+srv.shutdown(); srv.server_close()
 print("glimmer-text tests passed")
