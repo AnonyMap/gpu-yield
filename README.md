@@ -142,7 +142,7 @@ To turn on the controls, set a password on the gaming PC:
 gpu-yield config control_password -
 ```
 
-It asks without showing what you type; press Enter and it makes up a strong one. The page is plain HTTP on your local network, so don't reuse an important password. After 10 wrong guesses, that device is locked out for a minute, doubling up to an hour. Other devices aren't affected.
+It asks without showing what you type; press Enter and it makes up a strong one. The page is plain HTTP on your local network, so don't reuse an important password. After 10 wrong guesses, that device is locked out for a minute, doubling up to an hour. If many devices guess at once (100 wrong passwords in 10 minutes), devices that haven't signed in during the last day are refused for 10 minutes; ones that have keep working.
 
 Downloads accept Ollama names (`qwen3.5:9b`) and Hugging Face GGUF repos (`hf.co/user/repo:Q4_K_M`), or their web links. Changes made during a game are saved and take effect when the AI comes back.
 
@@ -167,7 +167,7 @@ Don't want the page? `gpu-yield config status_page false`.
 | `speed_results` | Recent speed tests: `model`, `read_tps`, `write_tps`, `context_length`, `at` |
 | `host`, `version`, `port`, `mac` | The PC's name, gpu-yield version, AI port, and network card address |
 
-Websites can't read this from your browser, since it names the PC and its network card.
+Websites can't read this from your browser, since it names the PC and its network card. Opened under a name that isn't the PC's own name or IP address, `/status` gives only `state`, `ai_available`, `retry_after`, `cooldown_remaining`, `version` and `port`, with `redacted: true`. For `gpu-yield wake`, use the PC's IP address or its own name (like `NAME.local`) once, so it can learn the network card address.
 </details>
 
 ## From other computers, sleep and Wake-on-LAN

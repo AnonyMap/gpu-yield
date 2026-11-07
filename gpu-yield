@@ -1991,8 +1991,9 @@ function same(a, b) {
 }
 
 function renderStatus(s) {
-  document.title = "gpu-yield on " + s.host;
-  $("title").textContent = "gpu-yield on " + s.host;
+  const host = s.host || location.hostname;
+  document.title = "gpu-yield on " + host;
+  $("title").textContent = "gpu-yield on " + host;
   $("ver").textContent = s.version || "";
   let tone = "off", head = s.state_text || s.state;
   if (s.ai_available) { tone = "ok"; head = "AI ready"; }
@@ -2005,7 +2006,7 @@ function renderStatus(s) {
   const rows = [];
   if (s.games && s.games.length) rows.push(["Game", s.games.join(", ")]);
   if (s.model) rows.push(["Model", s.model + " · " + s.context_length + " context"]);
-  else rows.push(["Model", "none chosen"]);
+  else if (!s.redacted) rows.push(["Model", "none chosen"]);
   if (s.model && s.alias) rows.push(["Apps use", s.alias + " (always the loaded model)"]);
   const m = s.memory;
   if (m && m.shared && m.ram_total) rows.push(["Shared memory", gb1(m.ram_used) + " / " + gb1(m.ram_total)
@@ -2034,6 +2035,10 @@ function renderStatus(s) {
 
 function renderControls() {
   const s = snap;
+  if (s.redacted) {           // opened under a name that isn't the PC's: no controls here
+    $("off").hidden = $("unlock").hidden = $("panel").hidden = true;
+    return;
+  }
   $("off").hidden = !!s.controls;
   $("unlock").hidden = !s.controls || !!pw;
   $("panel").hidden = !s.controls || !pw;
@@ -2191,6 +2196,7 @@ def public_snapshot(snap, hint):
     """Only what a client needs to decide whether to call the AI now: for requests that
     name this PC by something other than its own name or address."""
     out = {k: snap[k] for k in PUBLIC_FIELDS if k in (snap or {})}
+    out["redacted"] = True
     out["notice"] = "Details are hidden under this name. " + hint
     return out
 
@@ -3263,9 +3269,15 @@ class Watcher:
             # Many devices (or one using many addresses) guessing together: refuse devices
             # that haven't given the right password lately, so the owner's still work.
             recent = [t for t in self.recent_failures if now - t < 600]
-            if len(recent) >= self.NETWORK_FAILURES and client not in self.trusted:
+            trusted = now - self.trusted.get(client, -1e9) < 86400
+            if len(recent) >= self.NETWORK_FAILURES and not trusted:
                 wait = int(recent[-self.NETWORK_FAILURES] + self.NETWORK_LOCK - now) + 1
                 if wait > 0:
+                    if now - self.lock_event_at > 600:
+                        self.lock_event_at = now
+                        self.event("status page: many wrong control passwords from several "
+                                   "devices; devices that haven't signed in lately are refused "
+                                   f"for {ago(self.NETWORK_LOCK)}", "warn")
                     return 429, {"error": "Too many wrong passwords on this network lately. "
                                           f"Try again in {wait} s."}
             if not hmac.compare_digest(str(password).encode(), secret.encode()):
@@ -3921,6 +3933,15 @@ def cmd_status(args):
             die(f"can't reach {host}:{port} ({getattr(e, 'reason', e)}). If it's asleep, "
                 f"wake it with: gpu-yield wake {host_key(host, port)}")
         remember_host(host, port, st)
+        if st.get("redacted"):
+            # Answered under a name that isn't the PC's own: only the public part.
+            state = st.get("state")
+            print(f"Host:     {host}, gpu-yield {clean_text(str(st.get('version')))}")
+            print(f"AI:       {'ready' if st.get('ai_available') else 'not available'} "
+                  f"({clean_text(str(STATE_TEXT.get(state, state)))})")
+            print(f"Note:     that PC shares its details only under its own name or IP "
+                  f"address. Try its IP, or its own name (like NAME.local).")
+            return
         try:
             print(f"Host:     {st.get('host')} ({host}), gpu-yield {st.get('version')}")
             print_status(st)
@@ -4078,6 +4099,9 @@ def remember_host(host, port, st):
     entry = hosts.get(key, {})
     if st.get("mac"):
         entry["mac"] = st["mac"]
+        entry.pop("redacted", None)
+    elif st.get("redacted"):
+        entry["redacted"] = True       # this name gets only the public status
     try:
         entry["ip"] = socket.gethostbyname(host)
     except OSError:
@@ -4143,6 +4167,11 @@ def cmd_wake(args):
         return
     if kind == "silent":
         info = hosts.get(host_key(host, port), {})
+        if not info.get("mac") and info.get("redacted"):
+            die(f"{host} isn't that PC's own name, so it doesn't share its network card "
+                "address under it. While it's awake, run once with its IP address or its own "
+                "name (like NAME.local):\n  gpu-yield status --host <IP or NAME.local>\n"
+                "or pass the address directly: gpu-yield wake AA:BB:CC:DD:EE:FF")
         if not info.get("mac"):
             die(f"don't know {host}'s network card address yet. While it's awake, run once:\n"
                 f"  gpu-yield status --host {target}\n"
@@ -4685,8 +4714,18 @@ def cmd_doctor(args):
         rules = run(["firewall-cmd", "--list-rich-rules"])
         has_v6 = any('family="ipv6"' in r and f'port="{cfg["port"]}"' in r and "reject" in r
                      for r in rules.stdout.splitlines())
-        global_v6 = run(["ip", "-6", "addr", "show", "scope", "global"]).stdout.strip()
-        if rules.returncode == 0 and not has_v6 and global_v6:
+        public_v6 = []
+        for a in re.findall(r"inet6 ([0-9a-fA-F:]+)/", run(["ip", "-6", "addr", "show",
+                                                           "scope", "global"]).stdout):
+            try:
+                if ipaddress.ip_address(a).is_global:      # not fd00::/8 and the like
+                    public_v6.append(a)
+            except ValueError:
+                pass
+        if rules.returncode:
+            note("couldn't read the firewall rules without sudo, so the IPv6 check was "
+                 "skipped (gpu-yield firewall adds what's needed)")
+        elif not has_v6 and public_v6:
             bad(f"Ollama's port {cfg['port']} also answers on this PC's IPv6 addresses, which "
                 "can be reachable from outside your network: run gpu-yield firewall to limit "
                 "it to local addresses")

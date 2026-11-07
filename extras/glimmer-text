@@ -443,7 +443,12 @@ def download(url, final, size, sha256, retries=6):
         final.replace(bad)
         warn(f"the earlier download didn't match the checksum; set it aside as {bad}")
     if (part.exists() or part.is_symlink()) and not ours:
-        die(f"{part} already exists and wasn't started by glimmer-text; move it, or use --dir")
+        # Older versions left no marker. A plain partial file no bigger than the build can
+        # only be continued and then checked against the checksum, so carry on with it.
+        if part.is_symlink() or not part.is_file() or part.stat().st_size > size:
+            die(f"{part} is in the way and isn't a partial download of this build; move or "
+                "delete it, or use --dir")
+        ours = True
     try:
         fd = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
         os.write(fd, b"downloaded by glimmer-text\n")
@@ -464,7 +469,7 @@ def download(url, final, size, sha256, retries=6):
                 if have:                          # it must continue exactly where we stopped
                     m = re.match(r"bytes (\d+)-", r.headers.get("Content-Range") or "")
                     if not m or int(m.group(1)) != have:
-                        have = 0
+                        part.unlink(missing_ok=True)   # start over rather than splice
                         raise http.client.HTTPException("the server resumed at the wrong place")
                 last = 0.0
                 with open_part(part, append=bool(have)) as out:
@@ -693,7 +698,8 @@ def cmd_install(args, interactive=None):
     create_model(name, gguf, port)
     if args.keep or not ours:
         log(f"  kept the downloaded file: {gguf}" if ours else
-            f"  left {gguf} where it was: it was there before, so it's yours")
+            f"  {gguf} was already there before this run, so it was left in place; delete it "
+            "if you don't need it (Ollama has its own copy now)")
     else:
         gguf.unlink(missing_ok=True)             # Ollama has its own copy now
         gguf.with_name(gguf.name + ".glimmer-text").unlink(missing_ok=True)

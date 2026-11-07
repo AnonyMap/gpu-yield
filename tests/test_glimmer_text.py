@@ -358,10 +358,14 @@ d3 = Path(tempfile.mkdtemp())
 (d3 / "model.gguf").write_bytes(b"my own file")
 code, err = attempt(g3.download, url, d3 / "model.gguf", len(BLOB), SHA)
 assert code == 1 and "isn't this build" in err and (d3 / "model.gguf").read_bytes() == b"my own file"
-# a partial file this script didn't start is left alone
-(d3 / "other.gguf.part").write_bytes(b"someone else's")
-code, err = attempt(g3.download, url, d3 / "other.gguf", len(BLOB), SHA)
-assert code == 1 and "wasn't started by glimmer-text" in err
+# a partial download from an older version (no marker) carries on; one that can't be is refused
+served["drop_once"] = False
+(d3 / "old.gguf.part").write_bytes(BLOB[:700_000])
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    assert g3.download(url, d3 / "old.gguf", len(BLOB), SHA)[0].read_bytes() == BLOB
+(d3 / "big.gguf.part").write_bytes(b"x" * (len(BLOB) + 1))
+code, err = attempt(g3.download, url, d3 / "big.gguf", len(BLOB), SHA)
+assert code == 1 and "in the way" in err
 # a planted link isn't followed when writing
 victim = d3 / "victim"; victim.write_bytes(b"precious")
 (d3 / "linked.gguf.glimmer-text").write_text("x")
@@ -370,6 +374,24 @@ served["drop_once"] = False
 with contextlib.redirect_stdout(io.StringIO()):
     code, err = attempt(g3.download, url, d3 / "linked.gguf", len(BLOB), SHA)
 assert victim.read_bytes() == b"precious" and code == 1 and "couldn't write" in err, err
+# a server that resumes at the wrong place: the partial file starts over, not spliced
+class Wrong(Files):
+    def do_GET(self):
+        rng = self.headers.get("Range")
+        if rng:                                  # claims to resume, but from the start
+            self.send_response(206); self.send_header("Content-Length", str(len(BLOB)))
+            self.send_header("Content-Range", f"bytes 0-{len(BLOB) - 1}/{len(BLOB)}")
+            self.end_headers(); self.wfile.write(BLOB); return
+        self.send_response(200); self.send_header("Content-Length", str(len(BLOB)))
+        self.end_headers(); self.wfile.write(BLOB)
+wsrv = ThreadingHTTPServer(("127.0.0.1", 0), Wrong)
+threading.Thread(target=wsrv.serve_forever, daemon=True).start()
+(d3 / "resume.gguf.glimmer-text").write_text("x")
+(d3 / "resume.gguf.part").write_bytes(BLOB[:1000])
+with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+    got, _ = g3.download(f"http://127.0.0.1:{wsrv.server_address[1]}/f", d3 / "resume.gguf", len(BLOB), SHA)
+assert got.read_bytes() == BLOB
+wsrv.shutdown()
 # no checksum, no download
 code, err = attempt(g3.download, url, d3 / "nosum.gguf", len(BLOB), "")
 assert code == 1 and "no checksum" in err

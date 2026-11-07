@@ -325,6 +325,13 @@ assert len(w.failures) <= 1000
 code, reply = w.api("auth", {}, "wrong", client="10.2.0.1")
 assert code == 429 and "network" in reply["error"], reply
 assert w.api("auth", {}, "rightpassword", client="10.0.0.9")[0] == 200, "the owner still gets in"
+events = []
+w.event = lambda text, kind="info": events.append(text)
+w.lock_event_at = -1e9
+w.api("auth", {}, "wrong", client="10.3.0.1")
+assert any("several devices" in e for e in events), events
+w.trusted["10.0.0.9"] -= 2 * 86400                              # signed in two days ago
+assert w.api("auth", {}, "rightpassword", client="10.0.0.9")[0] == 429, "trust expires"
 ok("lockouts: a flood of addresses can't wipe them; network-wide guessing is slowed, not the owner")
 
 # model names: Ollama's long forms are the same model
@@ -390,6 +397,21 @@ rel.shutdown(); rel.server_close()
 assert gy.ollama_download_base() == f"{gy.OLLAMA_RELEASES}/latest/download", "unreachable: latest"
 gy.OLLAMA_RELEASES = real
 ok("Ollama downloads come from one release, by version, with that release's checksums")
+
+# a status page opened under another name: the CLI says so, and wake explains what to do
+gy.load_hosts = lambda: {gy.host_key(*gy.split_host("alias.example")): {"redacted": True, "ip": "192.168.1.5"}}
+gy.fetch_remote_status = lambda *a, **k: (_ for _ in ()).throw(OSError("timed out"))
+gy.refused = lambda e: False
+with contextlib.redirect_stderr(io.StringIO()) as err:
+    assert attempt(gy.cmd_wake, types.SimpleNamespace(target="alias.example", no_wait=False)) == 1
+assert "isn't that PC's own name" in err.getvalue(), err.getvalue()
+gy.fetch_remote_status = lambda *a, **k: {"state": "ai", "ai_available": True, "version": "1.13.4",
+                                          "redacted": True, "notice": "Details are hidden"}
+gy.remember_host = lambda *a: None
+with contextlib.redirect_stdout(io.StringIO()) as out:
+    gy.cmd_status(types.SimpleNamespace(host="alias.example"))
+assert "AI:       ready" in out.getvalue() and "own name or IP" in out.getvalue(), out.getvalue()
+ok("under a name that isn't the PC's own, status and wake say to use its IP or own name")
 
 # the firewall limits Ollama's IPv6 side to local addresses (a fresh copy: this file
 # stubbed open_firewall out earlier)
