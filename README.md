@@ -158,7 +158,7 @@ Don't want the page? `gpu-yield config status_page false`.
 | `retry_after` | Seconds to wait before trying again (0 when available) |
 | `games` | Running games, by name |
 | `model`, `context_length`, `model_status` | The configured model and its load state |
-| `in_use`, `last_used` | Whether another machine is using the AI now, and when it last did (Unix time) |
+| `in_use`, `last_used` | Whether an app is using the AI now (from another machine, or a lasting connection on this PC), and when one last did (Unix time) |
 | `notice` | A problem worth fixing, such as an app loading a different context |
 | `cooldown_remaining`, `since` | Seconds until the model reloads after a game; when the current state began |
 | `alias`, `loaded_name` | The fixed model name for apps, and the name the model is loaded under |

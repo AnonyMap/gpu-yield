@@ -2,6 +2,38 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.13.5 (2026-11-09)
+Stability, bug and security fixes from an audit of the watcher's state handling, the setup, update and model flows, and game detection.
+
+**Games always get the GPU**
+- **A failed Ollama stop is retried.** If stopping Ollama failed when a game started (systemd slow or busy while the game loads), gpu-yield never tried again, and the game ran with the model still holding GPU memory. It now retries every 2 seconds, and on the third failure kills Ollama outright.
+- **A slow game-name lookup can't delay the stop.** The first time a game is seen, gpu-yield looks up its name in every Steam library folder. A library on a sleeping disk or an unreachable network share could hold up stopping Ollama, possibly indefinitely. The lookup now happens on the side: the game shows as "Steam AppId N" until its name arrives.
+- **Ignoring a Steam app no longer hides other games.** Any ignored Steam app, such as Heroic added as a non-Steam shortcut and put on `ignore_appids`, switched off detection of Windows games outside Steam, so Heroic and Lutris games were missed. Now only games that count do that, and a Windows program is skipped only when Proton marks it as the ignored app's.
+- **Windows game launchers** (Battle.net, EA app, Ubisoft Connect, GOG Galaxy, Epic, Rockstar) don't count as games, so one left in the tray after a game doesn't keep the AI off.
+- **Health checks that unload a model wait at most 5 seconds** for Ollama, so a stuck Ollama can't hold up game detection for a minute.
+
+**Out-of-memory protection holds**
+- **Restarting a stopped Ollama no longer undoes a give-up.** If Ollama was found stopped, after an out-of-memory kill or after a model that didn't fit was refused, gpu-yield restarted it and loaded the model straight away. That skipped the 5-minute wait and cancelled giving up on a model that keeps running out of memory, which could loop. Now Ollama is restarted without loading until the wait is over, and a second out-of-memory kill gives up as intended.
+
+**The fixed name for apps**
+- **If gpu-yield can't save which model the fixed name points at** (a full disk, say), it no longer makes the copy. Before, the unrecorded copy looked like someone else's model from then on and was never repointed, so apps kept getting the old model. The record is also written atomically now.
+
+**Setup, updates and models**
+- **Updating Ollama keeps the AI running during the download.** `update --ollama`, setup's reinstall and automatic updates used to stop the AI before downloading, which can take minutes for ROCm, and for nothing if the download failed. Ollama is now downloaded and checked first, and the AI is stopped only to swap it in. An automatic update also checks that the PC is still idle before the swap.
+- **Automatic updates wait for apps and downloads on this PC.** Only other machines used to count as using the AI, so an app on the same PC, or a `gpu-yield model` download, could be cut off by an automatic update. A connection from this PC that stays open counts now; gpu-yield's own checks don't.
+- **Setup installs itself atomically**, and starts the watcher again if a later step fails. A full disk could leave a cut-off script that couldn't even run `rollback`, with the AI stopped.
+- **`config` and `model` won't restart the watcher during a download or speed test** from the status page, which cut it off silently. They say so and change nothing, as `restart` already did.
+- **`gpu-yield config env.OLLAMA_HOST` is refused.** gpu-yield sets it from the `port` setting, and changing it cut the watcher off from Ollama.
+- **A failed firewall step is reported.** If a `sudo` step failed, setup used to finish quietly without the rules, the IPv6 limit included. It now warns and says how to retry, and `gpu-yield firewall` exits with an error.
+- **After an update, a watcher that's running but not set to start at boot** is restarted on the new version too.
+- **`setup --model` checks the name before changing anything.** It used to save `--context` first and then say "nothing changed".
+- **`gpu-yield restart` interrupted by a game or a pause** says so and exits normally, instead of reporting a failure.
+- **With your own Ollama service and no `ollama` command,** `gpu-yield model` explains how to download the model instead of crashing.
+- **Ctrl-C during an Ollama download** no longer leaves a half-unpacked copy behind, and `uninstall --purge` removes leftover copies too.
+
+**Network**
+- **The stand-in answers on IPv6 as well**, as Ollama does, so an app that reaches the PC over IPv6 during a game gets the 503 and its reason instead of a refused connection.
+
 ## 1.13.4 (2026-11-07)
 Security and bug fixes from an audit of the status page, the parts that run on the PC, and glimmer-text. Nothing was high severity.
 

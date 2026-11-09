@@ -38,10 +38,11 @@ gpu_dir = home / "dri"; gpu_dir.mkdir(); (gpu_dir / "renderD128").write_text("")
 gy.GPU_DEVICE_DIR = str(gpu_dir) + "/"
 
 
-def spawn_gpu(argv0):
+def spawn_gpu(argv0, env=None):
     """A fake Windows program that has the (fake) GPU device open, like a real game."""
     script = f"f = open({str(gpu_dir / 'renderD128')!r}); import time; time.sleep(120)"
     return subprocess.Popen([argv0, "-c", script], executable=sys.executable,
+                            env=dict(os.environ, **(env or {})),
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -72,10 +73,17 @@ ok("Wine helpers, installers, and programs not using the GPU don't count as game
 g = spawn_gpu(r"Z:\games\Hades2\Hades2.exe")
 assert labels() == ["Hades2.exe (Wine, outside Steam)"]
 assert labels(detect_wine=False) == []
+g.kill(); g.wait()
 r = spawn("reaper", "SteamLaunch", "AppId=1820000", "--", "game")
+pg = spawn_gpu(r"Z:\games\Riftbreaker\Riftbreaker.exe", env={"SteamAppId": "1820000"})
 assert labels() == ["The Riftbreaker (AppId 1820000)"]
 assert labels(ignore_appids=["1820000"]) == [], "an ignored Steam Proton game must not count via Wine"
-for p in (r, w, g, *others):
+g = spawn_gpu(r"Z:\games\Hades2\Hades2.exe")          # a Heroic game beside it
+assert labels(ignore_appids=["1820000"]) == ["Hades2.exe (Wine, outside Steam)"], \
+    "an ignored Steam app (Heroic as a shortcut, say) mustn't hide Heroic's games"
+z = spawn("reaper", "SteamLaunch", "AppId=0", "--", "x")
+assert labels(ignore_appids=["1820000"]) == ["Hades2.exe (Wine, outside Steam)"]
+for p in (r, w, g, pg, z, *others):
     p.kill(); p.wait()
 assert labels() == []
 ok("a Windows game using the GPU counts, only when no Steam game is running; ignore_appids still works")

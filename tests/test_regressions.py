@@ -64,16 +64,23 @@ assert attempt(gy.cmd_model, types.SimpleNamespace(name="gpu-yield")) and not pu
 assert gy.load_config()["model"] == ""
 ok("gpu-yield model refuses the fixed name before downloading")
 
-# --- setup: a failed Ollama reinstall starts the watcher again
+# --- setup: a failed Ollama reinstall leaves the watcher running (the download happens
+# before anything is stopped)
 calls.clear()
 gy.check_conflicts = lambda args: None
 def broken_install(backend):
     gy.die("download failed")
-gy.install_ollama = broken_install
+gy.stage_ollama = broken_install
 gy.OLLAMA_BIN.parent.mkdir(parents=True, exist_ok=True)
 gy.OLLAMA_BIN.write_text("")
 args = types.SimpleNamespace(model="m:1", context=None, backend=None, reinstall=True, yes=True,
                              skip_pull=True, no_firewall=True)
+assert attempt(gy.cmd_setup, args)
+assert ("stop", gy.WATCHER_UNIT) not in calls, calls
+# and if a later step fails once the watcher is stopped, it's started again
+gy.stage_ollama = lambda backend: gy.HOME / "staged"
+gy.swap_ollama = lambda staged: gy.die("disk full")
+calls.clear()
 assert attempt(gy.cmd_setup, args)
 assert ("stop", gy.WATCHER_UNIT) in calls and calls[-1] == ("start", gy.WATCHER_UNIT), calls
 args.context, args.model = 64, None
@@ -211,7 +218,7 @@ w.ollama.active = lambda: True
 w.ollama.ready = lambda: False
 stops = []
 w.ollama.stop = lambda: stops.append(1)
-w.go_on = lambda why: stops.append(why)
+w.go_on = lambda why, load=True: stops.append(why)
 for t in range(15, 120, 15):
     w.last_health = 0
     w.health(1000.0 + t)

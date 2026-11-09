@@ -325,7 +325,8 @@ assert call("POST", "/api/model", {"name": "gpu-yield"}, "hunter2")[0] == 400
 assert w.snapshot()["alias"] == "gpu-yield" and w.snapshot()["loaded_name"] == "gpu-yield"
 ok("the fixed name follows the loaded model, isn't listed as a model, can't be deleted or chosen")
 
-# --- speed test
+# --- speed test (once the downloads above have hung up: a lasting local connection is use)
+wait(lambda: not w.in_use, msg="downloads to finish")
 code, body, _ = call("POST", "/api/speed", {}, "hunter2")
 assert code == 202, body
 wait(lambda: w.snapshot()["speed"]["state"] == "done", msg="speed test")
