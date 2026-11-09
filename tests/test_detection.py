@@ -75,10 +75,12 @@ assert labels() == ["Hades2.exe (Wine, outside Steam)"]
 assert labels(detect_wine=False) == []
 g.kill(); g.wait()
 r = spawn("reaper", "SteamLaunch", "AppId=1820000", "--", "game")
-pg = spawn_gpu(r"Z:\games\Riftbreaker\Riftbreaker.exe", env={"SteamAppId": "1820000"})
+pg = spawn_gpu(r"Z:\games\Riftbreaker\Riftbreaker.exe", env={"STEAM_COMPAT_APP_ID": "1820000", "SteamAppId": "1820000"})
 assert labels() == ["The Riftbreaker (AppId 1820000)"]
 assert labels(ignore_appids=["1820000"]) == [], "an ignored Steam Proton game must not count via Wine"
-g = spawn_gpu(r"Z:\games\Hades2\Hades2.exe")          # a Heroic game beside it
+# a Heroic/Lutris game beside it: umu marks its own (often 0), and a game started from an
+# ignored Heroic shortcut inherits the shortcut's SteamAppId. Neither hides it.
+g = spawn_gpu(r"Z:\games\Hades2\Hades2.exe", env={"STEAM_COMPAT_APP_ID": "0", "SteamAppId": "1820000"})
 assert labels(ignore_appids=["1820000"]) == ["Hades2.exe (Wine, outside Steam)"], \
     "an ignored Steam app (Heroic as a shortcut, say) mustn't hide Heroic's games"
 z = spawn("reaper", "SteamLaunch", "AppId=0", "--", "x")

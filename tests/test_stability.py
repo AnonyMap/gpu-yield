@@ -91,14 +91,32 @@ for o in (FakeOllama(stop_fails=2), FakeOllama(raises=True)):
     for t in range(3):
         w.step({1: "Game"}, False, False, 102.0 + 2 * t)
     assert not o.running and w.standin.started == 1 and not w.stop_pending, (o.stops, w.stop_pending)
-# a stop that never works is killed outright on the third try
+# a stop that never works is killed outright on the third try, and then stopped for good,
+# so systemd doesn't restart it during the game; it counts only once systemd confirms it
+killed = lambda: any(c[:2] == ("kill", "--signal=SIGKILL") for c in calls)
+def systemd_answers(*a):
+    calls.append(a)
+    out = ("inactive" if killed() else "active") if a[0] == "show" else ""
+    return types.SimpleNamespace(returncode=0, stdout=out, stderr="")
+gy.user_systemctl = systemd_answers
 calls.clear()
 o = FakeOllama(stop_fails=99)
-o.active = lambda: not any(c[:2] == ("kill", "--signal=SIGKILL") for c in calls)
+o.ready = lambda: not killed()
 w = watcher(o)
 for t in range(3):
     w.step({1: "Game"}, False, False, 100.0 + 2 * t)
-assert ("kill", "--signal=SIGKILL", o.unit) in calls and not w.stop_pending
+assert ("kill", "--signal=SIGKILL", o.unit) in calls and ("stop", o.unit) in calls
+assert not w.stop_pending and w.standin.started == 1
+# systemd too busy to say: still pending, tried again on the next pass
+gy.user_systemctl = lambda *a: calls.append(a) or types.SimpleNamespace(returncode=1, stdout="", stderr="timeout")
+calls.clear()
+o = FakeOllama(stop_fails=99)
+o.ready = lambda: True
+w = watcher(o)
+for t in range(4):
+    w.step({1: "Game"}, False, False, 100.0 + 2 * t)
+assert w.stop_pending and w.standin.started == 0 and o.stops == 4
+gy.user_systemctl = systemctl
 ok("a failed Ollama stop at game start is retried, then forced, until the game gets the GPU")
 
 # --- restarting a stopped Ollama keeps a give-up and a wait before the next try
@@ -118,6 +136,22 @@ for setup in ("give_up", "backoff"):
     w.health(time.monotonic())
     assert o.running and not warms, setup
     assert (w.given_up() if setup == "give_up" else w.warm_failed_at is not None), setup
+# a give-up lasts through a game, a pause and sleep; once it's cleared, it stays cleared
+o = FakeOllama()
+w = watcher(o)
+w.give_up_on_ram()
+warms = []
+w.start_warm = lambda: warms.append(1)
+w.state, w.cooldown_until = "cooldown", 0
+w.step({}, False, False, 200.0)
+assert w.state == "ai" and not warms and w.given_up(), "cooldown over: no reload"
+w2 = watcher(FakeOllama())
+w2.give_up_on_ram()
+gy.Watcher.start_warm(w2)               # e.g. gpu-yield restart: a fresh try
+w2.warm_gen += 1                        # (the load thread isn't needed here)
+w2.ollama.start = lambda: False         # then one start fails
+w2.go_on("Ollama is not running; restarting it")
+assert not w2.given_up() and w2.warm_retry == 30, (w2.warm_failed_at, w2.warm_retry)
 ok("restarting a stopped Ollama doesn't undo a give-up or the wait before the next try")
 
 # --- the fixed name isn't copied when its record can't be saved
@@ -234,6 +268,10 @@ if not gy.CONFIG_FILE.exists():
 with contextlib.redirect_stderr(io.StringIO()) as err:
     assert attempt(gy.cmd_config, types.SimpleNamespace(key="env.OLLAMA_HOST", value="0.0.0.0:9999")) != 0
 assert "set by gpu-yield" in err.getvalue()
+gy.read_status = lambda: {}
+with contextlib.redirect_stdout(io.StringIO()):
+    assert attempt(gy.cmd_config, types.SimpleNamespace(key="env.OLLAMA_HOST", value="")) == 0, \
+        "one set before can still be removed"
 gy.read_status = lambda: {"downloads": [{"name": "qwen3:14b", "state": "running"}]}
 before = gy.CONFIG_FILE.read_text()
 with contextlib.redirect_stderr(io.StringIO()) as err:

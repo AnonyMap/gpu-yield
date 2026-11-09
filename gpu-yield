@@ -707,10 +707,11 @@ def scan_games(cfg):
         # Wine also runs briefly for things that aren't games: Steam's install scripts,
         # redistributable installers, Proton's own helpers. A game draws with the GPU, so
         # only a Windows program that has the GPU open counts.
-        # A Windows program Steam started for an ignored AppId is part of that app, not a
-        # game: Proton marks it with the AppId. (Heroic and Lutris games carry their own.)
+        # A Windows program Steam ran under Proton for an ignored AppId is part of that
+        # app, not a game: Steam marks it with STEAM_COMPAT_APP_ID. Only that mark counts,
+        # and only for AppIds you listed: Heroic and Lutris (umu) set their own, often 0.
         gpu = [(pid, name) for pid, name in exes
-               if _uses_gpu(pid) and _steam_appid(pid) not in ignore | {"0"}]
+               if _uses_gpu(pid) and not (ignore and _steam_appid(pid) in ignore)]
         _GPU_EXES[:] = [int(pid) for pid, _ in gpu]
         playing = [name for _, name in gpu]
         if playing:
@@ -740,13 +741,14 @@ def _uses_gpu(pid):
 
 
 def _steam_appid(pid):
-    """The Steam AppId Proton gave a process (SteamAppId / STEAM_COMPAT_APP_ID), or None."""
+    """The AppId Steam's Proton launch gave a process (STEAM_COMPAT_APP_ID), or None.
+    SteamAppId isn't used: games started from a non-Steam shortcut inherit the shortcut's."""
     try:
         with open(f"/proc/{pid}/environ", "rb") as f:
             env = f.read(1 << 20)
     except OSError:
         return None
-    for var in (b"SteamAppId=", b"STEAM_COMPAT_APP_ID="):
+    for var in (b"STEAM_COMPAT_APP_ID=",):
         m = re.search(rb"(?:^|\0)" + re.escape(var) + rb"(\d+)", env)
         if m:
             return m.group(1).decode()
@@ -774,10 +776,11 @@ _WINE_HELPERS = {s.encode() for s in (
     "xalia.exe", "iscriptevaluator.exe", "steamerrorreporter.exe",
     "steamerrorreporter64.exe", "crashhandler.exe", "unitycrashhandler64.exe",
     # Windows game launchers, which can sit in the tray with the GPU open after a game
-    "battle.net.exe", "agent.exe", "eadesktop.exe", "eabackgroundservice.exe",
+    # (only distinctive names: generic ones like launcher.exe can be a game's own)
+    "battle.net.exe", "eadesktop.exe", "eabackgroundservice.exe",
     "ealauncher.exe", "upc.exe", "ubisoftconnect.exe", "uplaywebcore.exe",
     "galaxyclient.exe", "galaxyclient helper.exe", "epicgameslauncher.exe",
-    "epicwebhelper.exe", "rockstarservice.exe", "launcher.exe", "socialclubhelper.exe")}
+    "epicwebhelper.exe", "rockstarservice.exe", "socialclubhelper.exe")}
 # Redistributable installers and uninstallers Steam and launchers run in the background.
 _WINE_HELPER_PREFIXES = tuple(s.encode() for s in (
     "vc_redist", "vcredist", "dxsetup", "dotnet", "ndp", "physx", "oalinst",
@@ -2720,9 +2723,13 @@ class Watcher:
             log(f"could not stop {self.ollama.unit}: {e}")
             stopped = False
         if not stopped and self.stop_attempts >= 3:
-            # A stop that keeps failing: kill it outright. The GPU memory goes with it.
+            # A stop that keeps failing: kill it outright (the GPU memory goes with it),
+            # then stop the unit so systemd doesn't restart it during the game.
             user_systemctl("kill", "--signal=SIGKILL", self.ollama.unit)
-            stopped = not self.ollama.active()
+            user_systemctl("stop", self.ollama.unit)
+            state = user_systemctl("show", "-p", "ActiveState", "--value", self.ollama.unit)
+            stopped = state.returncode == 0 and state.stdout.strip() in ("inactive", "failed") \
+                and not self.ollama.ready()
         if not stopped:
             if self.stop_attempts == 1:
                 self.event("couldn't stop Ollama for the game; retrying", "error")
@@ -2745,9 +2752,10 @@ class Watcher:
         self.event(why)
         self.last_restart = time.monotonic()
         if not self.ollama.start():
-            self.warm_status = "failed: Ollama would not start (journalctl --user -u " \
-                               f"{self.cfg['ollama_unit']})"
-            self.warm_failed_at = time.monotonic()
+            if not self.given_up():      # a give-up stays one; otherwise try again soon
+                self.warm_status = "failed: Ollama would not start (journalctl --user -u " \
+                                   f"{self.cfg['ollama_unit']})"
+                self.warm_failed_at, self.warm_retry = time.monotonic(), 30
             return
         self.ping_failures = self.empty_checks = 0
         if not load:
@@ -2867,6 +2875,7 @@ class Watcher:
     def start_warm(self):
         self.warm_gen += 1
         self.warm_failed_at = None
+        self.warm_retry = 300            # a give-up ends here; it can't come back by itself
         self.low_memory_at = None
         self.warming = True
         threading.Thread(target=self._warm, args=(self.warm_gen,), name="warmup",
@@ -3127,18 +3136,18 @@ class Watcher:
                 "unless another game starts")
         elif self.state == "cooldown":
             if now >= self.cooldown_until:
-                self.go_on("cooldown over; starting Ollama")
+                self.go_on("cooldown over; starting Ollama", load=not self.given_up())
         elif self.state is None:
             self.go_on("no game running; starting Ollama")
         elif self.state == "paused":
             self.block_reason = ""
             self.client_spills.clear()
-            self.go_on("resumed; starting Ollama")
+            self.go_on("resumed; starting Ollama", load=not self.given_up())
         elif self.state == "ai":
             if slept and self.cfg["restart_after_suspend"]:
                 self.oom_retried, self.vram_report = False, ""
                 self.ollama.stop()
-                self.go_on("woke from sleep; restarting Ollama")
+                self.go_on("woke from sleep; restarting Ollama", load=not self.given_up())
             else:
                 self.health(now)
         if self.state in self.OFF_STATES:
@@ -4533,8 +4542,18 @@ def busy_reason(st):
     return ""
 
 
-def watcher_busy():
-    return bool(busy_reason(read_status()))
+def watcher_busy(idle_minutes=0):
+    """A download or speed test is running; with idle_minutes, also an app using the AI
+    now or within that many minutes, or a model loading."""
+    st = read_status() or {}
+    if busy_reason(st):
+        return True
+    if not idle_minutes:
+        return False
+    last = st.get("last_used")
+    return bool(st.get("in_use") or (isinstance(last, (int, float))
+                                     and time.time() - last < idle_minutes * 60)
+                or str(st.get("model_status", "")).startswith(("loading", "starting")))
 
 
 def cmd_restart(args):
@@ -5370,7 +5389,7 @@ def cmd_config(args):
                   "once on the status page.)")
     if key == "control_password" and args.value and len(args.value) < 8:
         die("use at least 8 characters for the control password; nothing changed")
-    if key == "env.OLLAMA_HOST":
+    if key == "env.OLLAMA_HOST" and args.value.strip():
         die("OLLAMA_HOST is set by gpu-yield from the port setting (gpu-yield config port "
             "N); changing it here would lose the AI's connection to Ollama. Nothing changed")
     if key not in LIVE_SETTINGS and \
@@ -5870,7 +5889,7 @@ def cmd_update(args):
         else:
             log(f"updating Ollama {o_installed} -> {o_latest} (backend {resolve_backend(cfg)})")
             staged = stage_ollama(resolve_backend(cfg))     # the AI keeps running meanwhile
-            if args.if_idle and (game_running(cfg) or watcher_busy()):
+            if args.if_idle and (game_running(cfg) or watcher_busy(idle_minutes=15)):
                 shutil.rmtree(staged, ignore_errors=True)
                 log("the PC got busy during the download; Ollama update postponed")
                 return
