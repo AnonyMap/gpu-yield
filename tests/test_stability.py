@@ -152,6 +152,26 @@ w2.warm_gen += 1                        # (the load thread isn't needed here)
 w2.ollama.start = lambda: False         # then one start fails
 w2.go_on("Ollama is not running; restarting it")
 assert not w2.given_up() and w2.warm_retry == 30, (w2.warm_failed_at, w2.warm_retry)
+# after a game, the give-up's own message is shown again, not "not loaded"
+w3 = watcher(FakeOllama())
+w3.give_up_on_ram()
+msg = w3.warm_status
+w3.go_off("gaming", "game started")
+w3.state, w3.cooldown_until = "cooldown", 0
+w3.step({}, False, False, 300.0)
+assert w3.warm_status == msg and w3.given_up(), w3.warm_status
+# a model change during the game ends the give-up, so the new model loads afterwards
+gy.set_config_values = lambda values: None
+gy.ensure_ollama_unit = lambda cfg: None
+w3.state = "gaming"
+w3.apply_settings({"model": "other:1"})
+assert not w3.given_up()
+# gpu-yield restart while given up, and Ollama won't start: a 30 s retry, not a stuck status
+w4 = watcher(FakeOllama())
+w4.give_up_on_ram()
+w4.ollama.start = lambda: False
+w4.go_on("starting Ollama again with the GPU memory cleared")
+assert not w4.given_up() and w4.warm_retry == 30 and w4.warm_status.startswith("failed: Ollama would not start")
 ok("restarting a stopped Ollama doesn't undo a give-up or the wait before the next try")
 
 # --- the fixed name isn't copied when its record can't be saved

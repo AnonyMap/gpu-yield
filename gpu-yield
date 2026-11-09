@@ -2689,6 +2689,7 @@ class Watcher:
         self.stop_pending = False        # a stop for a game or pause that hasn't worked yet
         self.stop_attempts = 0
         self.stop_just_tried = False
+        self.giveup_status = ""          # the give-up's message, to show again after a game
 
     # --- transitions
     def set_state(self, state):
@@ -2748,6 +2749,9 @@ class Watcher:
         self.standin.stop()
         if load:
             self.warm_status = "starting Ollama"  # not "ready" from before, while restarting
+            self.warm_failed_at, self.warm_retry = None, 300    # a fresh try
+        elif self.given_up():
+            self.warm_status = self.giveup_status   # a game or pause in between replaced it
         self.set_state("ai")
         self.event(why)
         self.last_restart = time.monotonic()
@@ -3100,6 +3104,7 @@ class Watcher:
                 "keeps running the PC out of memory, so Linux keeps stopping Ollama")
         self.warm_status = (f"failed: {self.cfg['model']} {what}; not loading it again until "
                             "you change the model or context, or run gpu-yield restart")
+        self.giveup_status = self.warm_status
         self.warm_failed_at, self.warm_retry = time.monotonic(), 10**9
         self.event(self.warm_status)
 
@@ -3760,6 +3765,7 @@ class Watcher:
         self.cfg = self.ollama.cfg = new
         self.notice = ""
         self.oom_retried = False         # a new model or context gets its own retry
+        self.warm_failed_at, self.warm_retry = None, 300   # and ends a give-up, as it says
         self.warned.clear()
         ensure_ollama_unit(new)
         source, self.change_source = self.change_source, "the status page"
@@ -4542,9 +4548,9 @@ def busy_reason(st):
     return ""
 
 
-def watcher_busy(idle_minutes=0):
+def watcher_busy(idle_minutes=0, loading=True):
     """A download or speed test is running; with idle_minutes, also an app using the AI
-    now or within that many minutes, or a model loading."""
+    now or within that many minutes, or (if `loading`) a model loading."""
     st = read_status() or {}
     if busy_reason(st):
         return True
@@ -4553,7 +4559,7 @@ def watcher_busy(idle_minutes=0):
     last = st.get("last_used")
     return bool(st.get("in_use") or (isinstance(last, (int, float))
                                      and time.time() - last < idle_minutes * 60)
-                or str(st.get("model_status", "")).startswith(("loading", "starting")))
+                or (loading and str(st.get("model_status", "")).startswith(("loading", "starting"))))
 
 
 def cmd_restart(args):
@@ -5389,7 +5395,7 @@ def cmd_config(args):
                   "once on the status page.)")
     if key == "control_password" and args.value and len(args.value) < 8:
         die("use at least 8 characters for the control password; nothing changed")
-    if key == "env.OLLAMA_HOST" and args.value.strip():
+    if key == "env.OLLAMA_HOST" and args.value != "":
         die("OLLAMA_HOST is set by gpu-yield from the port setting (gpu-yield config port "
             "N); changing it here would lose the AI's connection to Ollama. Nothing changed")
     if key not in LIVE_SETTINGS and \
@@ -5847,6 +5853,7 @@ def cmd_update(args):
     if not latest:
         die(f"the {APP} file in {repo} has no VERSION line")
     newer = parse_version(latest) > parse_version(VERSION)
+    updated_self = False
     if newer and args.if_idle and auto_update_blocked(latest):
         log(f"skipping gpu-yield {latest}: you rolled back from it")
         newer = False
@@ -5870,6 +5877,7 @@ def cmd_update(args):
             print_whats_new(cfg, repo, VERSION, latest)
         log(f"updating gpu-yield {VERSION} -> {latest} from {repo}")
         install_script(source, f"version {latest} from {repo}")
+        updated_self = True
         SKIP_FILE.unlink(missing_ok=True)   # a deliberate update ends any rollback hold
         log(f"gpu-yield is now {latest}. Undo with: gpu-yield rollback")
     else:
@@ -5889,7 +5897,10 @@ def cmd_update(args):
         else:
             log(f"updating Ollama {o_installed} -> {o_latest} (backend {resolve_backend(cfg)})")
             staged = stage_ollama(resolve_backend(cfg))     # the AI keeps running meanwhile
-            if args.if_idle and (game_running(cfg) or watcher_busy(idle_minutes=15)):
+            # A gpu-yield update in this same run restarted the watcher, so its model reload
+            # is ours, not a sign of use.
+            if args.if_idle and (game_running(cfg) or
+                                 watcher_busy(idle_minutes=15, loading=not updated_self)):
                 shutil.rmtree(staged, ignore_errors=True)
                 log("the PC got busy during the download; Ollama update postponed")
                 return
