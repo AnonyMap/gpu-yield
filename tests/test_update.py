@@ -1,8 +1,11 @@
 """Self-update from GitHub and from a file: self-test, backup, rollback, migration."""
+import contextlib
+import io
 import json
 import re
 import threading
 import types
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from _util import SCRIPT, load, ok
@@ -105,4 +108,44 @@ calls.clear()
 assert update(file=str(f)) == 0 and installed() == "1.0.0"
 assert ("restart", gy.WATCHER_UNIT) in calls
 ok("installing a version without the _post-update step still restarts the watcher")
+
+# a GITHUB_API on plain http is refused unless it's loopback (this file's fake server)
+gy.GITHUB_API = "http://updates.example.com"
+with contextlib.redirect_stderr(io.StringIO()) as err:
+    assert update(check=True) == 1
+assert "https" in err.getvalue(), err.getvalue()
+gy.GITHUB_API = f"http://127.0.0.1:{srv.server_port}"
+assert update(check=True) == 0
+ok("a plain-http GITHUB_API is refused; loopback (the tests' fake) still works")
+
+# nothing fetched for an update follows a redirect down from https to plain http
+req = urllib.request.Request("https://example.com/file")
+try:
+    gy._SafeRedirect().redirect_request(req, None, 302, "Found",
+                                        {"Location": "http://example.com/file"},
+                                        "http://example.com/file")
+    raise AssertionError("a downgrade redirect must be refused")
+except gy.urllib.error.HTTPError as e:
+    assert "refused a redirect" in str(e), str(e)
+ok("a redirect down from https to plain http is refused")
+
+# download() and published_checksums() fetch through the no-downgrade opener
+class FakeResp:
+    headers = {"Content-Length": "3"}
+    def __init__(self, data=b"abc"):
+        self.data = data
+    def read(self, n=-1):
+        d, self.data = self.data[:n], self.data[n:]
+        return d
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+fetched = []
+gy.open_no_downgrade = lambda req, timeout: fetched.append(req.full_url) or FakeResp()
+gy.download("https://example.com/pkg.tar.zst", gy.HOME / "pkg")
+gy.published_checksums("https://example.com")
+assert [u.rsplit("/", 1)[-1] for u in fetched] == ["pkg.tar.zst", "sha256sum.txt"], fetched
+del gy.open_no_downgrade
+ok("downloads and checksum fetches go through the no-downgrade opener")
 print("update tests passed")
