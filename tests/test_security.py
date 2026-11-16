@@ -427,4 +427,11 @@ assert any('family="ipv6" source address="fe80::/10"' in r and "accept" in r for
 assert any('family="ipv6" source address="fc00::/7"' in r and "accept" in r for r in rules)
 assert any('family="ipv6" port port="11434"' in r and r.endswith("reject") for r in rules), rules
 ok("firewall: Ollama's port answers only local IPv6 addresses")
+# every port opened above gets the same IPv6 limits, the status page's included
+assert any('family="ipv6" source address="fe80::/10" port port="11435"' in r and "accept" in r
+           for r in rules), rules
+assert any('family="ipv6" source address="fc00::/7" port port="11435"' in r and "accept" in r
+           for r in rules), rules
+assert any('family="ipv6" port port="11435"' in r and r.endswith("reject") for r in rules), rules
+ok("firewall: the status page's port is under the same IPv6 limits")
 print("security and review-fix tests passed")

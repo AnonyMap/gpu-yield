@@ -2,6 +2,17 @@
 
 `gpu-yield update` shows the entries between your version and the new one.
 
+## 1.13.6 (2026-11-16)
+Hardening from an independent audit of 1.13.5. Nothing was high severity, and nothing changes for users; the firewall rules apply the next time `gpu-yield firewall` or `setup` runs.
+
+**Firewall**
+- **The IPv6 limits now cover the status page's port too.** The rules that let only local IPv6 addresses reach an open port were added for the AI port alone. The status page isn't reachable over IPv6 today (it listens on IPv4 only), but a future version listening on IPv6 would have been reachable from the internet with no NAT in between. Every port that `gpu-yield firewall` opens now gets the same accept-local, reject-the-rest rules.
+
+**Updates and installs**
+- **Ollama downloads can't be redirected down to plain http.** The GitHub requests already refused a redirect from https to http; the package and checksum downloads now use the same rule, so no fetch made for an update can fall back to an unencrypted hop.
+- **`GPU_YIELD_GITHUB_API` must be an https address.** The setting that points `update` at another source took plain http without complaint, sending every update fetch unencrypted. It's refused with a clear error now (loopback addresses are still allowed, for the tests).
+- **A crash while writing a service file can't leave a half-written unit behind.** Unit files are swapped in atomically now, like the config and the script itself.
+
 ## 1.13.5 (2026-11-09)
 Stability, bug and security fixes from an audit of the watcher's state handling, the setup, update and model flows, and game detection.
 

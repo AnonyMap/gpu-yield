@@ -59,7 +59,7 @@ except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
 
 APP = "gpu-yield"
-VERSION = "1.13.5"
+VERSION = "1.13.6"
 BUILTIN_REPO = "AnonyMap/gpu-yield"   # "owner/name" of the GitHub repo that `gpu-yield update` pulls from
 
 HOME = Path.home()
@@ -1128,7 +1128,14 @@ def write_unit(name, text):
     path = UNIT_DIR / name
     if path.exists() and path.read_text() == text:
         return False
-    path.write_text(text)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.unlink(missing_ok=True)          # a leftover from a hard kill
+    try:
+        tmp.write_text(text)
+        os.replace(tmp, path)            # a crash mid-write can't leave a half-written unit
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return True
 
 
@@ -4969,10 +4976,17 @@ def sudo(cmd):
     return subprocess.run(["sudo", *cmd]).returncode == 0
 
 
+def open_no_downgrade(req, timeout):
+    """Open a URL following redirects, but never down from https to plain http — the
+    rule github_get follows: no fetch made for an update may fall back to an
+    unencrypted hop."""
+    return urllib.request.build_opener(_SafeRedirect).open(req, timeout=timeout)
+
+
 def download(url, dest):
     dest.parent.mkdir(parents=True, exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": f"{APP}/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=60) as r, open(dest, "wb") as f:
+    with open_no_downgrade(req, 60) as r, open(dest, "wb") as f:
         total = int(r.headers.get("Content-Length") or 0)
         done, shown = 0, -1
         while chunk := r.read(1 << 20):
@@ -5010,7 +5024,7 @@ def ollama_download_base():
 def published_checksums(base):
     """{file name: sha256} from the release's sha256sum.txt."""
     req = urllib.request.Request(f"{base}/sha256sum.txt", headers={"User-Agent": f"{APP}/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=60) as r:
+    with open_no_downgrade(req, 60) as r:
         text = r.read(1 << 20).decode("utf-8", "replace")
     sums = {}
     for line in text.splitlines():
@@ -5133,12 +5147,16 @@ def open_firewall(cfg, args):
                 f'port port="{port}" protocol="tcp" accept')
         done &= sudo(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"])
     # Ollama listens on IPv6 as well (its 0.0.0.0 means both), and IPv6 addresses can be
-    # reachable from the internet. Allow only local IPv6 (link-local and private), first,
-    # then refuse the rest; Fedora's desktop zone otherwise lets high ports through.
-    for rule in (*(f'rule priority="-10" family="ipv6" source address="{src}" '
-                   f'port port="{cfg["port"]}" protocol="tcp" accept'
-                   for src in ("fe80::/10", "fc00::/7")),
-                 f'rule priority="-9" family="ipv6" port port="{cfg["port"]}" protocol="tcp" reject'):
+    # reachable from the internet with no NAT in between. Allow only local IPv6 (link-local
+    # and private), first, then refuse the rest; Fedora's desktop zone otherwise lets high
+    # ports through. Every port opened above gets the same limits, the status page's
+    # included, so a page that ever listens on IPv6 is covered from the start.
+    rules = [f'rule priority="-10" family="ipv6" source address="{src}" '
+             f'port port="{port}" protocol="tcp" accept'
+             for src in ("fe80::/10", "fc00::/7") for port in ports]
+    rules += [f'rule priority="-9" family="ipv6" port port="{port}" protocol="tcp" reject'
+              for port in ports]
+    for rule in rules:
         done &= sudo(["firewall-cmd", "--permanent", f"--add-rich-rule={rule}"])
     if done:
         done = sudo(["firewall-cmd", "--reload"])
@@ -5666,6 +5684,10 @@ class _SafeRedirect(urllib.request.HTTPRedirectHandler):
 def github_get(cfg, path, raw=False, timeout=30, auth=True):
     """GET from GitHub's API. The token (for a private update repo) is sent only when
     `auth`, and only to GitHub's API itself."""
+    api = urllib.parse.urlsplit(GITHUB_API)
+    if api.scheme != "https" and api.hostname not in ("127.0.0.1", "localhost", "::1"):
+        die(f"GPU_YIELD_GITHUB_API must be an https address, not {api.scheme}:// "
+            "(only a loopback address may be plain http, for the tests)")
     headers = {
         "User-Agent": f"{APP}/{VERSION}",
         "Accept": "application/vnd.github.raw" if raw else "application/vnd.github+json",

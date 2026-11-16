@@ -64,4 +64,26 @@ sums_override.clear()
 assert run("good update", False).endswith("0.41.0")
 assert not (gy.OLLAMA_DIR / "lib/ollama/stale-from-old-version.so").exists(), "old libraries leaked into new install"
 assert not list(gy.CACHE_DIR.glob("*.zst")), "archives left in cache"
+
+# write_unit swaps the file in atomically: a crash mid-write can't leave a half-written
+# unit behind, and the .tmp file doesn't linger either
+gy.UNIT_DIR.mkdir(parents=True, exist_ok=True)
+gy.write_unit("atomic.service", "old text")
+real_replace = gy.os.replace
+def crash(a, b):
+    raise OSError("simulated crash")
+gy.os.replace = crash
+try:
+    try:
+        gy.write_unit("atomic.service", "new text")
+        raise AssertionError("the crash must surface")
+    except OSError:
+        pass
+finally:
+    gy.os.replace = real_replace
+assert (gy.UNIT_DIR / "atomic.service").read_text() == "old text"
+assert not (gy.UNIT_DIR / "atomic.service.tmp").exists(), "the .tmp file lingered"
+assert gy.write_unit("atomic.service", "new text") is True
+assert (gy.UNIT_DIR / "atomic.service").read_text() == "new text"
+assert gy.write_unit("atomic.service", "new text") is False
 print("install tests passed")
